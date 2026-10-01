@@ -1,0 +1,455 @@
+//! The chat: the model loads once and stays hot; a page on loopback sends each prompt in.
+//!
+//! One thread, no framework - `std::net::TcpListener` and a string of HTML. Nothing leaves the
+//! machine: the page is served on 127.0.0.1 only. The answer streams: each word goes out as an
+//! HTTP chunk the moment it is written.
+//!
+//! A chat is one long conversation the model has already read: a follow-up reads only its own new
+//! words, then the model carries on from where it stopped.
+
+use anyhow::Result;
+use std::cell::RefCell;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::rc::Rc;
+
+use candle::{Device, Tensor};
+use candle_transformers::generation::{LogitsProcessor, Sampling};
+use crate::model::{Model, Progress, Step};
+use tokenizers::Tokenizer;
+
+/// Largest request body accepted: a prompt of a few hundred pages.
+const MAX_BODY: usize = 1 << 20;
+
+/// Longest piece of a prompt read in one forward pass.
+const PROMPT_CHUNK: usize = 512;
+
+/// When a chat would grow past this many words, it is summarised first to make room.
+const CONTEXT_LIMIT: usize = 16384;
+
+/// Longest summary written when making room.
+const SUMMARY_TOKENS: usize = 500;
+
+const SUMMARY_ASK: &str = "Summarise our conversation so far in at most 300 words, for someone who will continue it: what was asked, what was decided, and every name, file, function or fact the next answer will need. Plain text, no preamble.";
+
+/// Separates the streamed text from the closing stats line.
+pub(crate) const STATS_MARK: &str = "\u{1}STATS:";
+
+/// A progress line sent while the prompt is read, before any text: `\u{1}PROG:<json>\n`.
+pub(crate) const PROG_MARK: &str = "\u{1}PROG:";
+
+/// Ends the stream when the answer could not be finished; the page shows what follows it.
+pub(crate) const ERROR_MARK: &str = "\u{1}ERROR:";
+
+/// After the GPU has run out of memory once, Metal does not recover in this process.
+fn gpu_out_of_memory(e: &anyhow::Error) -> bool {
+    let m = format!("{e:#}");
+    m.contains("OutOfMemory") || m.contains("Insufficient Memory")
+}
+
+pub fn serve(port: u16, model: &mut Model, model_name: &str, tokenizer: Tokenizer, device: &Device, max_new: usize, sampling: Sampling) -> Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    println!("\n  coachwhip chat on http://127.0.0.1:{port} (model hot, loopback only)\n");
+    let mut session = Session::default();
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        if let Err(e) = handle(stream, model, model_name, &tokenizer, device, max_new, &sampling, &mut session) {
+            eprintln!("  request failed: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Where the model is in the current chat.
+#[derive(Default)]
+pub struct Session {
+    /// Words the model has read so far, its own answers included.
+    pos: usize,
+    /// The last word of an answer cut off at the length limit: written, but not yet read back.
+    pending: Option<u32>,
+}
+
+pub struct Answer {
+    /// New words read for this question; the earlier chat was not read again.
+    pub prompt_tokens: usize,
+    /// Words in the chat after this answer.
+    pub context: usize,
+    pub fresh: bool,
+    /// The chat was summarised to make room before this answer.
+    pub compacted: bool,
+    pub written: usize,
+    pub read_tps: f64,
+    pub write_tps: f64,
+}
+
+/// Runs the model and hands every new piece of text to `emit` as soon as it exists.
+#[allow(clippy::too_many_arguments)]
+pub fn generate(
+    model: &mut Model,
+    tokenizer: &Tokenizer,
+    device: &Device,
+    session: &mut Session,
+    new_chat: bool,
+    prompt: &str,
+    think: bool,
+    max_new: usize,
+    sampling: &Sampling,
+    progress: Option<Progress>,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<Answer> {
+    let think = think && model.thinks();
+    let no_think = if think || !model.thinks() { "" } else { " /no_think" };
+    let encode = |text: String| -> Result<Vec<u32>> { Ok(tokenizer.encode(text, true).map_err(anyhow::Error::msg)?.get_ids().to_vec()) };
+    let eos = *tokenizer.get_vocab(true).get("<|im_end|>").unwrap();
+    let mut sampler = LogitsProcessor::from_sampling(42, sampling.clone());
+    let tell = progress.map(|p| Rc::new(RefCell::new(p)));
+
+    // A follow-up closes the last answer and adds the new question; nothing earlier is read again.
+    let turn = format!("<|im_start|>user\n{prompt}{no_think}<|im_end|>\n<|im_start|>assistant\n");
+    let mut tokens = Vec::new();
+    let mut fresh = new_chat || session.pos == 0;
+    let mut summary = None;
+    if !fresh {
+        tokens.extend(session.pending);
+        tokens.extend(encode(format!("<|im_end|>\n{turn}"))?);
+        // Too long to go on: the model summarises the chat, and the summary opens a new one.
+        if session.pos + tokens.len() + max_new > CONTEXT_LIMIT {
+            summary = Some(summarise(model, tokenizer, device, session, no_think, eos, &tell)?);
+            fresh = true;
+        }
+    }
+    if fresh {
+        model.clear_kv_cache();
+        *session = Session::default();
+        tokens = encode(match &summary {
+            Some(s) => format!("<|im_start|>user\nSummary of our conversation so far, for context:\n{s}\n\nNow: {prompt}{no_think}<|im_end|>\n<|im_start|>assistant\n"),
+            None => turn,
+        })?;
+    }
+
+    let t0 = std::time::Instant::now();
+    let logits = read_prompt(model, device, session.pos, &tokens, &tell)?;
+    let base = session.pos + tokens.len();
+    let mut next = sampler.sample(&logits)?;
+    let read = t0.elapsed().as_secs_f64();
+
+    // The answer so far; an end-of-turn word is never part of it.
+    let mut out = if next == eos { Vec::new() } else { vec![next] };
+    let mut sent = 0usize;
+    let mut stream_text = |out: &[u32], sent: &mut usize| -> Result<()> {
+        let full = tokenizer.decode(out, true).map_err(anyhow::Error::msg)?;
+        // A token can be half of a multi-byte character; wait until the text is whole.
+        if full.ends_with('\u{FFFD}') {
+            return Ok(());
+        }
+        // With thinking off the model still opens and closes an empty think block; skip it.
+        let start = if !think && full.starts_with("<think>") {
+            match full.find("</think>") {
+                Some(i) => {
+                    let after = &full[i + "</think>".len()..];
+                    i + "</think>".len() + (after.len() - after.trim_start_matches('\n').len())
+                }
+                None => return Ok(()),
+            }
+        } else {
+            0
+        };
+        let from = start.max(*sent);
+        // A later decode can re-space earlier text; wait for a clean place to carry on from.
+        if !full.is_char_boundary(from) {
+            return Ok(());
+        }
+        if full.len() > from {
+            emit(&full[from..])?;
+            *sent = full.len();
+        }
+        Ok(())
+    };
+    stream_text(&out, &mut sent)?;
+    let t1 = std::time::Instant::now();
+    while out.len() < max_new && next != eos {
+        let logits = model.forward(&Tensor::new(&[next], device)?.unsqueeze(0)?, base + out.len() - 1)?.squeeze(0)?;
+        next = sampler.sample(&logits)?;
+        if next != eos {
+            out.push(next);
+            stream_text(&out, &mut sent)?;
+        }
+    }
+    let write = t1.elapsed().as_secs_f64();
+    let written = out.len();
+    // Every word of the answer was read back, except the last one when the length limit cut it off.
+    let finished = next == eos;
+    session.pos = base + if finished { out.len() } else { out.len() - 1 };
+    session.pending = if finished { None } else { out.last().copied() };
+    Ok(Answer {
+        prompt_tokens: tokens.len(),
+        context: session.pos,
+        fresh,
+        compacted: summary.is_some(),
+        written,
+        read_tps: tokens.len() as f64 / read.max(1e-9),
+        // The first word comes out of reading the prompt; the rate counts the ones written after it.
+        write_tps: written.saturating_sub(1) as f64 / write.max(1e-9),
+    })
+}
+
+/// Reads a prompt that continues the chat at `pos`, and returns the logits for the next word.
+/// The chunker: a long prompt is read in pieces, so the memory a piece needs stays bounded.
+/// While it reads, every finished layer is reported, counted across all the pieces, so the page
+/// is never silent.
+fn read_prompt(model: &mut Model, device: &Device, pos: usize, tokens: &[u32], tell: &Option<Rc<RefCell<Progress>>>) -> Result<Tensor> {
+    let pieces = tokens.len().div_ceil(PROMPT_CHUNK);
+    let read = (|| -> Result<Tensor> {
+    let mut logits = None;
+    for (i, piece) in tokens.chunks(PROMPT_CHUNK).enumerate() {
+        model.set_progress(tell.clone().map(|t| -> Progress {
+            Box::new(move |step| {
+                if let Step::Layer(layer, of) = step {
+                    (t.borrow_mut())(Step::Layer(i * of + layer, pieces * of))
+                }
+            })
+        }));
+        logits = Some(model.forward(&Tensor::new(piece, device)?.unsqueeze(0)?, pos + i * PROMPT_CHUNK)?.squeeze(0)?);
+    }
+    logits.ok_or_else(|| anyhow::anyhow!("empty prompt"))
+    })();
+    // Taken back on every path: the hook holds the page's connection open.
+    model.set_progress(None);
+    read
+}
+
+/// Asks the model, in the chat as it stands, for a summary of the chat; the chat is then thrown
+/// away and the summary opens the next one. Greedy, so it is the same every time.
+fn summarise(model: &mut Model, tokenizer: &Tokenizer, device: &Device, session: &Session, no_think: &str, eos: u32, tell: &Option<Rc<RefCell<Progress>>>) -> Result<String> {
+    let mut tokens: Vec<u32> = session.pending.into_iter().collect();
+    let ask = format!("<|im_end|>\n<|im_start|>user\n{SUMMARY_ASK}{no_think}<|im_end|>\n<|im_start|>assistant\n");
+    tokens.extend(tokenizer.encode(ask, true).map_err(anyhow::Error::msg)?.get_ids().to_vec());
+    let mut sampler = LogitsProcessor::from_sampling(42, Sampling::ArgMax);
+    let logits = read_prompt(model, device, session.pos, &tokens, tell)?;
+    let mut next = sampler.sample(&logits)?;
+    let base = session.pos + tokens.len();
+    let mut out = Vec::new();
+    while next != eos && out.len() < SUMMARY_TOKENS {
+        out.push(next);
+        if let Some(t) = tell {
+            if out.len() % 8 == 0 {
+                (t.borrow_mut())(Step::Summary(out.len()));
+            }
+        }
+        let logits = model.forward(&Tensor::new(&[next], device)?.unsqueeze(0)?, base + out.len() - 1)?.squeeze(0)?;
+        next = sampler.sample(&logits)?;
+    }
+    let text = tokenizer.decode(&out, true).map_err(anyhow::Error::msg)?;
+    let text = match text.find("</think>") {
+        Some(i) if text.starts_with("<think>") => text[i + "</think>".len()..].to_string(),
+        _ => text,
+    };
+    let text = text.trim().to_string();
+    println!("  made room: {} tokens of chat summarised into {} tokens", session.pos, out.len());
+    Ok(text)
+}
+
+pub(crate) fn html_escape(t: &str) -> String {
+    t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+pub(crate) fn chunk(s: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    write!(s, "{:x}\r\n", bytes.len())?;
+    s.write_all(bytes)?;
+    s.write_all(b"\r\n")?;
+    s.flush()?;
+    Ok(())
+}
+
+fn handle(mut s: TcpStream, model: &mut Model, model_name: &str, tokenizer: &Tokenizer, device: &Device, max_new: usize, sampling: &Sampling, session: &mut Session) -> Result<()> {
+    // A client that stops sending must not hold the one-at-a-time server forever.
+    s.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    let mut r = BufReader::new(s.try_clone()?).take(64 * 1024 + MAX_BODY as u64);
+    let mut line = String::new();
+    r.read_line(&mut line)?;
+    let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+    let mut len = 0usize;
+    let mut host = String::new();
+    let mut origin = String::new();
+    loop {
+        let mut h = String::new();
+        if r.read_line(&mut h)? == 0 || h.trim().is_empty() {
+            break;
+        }
+        let lower = h.to_lowercase();
+        if let Some(v) = lower.strip_prefix("content-length:") {
+            len = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = lower.strip_prefix("host:") {
+            host = v.trim().to_string();
+        } else if let Some(v) = lower.strip_prefix("origin:") {
+            origin = v.trim().to_string();
+        }
+    }
+    // Only this machine's own page may talk to the model: another site open in the browser
+    // could otherwise post prompts here.
+    let port = s.local_addr()?.port();
+    let local = |h: &str| h == format!("127.0.0.1:{port}") || h == format!("localhost:{port}");
+    let own_page = local(&host) && (origin.is_empty() || origin.strip_prefix("http://").is_some_and(local));
+    if path == "/ask" && (!own_page || len > MAX_BODY) {
+        write!(s, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")?;
+        return Ok(());
+    }
+    if path == "/ask" {
+        let mut body = vec![0u8; len];
+        r.read_exact(&mut body)?;
+        let Ok(q) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            write!(s, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")?;
+            return Ok(());
+        };
+        let prompt = q["prompt"].as_str().unwrap_or("");
+        let think = q["think"].as_bool().unwrap_or(false);
+        let new_chat = q["new_chat"].as_bool().unwrap_or(false);
+        let max_new = q["max_new"].as_u64().map(|m| (m as usize).min(max_new)).unwrap_or(max_new);
+        println!("  prompt: {} chars, thinking {}", prompt.len(), if think { "on" } else { "off" });
+        write!(
+            s,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nTransfer-Encoding: chunked\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\n\r\n"
+        )?;
+        s.flush()?;
+        let mut out_s = s.try_clone()?;
+        let mut emit = |t: &str| chunk(&mut out_s, t.as_bytes());
+        let mut prog_s = s.try_clone()?;
+        let progress: Progress = Box::new(move |step| {
+            let line = match step {
+                Step::Layer(layer, of) => format!("{PROG_MARK}{{\"layer\":{layer},\"of\":{of}}}\n"),
+                Step::Summary(words) => format!("{PROG_MARK}{{\"summary\":{words}}}\n"),
+            };
+            let _ = chunk(&mut prog_s, line.as_bytes());
+        });
+        let a = match generate(model, tokenizer, device, session, new_chat, prompt, think, max_new, sampling, Some(progress), &mut emit) {
+            Ok(a) => a,
+            Err(e) => {
+                // A broken answer leaves the model part-way through it, so the next question starts afresh.
+                *session = Session::default();
+                let oom = gpu_out_of_memory(&e);
+                let msg = if oom {
+                    "The GPU ran out of memory. Coachwhip has stopped: close some apps, or start it again with a smaller --bank.".to_string()
+                } else {
+                    format!("The answer could not be finished: {e}")
+                };
+                let _ = chunk(&mut s, format!("{ERROR_MARK}{msg}").as_bytes());
+                let _ = s.write_all(b"0\r\n\r\n");
+                let _ = s.flush();
+                if oom {
+                    eprintln!("\n  coachwhip: {msg}\n");
+                    std::process::exit(1);
+                }
+                return Err(e);
+            }
+        };
+        println!("  read {} new tokens at {:.1} tok/s, wrote {} at {:.1} tok/s, chat now {} tokens", a.prompt_tokens, a.read_tps, a.written, a.write_tps, a.context);
+        model.report();
+        let stats = serde_json::json!({
+            "prompt_tokens": a.prompt_tokens, "written": a.written, "context": a.context, "fresh": a.fresh, "compacted": a.compacted,
+            "read_tps": a.read_tps, "write_tps": a.write_tps,
+        });
+        chunk(&mut s, format!("{STATS_MARK}{stats}").as_bytes())?;
+        s.write_all(b"0\r\n\r\n")?;
+    } else {
+        let page = if model.thinks() { PAGE.to_string() } else { PAGE.replace(THINK_BOX, "") };
+        let page = page.replace("MODEL_NAME", &html_escape(model_name));
+        write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n", page.len())?;
+        s.write_all(page.as_bytes())?;
+    }
+    s.flush()?;
+    Ok(())
+}
+
+/// The page's thinking switch, left out for a model that has no thinking mode.
+pub(crate) const THINK_BOX: &str = r#"<label><input type="checkbox" id="think"> let it think first (slower)</label>"#;
+
+pub(crate) const PAGE: &str = r##"<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coachwhip</title><style>
+ :root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--text:#e6edf3;--dim:#8b949e;--on:#3fb950;--off:#6e7681}
+ *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);
+   font:15px/1.55 ui-monospace,"Cascadia Code",Consolas,monospace}
+ .wrap{max-width:900px;margin:0 auto;padding:28px 16px 60px}
+ h1{font-size:22px;margin:0 0 4px} h1 b{color:var(--on)}
+ .sub{color:var(--dim);font-size:13px;margin-bottom:22px}
+ textarea{width:100%;height:160px;background:var(--panel);color:var(--text);border:1px solid var(--line);
+   border-radius:8px;padding:14px;font:14px/1.5 ui-monospace,Consolas,monospace;resize:vertical}
+ .row{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin:12px 0 22px}
+ button{background:var(--on);color:#08130b;border:0;border-radius:7px;padding:10px 22px;font-weight:700;
+   font-size:14px;cursor:pointer} button:disabled{background:var(--off);color:#0d1117;cursor:default}
+ label{color:var(--dim);font-size:13px;display:flex;gap:7px;align-items:center;cursor:pointer}
+ .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+ .card h2{margin:0;padding:11px 15px;font-size:12px;letter-spacing:.09em;text-transform:uppercase;
+   border-bottom:1px solid var(--line);color:var(--on)}
+ pre{margin:0;padding:15px;white-space:pre-wrap;word-break:break-word;min-height:40px;font-size:14px}
+ .you{color:var(--dim);white-space:pre-wrap;word-break:break-word;margin:18px 0 8px;font-size:14px}
+ .you b{color:var(--on)} #log .card{margin-bottom:6px} button.ghost{background:transparent;color:var(--dim);border:1px solid var(--line)}
+ .ms{color:var(--dim);font-size:13px;padding:0 15px 12px} .ms b{color:var(--text)}
+</style></head><body><div class="wrap">
+ <h1>coachwhip <b>·</b> MODEL_NAME</h1>
+ <div class="sub">the experts stream from the SSD; everything runs on this machine</div>
+ <div id="log"></div>
+ <textarea id="p" spellcheck="false">Write a JavaScript function debounce(fn, ms) and explain in two sentences how it works.</textarea>
+ <div class="row">
+   <button id="go">Send</button>
+   <button id="new" class="ghost">New chat</button>
+   <label><input type="checkbox" id="think"> let it think first (slower)</label>
+ </div>
+</div><script>
+const $=i=>document.getElementById(i);
+const MARK = '\u0001STATS:';
+const ERR = '\u0001ERROR:';
+const PROG = /\u0001PROG:(\{[^\n]*\})\n/g;
+let newChat = true;
+const add = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; e.innerHTML = html; $('log').appendChild(e); return e; };
+$('new').onclick = () => { newChat = true; $('log').innerHTML = ''; $('p').focus(); };
+$('go').onclick = async () => {
+  const prompt = $('p').value.trim();
+  if (!prompt) return;
+  $('go').disabled = true; $('new').disabled = true;
+  add('div', 'you', '<b>you ›</b> ').appendChild(document.createTextNode(prompt));
+  const card = add('div', 'card', '<pre></pre><div class="ms"></div>');
+  const A = card.querySelector('pre'), T = card.querySelector('.ms');
+  T.textContent = 'reading…'; $('p').value = '';
+  const t0 = performance.now();
+  let text = '', first = 0;
+  try{
+    const r = await fetch('/ask',{method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({prompt, new_chat:newChat, think:!!($('think')&&$('think').checked)})});
+    newChat = false;
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      text += dec.decode(value, {stream:true});
+      let p = null;
+      text = text.replace(PROG, (m, j) => { p = JSON.parse(j); return ''; });
+      const x = text.indexOf(ERR);
+      if (x >= 0) { A.textContent = text.slice(0, x); T.textContent = text.slice(x + ERR.length); newChat = true; break; }
+      if (p && !first) {
+        const secs = ((performance.now()-t0)/1000).toFixed(1) + ' s';
+        T.textContent = p.summary !== undefined
+          ? 'making room: summarising the chat so far · ' + p.summary + ' tokens · ' + secs
+          : 'reading your prompt · layer ' + p.layer + ' of ' + p.of + ' · ' + secs;
+        continue;
+      }
+      if (!text) continue;
+      if (!first) { first = performance.now(); T.textContent = 'writing…'; }
+      const k = text.indexOf(MARK);
+      A.textContent = k < 0 ? text : text.slice(0, k);
+    }
+    const k = text.indexOf(MARK);
+    if (k >= 0 && text.indexOf(ERR) < 0) {
+      const j = JSON.parse(text.slice(k + MARK.length));
+      T.innerHTML = 'writing <b>' + j.write_tps.toFixed(1) + ' tok/s</b> (' + j.written + ' tokens) · read <b>' +
+        j.prompt_tokens + ' new tokens</b> at ' + j.read_tps.toFixed(1) + ' tok/s · first word after <b>' +
+        ((first - t0)/1000).toFixed(1) + ' s</b> · chat so far ' + j.context + ' tokens' +
+        (j.compacted ? ' · the chat was summarised to make room' : '');
+    }
+  }catch(e){ A.textContent = 'failed: ' + e; newChat = true; }
+  $('go').disabled = false; $('new').disabled = false;
+  card.scrollIntoView({block:'end'});
+};
+</script></body></html>"##;

@@ -1,0 +1,10 @@
+/target
+*.gguf
+tokenizer.json
+tokenizer-*.json
+build.log
+.DS_Store
+/learned
+gate-out/
+/data
+/scripts

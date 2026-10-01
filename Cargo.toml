@@ -1,0 +1,22 @@
+[package]
+name = "coachwhip"
+version = "0.1.0"
+edition = "2021"
+description = "Run mixture-of-experts models bigger than your memory on a Mac: an 80B model on 16 GB. The experts stream from the SSD into a small GPU bank."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+candle = { package = "candle-core", git = "https://github.com/huggingface/candle", rev = "5ba5d5b468b5b1df40e82dd3d556987bedeea041", features = ["metal"] }
+candle-nn = { git = "https://github.com/huggingface/candle", rev = "5ba5d5b468b5b1df40e82dd3d556987bedeea041", features = ["metal"] }
+candle-transformers = { git = "https://github.com/huggingface/candle", rev = "5ba5d5b468b5b1df40e82dd3d556987bedeea041", features = ["metal"] }
+candle-metal-kernels = { git = "https://github.com/huggingface/candle", rev = "5ba5d5b468b5b1df40e82dd3d556987bedeea041" }
+objc2-metal = "0.3.1"
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+clap = { version = "4.2.4", features = ["derive"] }
+anyhow = "1"
+serde_json = "1.0.99"
+rayon = "1"
+
+[profile.release]
+debug = false
