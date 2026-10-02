@@ -109,6 +109,29 @@ Coachwhip is the engine; the model is yours. Any GGUF of a supported model works
 
 The last number is the bank (44 if you leave it out). The chat opens in your browser. Type, press Send, and the answer streams as it is written. Follow-up questions read only your new words; press **New chat** to start again. Stop Coachwhip with Ctrl+C.
 
+**From your coding tools:** while Coachwhip runs, it also speaks the OpenAI chat API, so any tool that takes an OpenAI base URL can use the model.
+
+| Setting | Value |
+|---|---|
+| Base URL | `http://127.0.0.1:8090/v1` |
+| API key | anything; it is ignored |
+| Model | the model's file name, as listed at `/v1/models` |
+
+Only programs on this Mac can reach it. Follow-ups that resend the whole conversation read only the new part. The chat page and your tools share one model, one request at a time; when a tool has used it, the page's next question starts a new chat.
+
+Tested with the official `openai` Python client and with [Aider](https://aider.chat), the coding agent for the terminal:
+
+```sh
+aider --openai-api-base http://127.0.0.1:8090/v1 --openai-api-key anything \
+      --model openai/Qwen3-Coder-Next-Q4_K_M --map-tokens 0 src/queue.ts
+```
+
+<p align="center"><img src="docs/coachwhip-aider.png" alt="Aider using Qwen3-Coder-Next (80B) through Coachwhip on a 16 GB Mac: it finds a sort-order bug and rewrites the file" width="720"></p>
+
+<p align="center"><sub>Aider on a Windows laptop, reaching the Mac through an SSH tunnel, so the requests arrive as a local program.</sub></p>
+
+`--map-tokens 0` turns off Aider's repository map, which adds up to about a thousand tokens to each request by default; with it on, each request takes longer to read.
+
 **One answer in the terminal:**
 
 ```sh

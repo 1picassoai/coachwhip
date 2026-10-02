@@ -6,6 +6,10 @@
 //!
 //! A chat is one long conversation the model has already read: a follow-up reads only its own new
 //! words, then the model carries on from where it stopped.
+//!
+//! The same server also speaks the OpenAI chat API (`/v1/chat/completions`, `/v1/models`), so
+//! coding tools on this machine can use the model. Those clients send the whole conversation every
+//! time; when it begins with what the model has already read, only the new part is read.
 
 use anyhow::Result;
 use std::cell::RefCell;
@@ -67,6 +71,10 @@ pub struct Session {
     pos: usize,
     /// The last word of an answer cut off at the length limit: written, but not yet read back.
     pending: Option<u32>,
+    /// Every word the model has read so far, in order: `pos` of them.
+    fed: Vec<u32>,
+    /// Who wrote the conversation the model holds: the page continues only its own.
+    by_api: bool,
 }
 
 pub struct Answer {
@@ -80,6 +88,8 @@ pub struct Answer {
     pub written: usize,
     pub read_tps: f64,
     pub write_tps: f64,
+    /// The model ended its answer itself, rather than hitting the length limit.
+    pub finished: bool,
 }
 
 /// Runs the model and hands every new piece of text to `emit` as soon as it exists.
@@ -101,13 +111,12 @@ pub fn generate(
     let no_think = if think || !model.thinks() { "" } else { " /no_think" };
     let encode = |text: String| -> Result<Vec<u32>> { Ok(tokenizer.encode(text, true).map_err(anyhow::Error::msg)?.get_ids().to_vec()) };
     let eos = *tokenizer.get_vocab(true).get("<|im_end|>").unwrap();
-    let mut sampler = LogitsProcessor::from_sampling(42, sampling.clone());
     let tell = progress.map(|p| Rc::new(RefCell::new(p)));
 
     // A follow-up closes the last answer and adds the new question; nothing earlier is read again.
     let turn = format!("<|im_start|>user\n{prompt}{no_think}<|im_end|>\n<|im_start|>assistant\n");
     let mut tokens = Vec::new();
-    let mut fresh = new_chat || session.pos == 0;
+    let mut fresh = new_chat || session.pos == 0 || session.by_api;
     let mut summary = None;
     if !fresh {
         tokens.extend(session.pending);
@@ -127,8 +136,63 @@ pub fn generate(
         })?;
     }
 
+    let a = answer(model, tokenizer, device, session, tokens, fresh, summary.is_some(), think, max_new, sampling, &tell, emit);
+    session.by_api = false;
+    a
+}
+
+/// Answers a whole conversation sent at once, as the OpenAI API does. When it begins with what the
+/// model has already read, only the rest is read; otherwise the model starts afresh.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_full(
+    model: &mut Model,
+    tokenizer: &Tokenizer,
+    device: &Device,
+    session: &mut Session,
+    prompt: Vec<u32>,
+    max_new: usize,
+    sampling: &Sampling,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<Answer> {
+    if prompt.len() + max_new > CONTEXT_LIMIT {
+        anyhow::bail!("the conversation and its answer would be over {CONTEXT_LIMIT} tokens; start a new one");
+    }
+    let known = session.fed.len();
+    let fresh = known == 0 || prompt.len() <= known || !prompt.starts_with(&session.fed);
+    if fresh {
+        model.clear_kv_cache();
+        *session = Session::default();
+    } else {
+        // The word an earlier answer was cut off on is part of what the client sent back.
+        session.pending = None;
+    }
+    let tokens = prompt[session.fed.len()..].to_vec();
+    let a = answer(model, tokenizer, device, session, tokens, fresh, false, false, max_new, sampling, &None, emit);
+    session.by_api = true;
+    a
+}
+
+/// Reads `tokens` after what the session has read, then writes the answer, streaming it to `emit`.
+#[allow(clippy::too_many_arguments)]
+fn answer(
+    model: &mut Model,
+    tokenizer: &Tokenizer,
+    device: &Device,
+    session: &mut Session,
+    tokens: Vec<u32>,
+    fresh: bool,
+    compacted: bool,
+    think: bool,
+    max_new: usize,
+    sampling: &Sampling,
+    tell: &Option<Rc<RefCell<Progress>>>,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<Answer> {
+    let eos = *tokenizer.get_vocab(true).get("<|im_end|>").unwrap();
+    let mut sampler = LogitsProcessor::from_sampling(42, sampling.clone());
     let t0 = std::time::Instant::now();
-    let logits = read_prompt(model, device, session.pos, &tokens, &tell)?;
+    let logits = read_prompt(model, device, session.pos, &tokens, tell)?;
+    session.fed.extend(&tokens);
     let base = session.pos + tokens.len();
     let mut next = sampler.sample(&logits)?;
     let read = t0.elapsed().as_secs_f64();
@@ -179,13 +243,16 @@ pub fn generate(
     let written = out.len();
     // Every word of the answer was read back, except the last one when the length limit cut it off.
     let finished = next == eos;
-    session.pos = base + if finished { out.len() } else { out.len() - 1 };
+    let read_back = if finished { out.len() } else { out.len() - 1 };
+    session.pos = base + read_back;
     session.pending = if finished { None } else { out.last().copied() };
+    session.fed.extend(&out[..read_back]);
     Ok(Answer {
         prompt_tokens: tokens.len(),
         context: session.pos,
         fresh,
-        compacted: summary.is_some(),
+        compacted,
+        finished,
         written,
         read_tps: tokens.len() as f64 / read.max(1e-9),
         // The first word comes out of reading the prompt; the rate counts the ones written after it.
@@ -249,6 +316,119 @@ fn summarise(model: &mut Model, tokenizer: &Tokenizer, device: &Device, session:
     Ok(text)
 }
 
+/// The text of an OpenAI message: a plain string, or a list of parts of which the text ones count.
+fn message_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(t) => t.clone(),
+        serde_json::Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// An OpenAI conversation in the model's chat format, ready for the assistant's turn.
+pub(crate) fn chat_prompt(messages: &[serde_json::Value]) -> String {
+    let mut text = String::new();
+    for m in messages {
+        let role = match m["role"].as_str().unwrap_or("user") {
+            r @ ("system" | "user" | "assistant") => r,
+            "developer" => "system",
+            _ => "user",
+        };
+        text.push_str(&format!("<|im_start|>{role}\n{}<|im_end|>\n", message_text(&m["content"])));
+    }
+    text.push_str("<|im_start|>assistant\n");
+    text
+}
+
+/// `/v1/chat/completions`: the OpenAI chat API, streamed (server-sent events) or in one reply. Any
+/// API key is accepted and ignored: only programs on this machine can reach this port.
+#[allow(clippy::too_many_arguments)]
+fn openai(mut s: TcpStream, body: &[u8], model: &mut Model, model_name: &str, tokenizer: &Tokenizer, device: &Device, max_new: usize, sampling: &Sampling, session: &mut Session) -> Result<()> {
+    let reply = |s: &mut TcpStream, status: &str, json: serde_json::Value| -> Result<()> {
+        let body = json.to_string();
+        write!(s, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len())?;
+        Ok(())
+    };
+    let bad = |m: &str| serde_json::json!({"error": {"message": m, "type": "invalid_request_error"}});
+    let Ok(q) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return reply(&mut s, "400 Bad Request", bad("the body is not JSON"));
+    };
+    let Some(messages) = q["messages"].as_array().filter(|m| !m.is_empty()) else {
+        return reply(&mut s, "400 Bad Request", bad("`messages` must be a non-empty list"));
+    };
+    let stream = q["stream"].as_bool().unwrap_or(false);
+    let asked = q["max_completion_tokens"].as_u64().or(q["max_tokens"].as_u64());
+    let prompt = tokenizer.encode(chat_prompt(messages), true).map_err(anyhow::Error::msg)?.get_ids().to_vec();
+    // With no limit asked for, the answer gets whatever room the conversation leaves.
+    let room = CONTEXT_LIMIT.saturating_sub(prompt.len());
+    let max_new = asked.map_or(max_new.min(room), |m| (m as usize).min(max_new));
+    let id = format!("chatcmpl-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let prompt_len = prompt.len();
+    println!("  api: {} messages, {} tokens, {}", messages.len(), prompt_len, if stream { "streamed" } else { "one reply" });
+
+    let event = |delta: serde_json::Value, finish: Option<&str>| {
+        serde_json::json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": model_name,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+    };
+    let mut text = String::new();
+    let result = if stream {
+        write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nCache-Control: no-cache\r\n\r\n")?;
+        chunk(&mut s, format!("data: {}\n\n", event(serde_json::json!({"role": "assistant", "content": ""}), None)).as_bytes())?;
+        let mut out_s = s.try_clone()?;
+        let mut emit = |t: &str| chunk(&mut out_s, format!("data: {}\n\n", event(serde_json::json!({"content": t}), None)).as_bytes());
+        generate_full(model, tokenizer, device, session, prompt, max_new, sampling, &mut emit)
+    } else {
+        let mut emit = |t: &str| -> Result<()> {
+            text.push_str(t);
+            Ok(())
+        };
+        generate_full(model, tokenizer, device, session, prompt, max_new, sampling, &mut emit)
+    };
+    let a = match result {
+        Ok(a) => a,
+        Err(e) => {
+            *session = Session::default();
+            let oom = gpu_out_of_memory(&e);
+            let msg = if oom {
+                "The GPU ran out of memory. Coachwhip has stopped: close some apps, or start it again with a smaller --bank.".to_string()
+            } else {
+                format!("{e}")
+            };
+            let too_long = format!("{e}").contains("start a new one");
+            let err = serde_json::json!({"error": {"message": msg, "type": if too_long { "invalid_request_error" } else { "server_error" }}});
+            if stream {
+                let _ = chunk(&mut s, format!("data: {err}\n\ndata: [DONE]\n\n").as_bytes());
+                let _ = s.write_all(b"0\r\n\r\n");
+            } else {
+                let status = if too_long { "400 Bad Request" } else { "500 Internal Server Error" };
+                let _ = reply(&mut s, status, err);
+            }
+            let _ = s.flush();
+            if oom {
+                eprintln!("\n  coachwhip: {msg}\n");
+                std::process::exit(1);
+            }
+            return Err(e);
+        }
+    };
+    println!("  api: read {} new tokens at {:.1} tok/s, wrote {} at {:.1} tok/s, chat now {} tokens", a.prompt_tokens, a.read_tps, a.written, a.write_tps, a.context);
+    model.report();
+    let finish = if a.finished { "stop" } else { "length" };
+    let usage = serde_json::json!({"prompt_tokens": prompt_len, "completion_tokens": a.written, "total_tokens": prompt_len + a.written});
+    if stream {
+        let mut last = event(serde_json::json!({}), Some(finish));
+        last["usage"] = usage;
+        chunk(&mut s, format!("data: {last}\n\ndata: [DONE]\n\n").as_bytes())?;
+        s.write_all(b"0\r\n\r\n")?;
+        s.flush()?;
+        Ok(())
+    } else {
+        reply(&mut s, "200 OK", serde_json::json!({"id": id, "object": "chat.completion", "created": created, "model": model_name,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish}], "usage": usage}))
+    }
+}
+
 pub(crate) fn html_escape(t: &str) -> String {
     t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -293,8 +473,24 @@ fn handle(mut s: TcpStream, model: &mut Model, model_name: &str, tokenizer: &Tok
     let port = s.local_addr()?.port();
     let local = |h: &str| h == format!("127.0.0.1:{port}") || h == format!("localhost:{port}");
     let own_page = local(&host) && (origin.is_empty() || origin.strip_prefix("http://").is_some_and(local));
-    if path == "/ask" && (!own_page || len > MAX_BODY) {
+    let path = path.split('?').next().unwrap_or("/").to_string();
+    let api = path.starts_with("/v1/");
+    if (path == "/ask" || api) && (!own_page || len > MAX_BODY) {
         write!(s, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")?;
+        return Ok(());
+    }
+    if path == "/v1/models" {
+        let body = serde_json::json!({"object": "list", "data": [{"id": model_name, "object": "model", "owned_by": "coachwhip"}]}).to_string();
+        write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len())?;
+        return Ok(());
+    }
+    if path == "/v1/chat/completions" {
+        let mut body = vec![0u8; len];
+        r.read_exact(&mut body)?;
+        return openai(s, &body, model, model_name, tokenizer, device, max_new, sampling, session);
+    }
+    if api {
+        write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")?;
         return Ok(());
     }
     if path == "/ask" {

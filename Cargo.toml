@@ -1,6 +1,6 @@
 [package]
 name = "coachwhip"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Run mixture-of-experts models bigger than your memory on a Mac: an 80B model on 16 GB. The experts stream from the SSD into a small GPU bank."
 license = "Apache-2.0"
