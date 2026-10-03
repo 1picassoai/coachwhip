@@ -8,6 +8,8 @@ An 80B model, running comfortably on a 16 GB Mac. Coachwhip never needs the whol
 
 One Rust binary. Everything on the GPU. Nothing leaves your machine.
 
+**Questions, ideas, or using it at work?** [Open an issue](https://github.com/1picassoai/coachwhip/issues).
+
 <p align="center"><img src="docs/coachwhip-demo.gif" alt="Qwen3-Coder-Next (80B) writing TypeScript in the Coachwhip chat on a 16 GB Mac" width="720"></p>
 
 ## Why it works
