@@ -55,7 +55,7 @@ struct Bank {
     prefetched: HashSet<u32>,
 }
 
-type Key = (usize, u32);
+pub type Key = (usize, u32);
 
 /// How the store behaves. `Default` is what the Mac mini M4 with 16 GB was tuned on.
 #[derive(Clone, Debug)]
@@ -83,11 +83,11 @@ impl Default for Settings {
 }
 
 /// Route table: for each (layer, expert), how often each expert of the next layer followed it.
-pub(crate) type Counts = HashMap<Key, HashMap<u32, u64>>;
+pub type Counts = HashMap<Key, HashMap<u32, u64>>;
 
 /// Adds one layer-to-layer step to the table: every expert picked now, for every expert picked
 /// in the layer before, token by token.
-pub(crate) fn count_step(counts: &mut Counts, layer: usize, before: &[Vec<u32>], now: &[Vec<u32>]) {
+pub fn count_step(counts: &mut Counts, layer: usize, before: &[Vec<u32>], now: &[Vec<u32>]) {
     for (a_row, b_row) in before.iter().zip(now.iter()) {
         // Nothing followed (a broken log line): leave no empty row behind to look like knowledge.
         if b_row.is_empty() {
@@ -104,7 +104,7 @@ pub(crate) fn count_step(counts: &mut Counts, layer: usize, before: &[Vec<u32>],
 
 /// Reads route logs from folders. A log is a "T ..." line followed by one line per layer:
 /// comma-separated tokens, each the space-separated experts the router picked for it.
-pub(crate) fn load_routes(dirs: &[&Path], layers: usize) -> Counts {
+pub fn load_routes(dirs: &[&Path], layers: usize) -> Counts {
     let mut counts = Counts::new();
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else { continue };

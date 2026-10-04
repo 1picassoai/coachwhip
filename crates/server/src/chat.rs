@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use candle::{Device, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use crate::model::{Model, Progress, Step};
+use coachwhip_engine::model::{Model, Progress, Step};
 use tokenizers::Tokenizer;
 
 /// Largest request body accepted: a prompt of a few hundred pages.
@@ -37,13 +37,13 @@ const SUMMARY_TOKENS: usize = 500;
 const SUMMARY_ASK: &str = "Summarise our conversation so far in at most 300 words, for someone who will continue it: what was asked, what was decided, and every name, file, function or fact the next answer will need. Plain text, no preamble.";
 
 /// Separates the streamed text from the closing stats line.
-pub(crate) const STATS_MARK: &str = "\u{1}STATS:";
+pub const STATS_MARK: &str = "\u{1}STATS:";
 
 /// A progress line sent while the prompt is read, before any text: `\u{1}PROG:<json>\n`.
-pub(crate) const PROG_MARK: &str = "\u{1}PROG:";
+pub const PROG_MARK: &str = "\u{1}PROG:";
 
 /// Ends the stream when the answer could not be finished; the page shows what follows it.
-pub(crate) const ERROR_MARK: &str = "\u{1}ERROR:";
+pub const ERROR_MARK: &str = "\u{1}ERROR:";
 
 /// After the GPU has run out of memory once, Metal does not recover in this process.
 fn gpu_out_of_memory(e: &anyhow::Error) -> bool {
@@ -326,7 +326,7 @@ fn message_text(content: &serde_json::Value) -> String {
 }
 
 /// An OpenAI conversation in the model's chat format, ready for the assistant's turn.
-pub(crate) fn chat_prompt(messages: &[serde_json::Value]) -> String {
+pub fn chat_prompt(messages: &[serde_json::Value]) -> String {
     let mut text = String::new();
     for m in messages {
         let role = match m["role"].as_str().unwrap_or("user") {
@@ -429,11 +429,11 @@ fn openai(mut s: TcpStream, body: &[u8], model: &mut Model, model_name: &str, to
     }
 }
 
-pub(crate) fn html_escape(t: &str) -> String {
+pub fn html_escape(t: &str) -> String {
     t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-pub(crate) fn chunk(s: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+pub fn chunk(s: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
@@ -560,9 +560,9 @@ fn handle(mut s: TcpStream, model: &mut Model, model_name: &str, tokenizer: &Tok
 }
 
 /// The page's thinking switch, left out for a model that has no thinking mode.
-pub(crate) const THINK_BOX: &str = r#"<label><input type="checkbox" id="think"> let it think first (slower)</label>"#;
+pub const THINK_BOX: &str = r#"<label><input type="checkbox" id="think"> let it think first (slower)</label>"#;
 
-pub(crate) const PAGE: &str = r##"<!doctype html>
+pub const PAGE: &str = r##"<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Coachwhip</title><style>
  :root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--text:#e6edf3;--dim:#8b949e;--on:#3fb950;--off:#6e7681}
  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);

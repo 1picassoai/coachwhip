@@ -27,7 +27,7 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
 }
 
 /// Words per block when a running-memory layer reads a prompt.
-pub(crate) const DELTA_CHUNK: usize = 64;
+pub const DELTA_CHUNK: usize = 64;
 
 /// The delta rule over a whole prompt, a block of words at a time (Gated DeltaNet, Yang, Kautz and
 /// Hatamizadeh, ICLR 2025, section 3). Gives the same answer as stepping word by word, but each
@@ -36,7 +36,7 @@ pub(crate) const DELTA_CHUNK: usize = 64;
 /// system, solved once per block on the CPU. Decays are kept as logarithms so long blocks never
 /// divide by a vanishing number.
 /// q, k: (l, n_v, dk); v: (l, n_v, dv); beta, log_decay: (l, n_v); s: (n_v, dk, dv).
-pub(crate) fn delta_chunked(q: &Tensor, k: &Tensor, v: &Tensor, beta: &Tensor, log_decay: &Tensor, mut s: Tensor) -> Result<(Tensor, Tensor)> {
+pub fn delta_chunked(q: &Tensor, k: &Tensor, v: &Tensor, beta: &Tensor, log_decay: &Tensor, mut s: Tensor) -> Result<(Tensor, Tensor)> {
     let (l, n_v, dk) = q.dims3()?;
     let dv = v.dim(2)?;
     let c = DELTA_CHUNK;

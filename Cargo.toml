@@ -1,12 +1,14 @@
-[package]
-name = "coachwhip"
-version = "0.2.0"
+[workspace]
+members = ["crates/engine", "crates/server", "crates/cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.1"
 edition = "2021"
-description = "Run mixture-of-experts models bigger than your memory on a Mac: an 80B model on 16 GB. The experts stream from the SSD into a small GPU bank."
 license = "Apache-2.0"
 publish = false
 
-[dependencies]
+[workspace.dependencies]
 candle = { package = "candle-core", git = "https://github.com/huggingface/candle", rev = "5ba5d5b468b5b1df40e82dd3d556987bedeea041", features = ["metal"] }
 candle-nn = { git = "https://github.com/huggingface/candle", rev = "5ba5d5b468b5b1df40e82dd3d556987bedeea041", features = ["metal"] }
 candle-transformers = { git = "https://github.com/huggingface/candle", rev = "5ba5d5b468b5b1df40e82dd3d556987bedeea041", features = ["metal"] }
@@ -17,6 +19,8 @@ clap = { version = "4.2.4", features = ["derive"] }
 anyhow = "1"
 serde_json = "1.0.99"
 rayon = "1"
+coachwhip-engine = { path = "crates/engine" }
+coachwhip-server = { path = "crates/server" }
 
 [profile.release]
 debug = false

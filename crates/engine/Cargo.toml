@@ -1,0 +1,15 @@
+[package]
+name = "coachwhip-engine"
+description = "The Coachwhip engine: MoE model families, the expert bank on the GPU, and streaming experts from the SSD."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+candle.workspace = true
+candle-nn.workspace = true
+candle-transformers.workspace = true
+candle-metal-kernels.workspace = true
+objc2-metal.workspace = true
+rayon.workspace = true

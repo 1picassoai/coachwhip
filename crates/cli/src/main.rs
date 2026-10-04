@@ -2,13 +2,8 @@
 //! model runs on 16 GB: the experts stream from the SSD into a small bank on the GPU, and the
 //! ones the next layer will probably need are fetched while the current layer computes.
 
-mod chat;
-mod experts;
-mod model;
-mod model_next;
-mod mv_id;
-#[cfg(test)]
-mod tests;
+use coachwhip_engine::{experts, model};
+use coachwhip_server::chat;
 
 use anyhow::Result;
 use candle::Device;
