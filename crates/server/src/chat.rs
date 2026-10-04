@@ -29,7 +29,7 @@ const MAX_BODY: usize = 1 << 20;
 const PROMPT_CHUNK: usize = 512;
 
 /// When a chat would grow past this many words, it is summarised first to make room.
-const CONTEXT_LIMIT: usize = 16384;
+pub const CONTEXT_LIMIT: usize = 16384;
 
 /// Longest summary written when making room.
 const SUMMARY_TOKENS: usize = 500;
@@ -317,7 +317,7 @@ fn summarise(model: &mut Model, tokenizer: &Tokenizer, device: &Device, session:
 }
 
 /// The text of an OpenAI message: a plain string, or a list of parts of which the text ones count.
-fn message_text(content: &serde_json::Value) -> String {
+pub fn message_text(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(t) => t.clone(),
         serde_json::Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"),
@@ -359,9 +359,7 @@ fn openai(mut s: TcpStream, body: &[u8], model: &mut Model, model_name: &str, to
     let stream = q["stream"].as_bool().unwrap_or(false);
     let asked = q["max_completion_tokens"].as_u64().or(q["max_tokens"].as_u64());
     let prompt = tokenizer.encode(chat_prompt(messages), true).map_err(anyhow::Error::msg)?.get_ids().to_vec();
-    // With no limit asked for, the answer gets whatever room the conversation leaves.
-    let room = CONTEXT_LIMIT.saturating_sub(prompt.len());
-    let max_new = asked.map_or(max_new.min(room), |m| (m as usize).min(max_new));
+    let max_new = answer_budget(asked, max_new, prompt.len());
     let id = format!("chatcmpl-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
     let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let prompt_len = prompt.len();
@@ -429,6 +427,21 @@ fn openai(mut s: TcpStream, body: &[u8], model: &mut Model, model_name: &str, to
     }
 }
 
+/// Only this machine's own page, or a program on this machine, may talk to the model: the Host
+/// must name this port on loopback, and an Origin, when a browser sends one, must too. Another
+/// site open in the browser could otherwise post prompts here. Headers arrive lower-cased.
+pub fn own_page(host: &str, origin: &str, port: u16) -> bool {
+    let local = |h: &str| h == format!("127.0.0.1:{port}") || h == format!("localhost:{port}");
+    local(host) && (origin.is_empty() || origin.strip_prefix("http://").is_some_and(local))
+}
+
+/// How many tokens an API answer may write: what the client asked for, capped by Coachwhip's own
+/// limit; with no limit asked for, whatever room the 16K conversation leaves.
+pub fn answer_budget(asked: Option<u64>, max_new: usize, prompt_len: usize) -> usize {
+    let room = CONTEXT_LIMIT.saturating_sub(prompt_len);
+    asked.map_or(max_new.min(room), |m| (m as usize).min(max_new))
+}
+
 pub fn html_escape(t: &str) -> String {
     t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -468,11 +481,7 @@ fn handle(mut s: TcpStream, model: &mut Model, model_name: &str, tokenizer: &Tok
             origin = v.trim().to_string();
         }
     }
-    // Only this machine's own page may talk to the model: another site open in the browser
-    // could otherwise post prompts here.
-    let port = s.local_addr()?.port();
-    let local = |h: &str| h == format!("127.0.0.1:{port}") || h == format!("localhost:{port}");
-    let own_page = local(&host) && (origin.is_empty() || origin.strip_prefix("http://").is_some_and(local));
+    let own_page = own_page(&host, &origin, s.local_addr()?.port());
     let path = path.split('?').next().unwrap_or("/").to_string();
     let api = path.starts_with("/v1/");
     if (path == "/ask" || api) && (!own_page || len > MAX_BODY) {

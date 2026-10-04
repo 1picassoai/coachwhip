@@ -46,16 +46,116 @@ struct BankMat {
 
 struct Bank {
     mats: [BankMat; 3],
-    holder: Vec<Option<u32>>,
-    slot_of: HashMap<u32, usize>,
-    lru: VecDeque<usize>,
+    slots: Slots,
     /// False while the prefetch thread is still reading an expert into the slot.
     ready: Vec<Arc<AtomicBool>>,
-    /// Experts the prefetch thread brought in that no token has asked for yet.
-    prefetched: HashSet<u32>,
+}
+
+/// A bank's bookkeeping, apart from the GPU memory it describes: which expert sits in which
+/// slot, and the order slots were last used in. Pure, so it can be tested without a GPU.
+#[derive(Clone, Debug)]
+pub struct Slots {
+    pub holder: Vec<Option<u32>>,
+    pub slot_of: HashMap<u32, usize>,
+    /// Slots from least to most recently used.
+    pub lru: VecDeque<usize>,
+    /// Experts a prefetch brought in that no token has asked for yet.
+    pub prefetched: HashSet<u32>,
+}
+
+/// What one forward needs from a layer's bank: the experts already there and the ones to read in.
+#[derive(Debug, Default, PartialEq)]
+pub struct Plan {
+    pub hits: Vec<(u32, usize)>,
+    pub misses: Vec<(u32, usize)>,
+    /// Hits that a prefetch had brought in.
+    pub prefetch_hits: u64,
+}
+
+impl Slots {
+    pub fn new(n: usize) -> Self {
+        Self { holder: vec![None; n], slot_of: HashMap::new(), lru: (0..n).collect(), prefetched: HashSet::new() }
+    }
+
+    /// The least recently used slot that is not being filled (`ready`) and does not hold one of `keep`.
+    fn victim(&self, ready: &impl Fn(usize) -> bool, keep: &[u32]) -> Option<usize> {
+        self.lru.iter().position(|&slot| ready(slot) && self.holder[slot].map_or(true, |h| !keep.contains(&h)))
+    }
+
+    fn put(&mut self, pos: usize, e: u32) -> usize {
+        let slot = self.lru.remove(pos).unwrap();
+        if let Some(old) = self.holder[slot] {
+            self.slot_of.remove(&old);
+            self.prefetched.remove(&old);
+        }
+        self.holder[slot] = Some(e);
+        self.slot_of.insert(e, slot);
+        self.lru.push_back(slot);
+        slot
+    }
+
+    /// Give every expert in `needed` a slot: hits move to most recently used, misses take the least
+    /// recently used slot that is ready and holds nothing this forward needs. None, and nothing
+    /// changed, when too few such slots are free (the caller then reads the experts fresh).
+    pub fn assign(&mut self, needed: &[u32], ready: impl Fn(usize) -> bool) -> Option<Plan> {
+        let missing = needed.iter().filter(|e| !self.slot_of.contains_key(e)).count();
+        let free = self.lru.iter().filter(|&&slot| ready(slot) && self.holder[slot].map_or(true, |h| !needed.contains(&h))).count();
+        if free < missing {
+            return None;
+        }
+        let mut plan = Plan::default();
+        for &e in needed {
+            if let Some(&slot) = self.slot_of.get(&e) {
+                self.lru.retain(|&x| x != slot);
+                self.lru.push_back(slot);
+                if self.prefetched.remove(&e) {
+                    plan.prefetch_hits += 1;
+                }
+                plan.hits.push((e, slot));
+                continue;
+            }
+            let pos = self.victim(&ready, needed).expect("a bank always has a slot that this forward does not need");
+            plan.misses.push((e, self.put(pos, e)));
+        }
+        Some(plan)
+    }
+
+    /// Reserve slots for the predicted experts not already held, best first, as far as free slots
+    /// go; never evicts another predicted expert or a slot still being filled.
+    pub fn reserve(&mut self, predicted: &[u32], ready: impl Fn(usize) -> bool) -> Vec<(u32, usize)> {
+        let mut out = Vec::new();
+        for &e in predicted {
+            if self.slot_of.contains_key(&e) {
+                continue;
+            }
+            let Some(pos) = self.victim(&ready, predicted) else { continue };
+            let slot = self.put(pos, e);
+            self.prefetched.insert(e);
+            out.push((e, slot));
+        }
+        out
+    }
 }
 
 pub type Key = (usize, u32);
+
+/// Scores for layer `layer + 1`'s experts given `layer`'s picks (expert, weight), from the route
+/// table: each pick hands its weight on in proportion to where it has led before. Best first;
+/// equal scores in expert order, so the same table always gives the same guess.
+pub fn next_scores(routes: &Counts, layer: usize, now: &[(u32, f32)]) -> Vec<(u32, f32)> {
+    let mut score: HashMap<u32, f32> = HashMap::new();
+    for &(a, w) in now {
+        if let Some(row) = routes.get(&(layer, a)) {
+            let total = row.values().sum::<u64>().max(1) as f32;
+            for (&b, &n) in row {
+                *score.entry(b).or_insert(0.0) += w * n as f32 / total;
+            }
+        }
+    }
+    let mut v: Vec<(u32, f32)> = score.into_iter().collect();
+    v.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap().then(x.0.cmp(&y.0)));
+    v
+}
 
 /// How the store behaves. `Default` is what the Mac mini M4 with 16 GB was tuned on.
 #[derive(Clone, Debug)]
@@ -268,21 +368,8 @@ impl ExpertStore {
         Ok(store)
     }
 
-    /// Scores for the next layer's experts given this layer's picks, from the route table.
     fn next_scores(&self, layer: usize, now: &[(u32, f32)]) -> Vec<(u32, f32)> {
-        let mut score: HashMap<u32, f32> = HashMap::new();
-        let routes = self.routes.lock().unwrap();
-        for &(a, w) in now {
-            if let Some(row) = routes.get(&(layer, a)) {
-                let total = row.values().sum::<u64>().max(1) as f32;
-                for (&b, &n) in row {
-                    *score.entry(b).or_insert(0.0) += w * n as f32 / total;
-                }
-            }
-        }
-        let mut v: Vec<(u32, f32)> = score.into_iter().collect();
-        v.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap());
-        v
+        next_scores(&self.routes.lock().unwrap(), layer, now)
     }
 
     /// The `k` likeliest experts of `layer` that are not in its bank yet, one layer ahead of `now`
@@ -298,7 +385,7 @@ impl ExpertStore {
         scores
             .into_iter()
             .map(|(e, _)| e)
-            .filter(|e| present.map_or(true, |b| !b.slot_of.contains_key(e)))
+            .filter(|e| present.map_or(true, |b| !b.slots.slot_of.contains_key(e)))
             .take(k)
             .collect()
     }
@@ -320,29 +407,11 @@ impl ExpertStore {
         {
             let mut banks = self.banks.lock().unwrap();
             let Some(bank) = banks.get_mut(&layer) else { return Ok(()) };
-            for &e in predicted {
-                if bank.slot_of.contains_key(&e) {
-                    continue;
-                }
-                let Some(pos) = bank
-                    .lru
-                    .iter()
-                    .position(|&slot| bank.ready[slot].load(Ordering::Acquire) && bank.holder[slot].map_or(true, |h| !predicted.contains(&h)))
-                else {
-                    continue;
-                };
-                let slot = bank.lru.remove(pos).unwrap();
-                if let Some(old) = bank.holder[slot] {
-                    bank.slot_of.remove(&old);
-                    bank.prefetched.remove(&old);
-                }
-                bank.ready[slot].store(false, Ordering::Release);
-                bank.holder[slot] = Some(e);
-                bank.slot_of.insert(e, slot);
-                bank.prefetched.insert(e);
-                bank.lru.push_back(slot);
+            let ready = &bank.ready;
+            for (e, slot) in bank.slots.reserve(predicted, |s| ready[s].load(Ordering::Acquire)) {
+                ready[slot].store(false, Ordering::Release);
                 let ptrs = [0, 1, 2].map(|i| (bank.mats[i].base + slot * bank.mats[i].bytes, bank.mats[i].bytes));
-                jobs.push((e, ptrs, bank.ready[slot].clone()));
+                jobs.push((e, ptrs, ready[slot].clone()));
             }
         }
         for (e, ptrs, ready) in jobs {
@@ -383,11 +452,8 @@ impl ExpertStore {
         self.device.synchronize()?;
         Ok(Bank {
             mats,
-            holder: vec![None; self.per_layer],
-            slot_of: HashMap::new(),
-            lru: (0..self.per_layer).collect(),
+            slots: Slots::new(self.per_layer),
             ready: (0..self.per_layer).map(|_| Arc::new(AtomicBool::new(true))).collect(),
-            prefetched: HashSet::new(),
         })
     }
 
@@ -448,42 +514,22 @@ impl ExpertStore {
         let bank = banks.get_mut(&layer).unwrap();
         // A slot still being filled by a prefetch cannot be taken; if too few are free for this
         // layer's misses, read them fresh instead, before the bank is touched.
-        let missing = needed.iter().filter(|e| !bank.slot_of.contains_key(e)).count();
-        let free = bank.lru.iter().filter(|&&slot| bank.ready[slot].load(Ordering::Acquire) && bank.holder[slot].map_or(true, |h| !needed.contains(&h))).count();
-        if free < missing {
+        let ready = &bank.ready;
+        let Some(plan) = bank.slots.assign(needed, |s| ready[s].load(Ordering::Acquire)) else {
             return Ok(None);
-        }
-        let mut misses: Vec<(u32, usize)> = Vec::new();
-        for &e in needed {
-            if let Some(&slot) = bank.slot_of.get(&e) {
-                // A prefetch may still be reading this one in; wait for it rather than read it twice.
-                while !bank.ready[slot].load(Ordering::Acquire) {
-                    std::thread::yield_now();
-                }
-                bank.lru.retain(|&x| x != slot);
-                bank.lru.push_back(slot);
-                let mut st = self.stats.lock().unwrap();
-                st.hits += 1;
-                if bank.prefetched.remove(&e) {
-                    st.prefetch_hits += 1;
-                }
-                continue;
+        };
+        // A prefetch may still be reading a hit in; wait for it rather than read it twice.
+        for &(_, slot) in &plan.hits {
+            while !bank.ready[slot].load(Ordering::Acquire) {
+                std::thread::yield_now();
             }
-            let pos = bank
-                .lru
-                .iter()
-                .position(|&slot| bank.ready[slot].load(Ordering::Acquire) && bank.holder[slot].map_or(true, |h| !needed.contains(&h)))
-                .expect("a bank always has a slot that this forward does not need");
-            let slot = bank.lru.remove(pos).unwrap();
-            if let Some(old) = bank.holder[slot] {
-                bank.slot_of.remove(&old);
-                bank.prefetched.remove(&old);
-            }
-            bank.holder[slot] = Some(e);
-            bank.slot_of.insert(e, slot);
-            bank.lru.push_back(slot);
-            misses.push((e, slot));
         }
+        {
+            let mut st = self.stats.lock().unwrap();
+            st.hits += plan.hits.len() as u64;
+            st.prefetch_hits += plan.prefetch_hits;
+        }
+        let misses = plan.misses;
         if !misses.is_empty() {
             // All of this layer's misses go to the SSD at once: it serves several requests in
             // parallel far faster than one after another. Each matrix of each expert is one read.
@@ -509,7 +555,7 @@ impl ExpertStore {
             st.bytes_loaded += reads.iter().map(|r| r.1 as u64).sum::<u64>();
             st.load_seconds += started.elapsed().as_secs_f64();
         }
-        Ok(Some(bank.slot_of.clone()))
+        Ok(Some(bank.slots.slot_of.clone()))
     }
 
     /// One `mul_mv_id` dispatch over a bank matrix.
@@ -686,6 +732,18 @@ impl CustomOp2 for MoeMatvec {
     }
 }
 
+/// The router's choice for each token: the `top_k` likeliest experts from the router's scores,
+/// best first, and their weights, rescaled to sum to 1 when `norm`.
+pub fn route(logits: &Tensor, top_k: usize, norm: bool) -> Result<(Tensor, Tensor)> {
+    let probs = candle_nn::ops::softmax_last_dim(logits)?;
+    let top_ids = probs.arg_sort_last_dim(false)?.narrow(D::Minus1, 0, top_k)?.contiguous()?;
+    let mut top_w = probs.gather(&top_ids, D::Minus1)?;
+    if norm {
+        top_w = top_w.broadcast_div(&top_w.sum_keepdim(D::Minus1)?)?;
+    }
+    Ok((top_ids, top_w))
+}
+
 /// A MoE layer whose experts live in the ExpertStore instead of on the device.
 pub struct StreamedMoe {
     pub layer: usize,
@@ -753,12 +811,7 @@ impl StreamedMoe {
         let n = b * s;
         let xs = xs.reshape((n, h))?.to_dtype(DType::F32)?.contiguous()?;
 
-        let probs = candle_nn::ops::softmax_last_dim(&self.gate.forward(&xs)?)?;
-        let top_ids = probs.arg_sort_last_dim(false)?.narrow(D::Minus1, 0, self.top_k)?.contiguous()?;
-        let mut top_w = probs.gather(&top_ids, D::Minus1)?;
-        if self.norm_topk_prob {
-            top_w = top_w.broadcast_div(&top_w.sum_keepdim(D::Minus1)?)?;
-        }
+        let (top_ids, top_w) = route(&self.gate.forward(&xs)?, self.top_k, self.norm_topk_prob)?;
         // Reading the picks back waits for the GPU to finish everything queued so far, so no
         // kernel is still reading a bank slot when `ensure` and the prefetchers overwrite it.
         // Keep this wait if this code ever changes.
