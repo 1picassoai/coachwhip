@@ -61,9 +61,11 @@ Coachwhip is an engine for MoE models, in GGUF format.
 | Qwen3-30B-A3B, other Qwen3 MoE | qwen3moe | Supported. |
 | Mixtral, Qwen2-MoE, OLMoE, DeepSeek, gpt-oss, GLM | | Coming next. |
 
+Speed and a quality check for each model file, measured on a 16 GB Mac: [docs/MODELS.md](docs/MODELS.md).
+
 Try other MoE models and tell us what happens. If a model's architecture is not supported yet, Coachwhip says so, and an issue is the fastest way to move it up the list.
 
-**Which GGUF file.** Coachwhip reads the standard GGUF quantisations (Q4_K, Q5_K, Q6_K, Q8_0, F16). Some newer conversions store a few tensors in MXFP4 or fuse the attention weights into one tensor; Coachwhip does not read those yet. For Qwen3-Coder-Next, [MaziyarPanahi's Q4_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) loads as is.
+**Which GGUF file.** Coachwhip reads the standard GGUF quantisations (Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, F16). Some newer conversions store a few tensors in MXFP4 or fuse the attention weights into one tensor; Coachwhip does not read those yet. For Qwen3-Coder-Next, [MaziyarPanahi's Q4_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) loads as is.
 
 ## What you need
 
