@@ -119,6 +119,8 @@ The last number is the bank (44 if you leave it out). The chat opens in your bro
 | API key | anything; it is ignored |
 | Model | the model's file name, as listed at `/v1/models` |
 
+A conversation holds up to 16K tokens: the history, the question and the answer together. That limit is sized to fit a 16 GB Mac; the models themselves support longer.
+
 Only programs on this Mac can reach it. Follow-ups that resend the whole conversation read only the new part. The chat page and your tools share one model, one request at a time; when a tool has used it, the page's next question starts a new chat.
 
 Tested with the official `openai` Python client and with [Aider](https://aider.chat), the coding agent for the terminal:
