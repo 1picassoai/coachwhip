@@ -20,7 +20,7 @@ Coachwhip is built around that fact:
 
 - **Streams experts, not files.** The small, always-used part of the model lives on the GPU. The experts stay on the SSD, and for each word Coachwhip reads exactly the experts the router picked.
 - **An expert bank on the GPU.** Recently used experts stay in a bank in the GPU's memory and are reused, so the SSD is only touched for experts the bank does not hold.
-- **The hot path.** While the GPU works on one layer, Coachwhip predicts which experts the next layer will want and fetches them in parallel. The predictions are learned from the routes the model has taken before, and every chat teaches it more.
+- **The early guess.** While the GPU works on one layer, Coachwhip runs the router of a layer four steps ahead on the same input, so it already knows most of the experts that layer will want, and reads them in while the GPU is busy. A guess that would land too late is dropped rather than evicting an expert still in use. The last few layers, which have no later router, use the routes the model has taken before, and every chat teaches that table more.
 - **One GPU dispatch per layer.** All the experts a layer picked run together in a single fused kernel.
 - **Reads while it computes.** When a prompt needs more experts than the bank holds, the GPU starts on each expert the moment its bytes land, while the rest are still being read.
 - **Unified memory, used properly.** On Apple silicon the CPU and GPU share one memory, so an expert read from the SSD lands straight where the GPU reads it. No copies.
@@ -152,7 +152,9 @@ cd ~/coachwhip
 | `--chat 8090` | Serve the chat page on that port, on this machine only |
 | `--max-tokens 4000` | Longest answer |
 | `--temperature 0` | Always pick the likeliest word (same answer every time) |
-| `--bank 44` | Expert slots kept on the GPU per layer (56 for the 80B) |
+| `--bank 44` | Expert slots kept on the GPU per layer (56 for the 80B, 70 for its Q3_K_M file) |
+| `--prefetch 10` | Experts guessed and read in ahead, per layer; 0 turns the guess off |
+| `--ahead 4` | How many layers ahead the guess looks |
 | `--profile` | Print where the time went after each answer |
 | `--help` | Everything else |
 
@@ -165,7 +167,7 @@ cd ~/coachwhip
 
 ## Credits
 
-Built on [Candle](https://github.com/huggingface/candle). `src/model.rs` is derived from Candle's Qwen3 model, and the fused expert kernel is ggml's `mul_mv_id`, which ships inside Candle. The block-at-a-time linear attention follows [Gated Delta Networks](https://arxiv.org/abs/2412.06464) (Yang, Kautz and Hatamizadeh, ICLR 2025).
+Built on [Candle](https://github.com/huggingface/candle). `crates/engine/src/model.rs` is derived from Candle's Qwen3 model, and the fused expert kernel is ggml's `mul_mv_id`, which ships inside Candle. The block-at-a-time linear attention follows [Gated Delta Networks](https://arxiv.org/abs/2412.06464) (Yang, Kautz and Hatamizadeh, ICLR 2025).
 
 ## Licence
 

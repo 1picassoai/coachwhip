@@ -144,6 +144,8 @@ impl Qwen3Moe {
             let moe = StreamedMoe {
                 layer,
                 gate: Linear::new(gate, None),
+                next_gate: None,
+                ahead: settings.ahead.max(1),
                 store: store.clone(),
                 top_k,
                 norm_topk_prob,
@@ -169,6 +171,12 @@ impl Qwen3Moe {
                 moe,
                 ffn_norm: gg.rms_norm(&format!("{p}.ffn_norm.weight"), rms_norm_eps)?,
             });
+        }
+        // Each layer gets the router of the layer `ahead` on, to guess its experts early; the last
+        // `ahead` layers have no later router and use the learned route table.
+        let ahead = settings.ahead.max(1);
+        for i in ahead..layers.len() {
+            layers[i - ahead].moe.next_gate = Some(layers[i].moe.gate.clone());
         }
         Ok(Self { embeddings: Embedding::new(embeddings, embedding_length), layers, norm, output, store, dtype, device: device.clone(), thinks, progress: None })
     }

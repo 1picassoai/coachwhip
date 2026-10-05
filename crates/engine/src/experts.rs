@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::os::unix::fs::FileExt;
 use rayon::prelude::*;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::Instant;
 
@@ -162,9 +162,10 @@ pub fn next_scores(routes: &Counts, layer: usize, now: &[(u32, f32)]) -> Vec<(u3
 pub struct Settings {
     /// Expert slots kept per layer (one expert each: about 3 MB for the 30B, 2 MB for the 80B, at Q4_K_M).
     pub bank: usize,
-    /// Experts predicted and fetched ahead for the next layer; 0 turns prefetch off.
+    /// Experts guessed and fetched ahead per layer; 0 turns prefetch off.
     pub prefetch: usize,
-    /// How many layers ahead to predict.
+    /// How many layers ahead the guess looks: layer n runs layer n + ahead's own router on its
+    /// input, so the reads have that many layers of GPU work to land in.
     pub ahead: usize,
     /// Reader threads that fetch predicted experts.
     pub readers: usize,
@@ -178,7 +179,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { bank: 44, prefetch: 2, ahead: 1, readers: 3, routes: None, learned: None, profile: false }
+        Self { bank: 44, prefetch: 10, ahead: 4, readers: 3, routes: None, learned: None, profile: false }
     }
 }
 
@@ -259,6 +260,12 @@ struct Stats {
     fresh_build_seconds: f64,
     prefetch_copies: u64,
     prefetch_hits: u64,
+    /// Guessed reads thrown away because the word had moved past their layer.
+    stale_dropped: u64,
+    /// Time a forward spent waiting for a guessed expert still being read in.
+    prefetch_wait_seconds: f64,
+    /// Forwards that fit the bank but found too few free slots (guesses still landing).
+    crowded: u64,
     words: u64,
     word_started: Option<Instant>,
     word_seconds: f64,
@@ -287,7 +294,25 @@ pub struct ExpertStore {
     trail: Mutex<Trail>,
     learned: Option<std::path::PathBuf>,
     learned_file: String,
-    prefetch_tx: Mutex<Option<mpsc::Sender<(usize, Vec<u32>)>>>,
+    /// Prefetch jobs: the layer to fill, the word they were guessed for, the experts.
+    prefetch_tx: Mutex<Option<mpsc::Sender<(usize, u64, Vec<u32>)>>>,
+    /// The word being written (one-word steps only) and the layer it has reached.
+    word: AtomicU64,
+    now_layer: AtomicUsize,
+}
+
+/// Expert ids ordered by a router's scores, best first. Equal scores keep expert order, so the
+/// same scores always give the same guess.
+pub fn rank(scores: &[f32]) -> Vec<u32> {
+    let mut ids: Vec<u32> = (0..scores.len() as u32).collect();
+    ids.sort_by(|&a, &b| scores[b as usize].partial_cmp(&scores[a as usize]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+    ids
+}
+
+/// A guessed read is stale once its word is over, or the word has reached its layer: from then
+/// on that layer reads its own misses, and a late guess would only evict experts still to be used.
+pub fn is_stale(job_layer: usize, job_word: u64, now_layer: usize, now_word: u64) -> bool {
+    job_word != now_word || job_layer <= now_layer
 }
 
 impl ExpertStore {
@@ -347,10 +372,12 @@ impl ExpertStore {
             learned: settings.learned.clone(),
             learned_file: format!("{started}.log"),
             prefetch_tx: Mutex::new(None),
+            word: AtomicU64::new(0),
+            now_layer: AtomicUsize::new(0),
         });
-        // The prefetch thread reads predicted experts into free slots while the GPU works on the
-        // current layer. It holds only a weak handle, so the store still shuts down when the model does.
-        let (tx, rx) = mpsc::channel::<(usize, Vec<u32>)>();
+        // The prefetch threads read guessed experts into free slots while the GPU works on the
+        // current layer. They hold only a weak handle, so the store still shuts down with the model.
+        let (tx, rx) = mpsc::channel::<(usize, u64, Vec<u32>)>();
         *store.prefetch_tx.lock().unwrap() = Some(tx);
         let rx = Arc::new(Mutex::new(rx));
         for _ in 0..settings.readers {
@@ -358,8 +385,12 @@ impl ExpertStore {
             let rx = rx.clone();
             std::thread::spawn(move || loop {
                 let job = rx.lock().unwrap().recv();
-                let Ok((layer, experts)) = job else { break };
+                let Ok((layer, word, experts)) = job else { break };
                 let Some(st) = weak.upgrade() else { break };
+                if is_stale(layer, word, st.now_layer.load(Ordering::Acquire), st.word.load(Ordering::Acquire)) {
+                    st.stats.lock().unwrap().stale_dropped += experts.len() as u64;
+                    continue;
+                }
                 if let Err(e) = st.prefetch(layer, &experts) {
                     eprintln!("coachwhip: prefetch failed: {e}");
                 }
@@ -390,14 +421,35 @@ impl ExpertStore {
             .collect()
     }
 
-    /// Hand the next layer's predicted experts to the prefetch thread.
+    /// Hand a layer's guessed experts to the prefetch threads.
     fn request_prefetch(&self, layer: usize, predicted: Vec<u32>) {
         if predicted.is_empty() {
             return;
         }
         if let Some(tx) = self.prefetch_tx.lock().unwrap().as_ref() {
-            let _ = tx.send((layer, predicted));
+            let _ = tx.send((layer, self.word.load(Ordering::Acquire), predicted));
         }
+    }
+
+    /// Prefetch those of the top `k` experts in `guess` (best first) that `layer`'s bank does not
+    /// hold, in pairs across the reader threads so they are read side by side.
+    fn prefetch_guess(&self, layer: usize, guess: &[u32], k: usize) {
+        let missing: Vec<u32> = {
+            let banks = self.banks.lock().unwrap();
+            let present = banks.get(&layer);
+            guess.iter().take(k).copied().filter(|e| present.map_or(true, |b| !b.slots.slot_of.contains_key(e))).collect()
+        };
+        for pair in missing.chunks(2) {
+            self.request_prefetch(layer, pair.to_vec());
+        }
+    }
+
+    /// Mark where the word being written has got to; layer 0 starts a new word.
+    fn reached(&self, layer: usize) {
+        if layer == 0 {
+            self.word.fetch_add(1, Ordering::AcqRel);
+        }
+        self.now_layer.store(layer, Ordering::Release);
     }
 
     /// Prefetch thread: reserve free slots for the predicted experts, then read them in with the
@@ -516,18 +568,25 @@ impl ExpertStore {
         // layer's misses, read them fresh instead, before the bank is touched.
         let ready = &bank.ready;
         let Some(plan) = bank.slots.assign(needed, |s| ready[s].load(Ordering::Acquire)) else {
+            self.stats.lock().unwrap().crowded += 1;
             return Ok(None);
         };
         // A prefetch may still be reading a hit in; wait for it rather than read it twice.
+        let mut waited = 0.0;
         for &(_, slot) in &plan.hits {
-            while !bank.ready[slot].load(Ordering::Acquire) {
-                std::thread::yield_now();
+            if !bank.ready[slot].load(Ordering::Acquire) {
+                let wait = Instant::now();
+                while !bank.ready[slot].load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                waited += wait.elapsed().as_secs_f64();
             }
         }
         {
             let mut st = self.stats.lock().unwrap();
             st.hits += plan.hits.len() as u64;
             st.prefetch_hits += plan.prefetch_hits;
+            st.prefetch_wait_seconds += waited;
         }
         let misses = plan.misses;
         if !misses.is_empty() {
@@ -639,6 +698,10 @@ impl ExpertStore {
             s.prefetch_copies,
             s.prefetch_hits
         );
+        eprintln!(
+            "coachwhip: waited {:.2} s on guesses still landing; dropped {} stale guessed reads; {} layers read fresh because the bank was crowded",
+            s.prefetch_wait_seconds, s.stale_dropped, s.crowded
+        );
         if s.fresh > 0 {
             eprintln!(
                 "coachwhip: prompt experts: {} read outside the bank, {:.2} s reading, {:.2} s copying to the GPU",
@@ -748,6 +811,10 @@ pub fn route(logits: &Tensor, top_k: usize, norm: bool) -> Result<(Tensor, Tenso
 pub struct StreamedMoe {
     pub layer: usize,
     pub gate: Linear,
+    /// A later layer's router (`ahead` layers on), run early on this layer's input to guess
+    /// that layer's experts while there is still time to read them in.
+    pub next_gate: Option<Linear>,
+    pub ahead: usize,
     pub store: Arc<ExpertStore>,
     pub top_k: usize,
     pub norm_topk_prob: bool,
@@ -809,9 +876,17 @@ impl StreamedMoe {
         let started = Instant::now();
         let dtype = xs.dtype();
         let n = b * s;
+        if n == 1 {
+            self.store.reached(self.layer);
+        }
         let xs = xs.reshape((n, h))?.to_dtype(DType::F32)?.contiguous()?;
 
         let (top_ids, top_w) = route(&self.gate.forward(&xs)?, self.top_k, self.norm_topk_prob)?;
+        // The guess for a later layer is queued before the read-back below, so it costs no wait.
+        let early = match &self.next_gate {
+            Some(g) if n == 1 && self.prefetch_k > 0 => Some(g.forward(&xs)?),
+            _ => None,
+        };
         // Reading the picks back waits for the GPU to finish everything queued so far, so no
         // kernel is still reading a bank slot when `ensure` and the prefetchers overwrite it.
         // Keep this wait if this code ever changes.
@@ -821,7 +896,10 @@ impl StreamedMoe {
         needed.sort_unstable();
         needed.dedup();
         let slot_of = self.store.ensure(self.layer, &needed)?;
-        if n == 1 && self.prefetch_k > 0 {
+        if let Some(logits) = early {
+            let scores: Vec<f32> = logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
+            self.store.prefetch_guess(self.layer + self.ahead, &rank(&scores), self.prefetch_k);
+        } else if n == 1 && self.prefetch_k > 0 {
             for ahead in 1..=self.store.ahead {
                 if self.layer + ahead < self.store.slices.len() {
                     let predicted = self.store.predict_missing(self.layer, &needed, ahead, self.prefetch_k);

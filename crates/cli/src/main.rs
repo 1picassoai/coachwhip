@@ -52,9 +52,13 @@ struct Args {
     #[arg(long, default_value_t = 44)]
     bank: usize,
 
-    /// Experts fetched ahead for the next layer; 0 turns prefetch off.
-    #[arg(long, default_value_t = 2)]
+    /// Experts guessed and fetched ahead per layer; 0 turns prefetch off.
+    #[arg(long, default_value_t = 10)]
     prefetch: usize,
+
+    /// How many layers ahead the guess looks (each layer is about 2 ms of GPU work to read in).
+    #[arg(long, default_value_t = 4)]
+    ahead: usize,
 
     /// Reader threads for the prefetch.
     #[arg(long, default_value_t = 3)]
@@ -85,7 +89,7 @@ fn main() -> Result<()> {
     let settings = experts::Settings {
         bank: args.bank,
         prefetch: args.prefetch,
-        ahead: 1,
+        ahead: args.ahead.max(1),
         readers: args.readers,
         routes: routes.is_dir().then_some(routes),
         learned: Some(learned.clone()),

@@ -22,6 +22,15 @@ fn l2_norm(x: &Tensor, eps: f64) -> Result<Tensor> {
     x.broadcast_div(&n)
 }
 
+/// Give each layer the router of the layer `ahead` on, so it can guess that layer's experts early.
+/// The last `ahead` layers have no later router and fall back to the learned route table.
+fn wire_lookahead(layers: &mut [Layer], ahead: usize) {
+    let ahead = ahead.max(1);
+    for i in ahead..layers.len() {
+        layers[i - ahead].moe.next_gate = Some(layers[i].moe.gate.clone());
+    }
+}
+
 fn softplus(x: &Tensor) -> Result<Tensor> {
     (x.exp()? + 1.0)?.log()
 }
@@ -383,6 +392,8 @@ impl Qwen3Next {
             let moe = StreamedMoe {
                 layer,
                 gate: Linear::new(gate, None),
+                next_gate: None,
+                ahead: settings.ahead.max(1),
                 store: store.clone(),
                 top_k,
                 norm_topk_prob: true,
@@ -402,6 +413,7 @@ impl Qwen3Next {
                 shared,
             });
         }
+        wire_lookahead(&mut layers, settings.ahead);
         Ok(Self { embeddings: Embedding::new(embeddings, embedding_length), layers, norm, output, store, device: device.clone(), thinks, progress: None })
     }
 

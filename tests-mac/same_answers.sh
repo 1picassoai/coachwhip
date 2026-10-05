@@ -1,6 +1,6 @@
 #!/bin/bash
 # Speed settings must never change what the model says. Runs one prompt at temperature 0 with
-# different banks and prefetch settings and checks every answer is byte-identical.
+# different banks, prefetch sizes and look-aheads and checks every answer is byte-identical.
 # Needs a Mac with the model: tests-mac/same_answers.sh /path/to/model.gguf /path/to/tokenizer.json
 set -u
 MODEL=${1:?model.gguf}
@@ -18,10 +18,11 @@ run() {
 run bank44 --bank 44
 run bank56 --bank 56
 run no-prefetch --bank 56 --prefetch 0
-run prefetch8 --bank 56 --prefetch 8
+run ahead1 --bank 56 --ahead 1
+run ahead4-k20 --bank 56 --ahead 4 --prefetch 20
 
 ref=$(shasum -a 256 < "$OUT/bank44.txt" | cut -c1-16)
-for t in bank56 no-prefetch prefetch8; do
+for t in bank56 no-prefetch ahead1 ahead4-k20; do
   got=$(shasum -a 256 < "$OUT/$t.txt" | cut -c1-16)
   if [ "$got" = "$ref" ]; then echo "same  $t"; else echo "DIFF  $t (see $OUT)"; fail=1; fi
 done
