@@ -1,0 +1,7 @@
+[
+  {"id": "intervals", "prompt": "Write a Python function that merges overlapping intervals, with a short explanation."},
+  {"id": "debounce", "prompt": "Write a JavaScript function debounce(fn, ms) and explain in two sentences how it works."},
+  {"id": "lru", "prompt": "Write a TypeScript class LRUCache<K, V> with get, set and delete in O(1), with a short explanation."},
+  {"id": "sql", "prompt": "Write a SQL query that returns each customer's most recent order, and explain the approach briefly."},
+  {"id": "rust", "prompt": "Write a Rust function that reverses a singly linked list, with a short explanation."}
+]

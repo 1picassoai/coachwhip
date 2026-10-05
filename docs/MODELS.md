@@ -5,8 +5,8 @@ What each model file does on a 16 GB Mac, measured the same way every time. Thes
 ## How we measure
 
 - **Machine:** Mac mini M4, 16 GB, macOS 26.
-- **Engine:** Coachwhip 0.2.0, temperature 0.
-- **Speed:** one answer to *"Write a Python function that merges overlapping intervals, with a short explanation."*, capped at 300 tokens. "Writing" is tokens written per second once the answer has started, as Coachwhip counts it: the same figure the chat shows under each answer.
+- **Engine:** Coachwhip 0.3.0 with its default settings (`--prefetch 10 --ahead 4`), temperature 0.
+- **Speed:** the five coding prompts in [`bench/speed/prompts.json`](../bench/speed/prompts.json), each a fresh conversation capped at 300 tokens, run by [`bench/speed/run.py`](../bench/speed/run.py). "Writing" is answer tokens per second from the first token to the last, the same thing the chat shows under each answer; the table gives the mean over the five prompts, with the slowest and fastest in brackets.
 - **Quality:** 8 small coding tasks in [`bench/quality/tasks.json`](../bench/quality/tasks.json). Each answer's code is run against tests the model never sees ([`bench/quality/tests.py`](../bench/quality/tests.py)); a task passes only if every test does. Quality depends on the model file, not on Coachwhip's settings: the bank and the prefetch change how fast an answer comes, never what it says.
 
 ## Qwen3-Coder-Next (80B)
@@ -31,7 +31,8 @@ Qwen3-Coder-30B-A3B and Qwen3-Next-80B-A3B-Instruct run on Coachwhip (see the RE
 ```sh
 ~/coachwhip/target/release/coachwhip --model /path/to/model.gguf --tokenizer /path/to/tokenizer.json \
     --bank 56 --temperature 0 --chat 8090
+python3 bench/speed/run.py
 python3 bench/quality/run.py
 ```
 
-`run.py` asks the 8 tasks through Coachwhip's API, runs each answer against the tests, and prints pass or fail per task. It needs only Python 3. The chat's speed line gives the writing speed for any prompt you like.
+`bench/speed/run.py` streams the five prompts and prints each answer's writing speed and the mean. `bench/quality/run.py` asks the 8 tasks, runs each answer against the tests, and prints pass or fail per task. Both need only Python 3.
