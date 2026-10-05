@@ -65,7 +65,7 @@ Speed and a quality check for each model file, measured on a 16 GB Mac: [docs/MO
 
 Try other MoE models and tell us what happens. If a model's architecture is not supported yet, Coachwhip says so, and an issue is the fastest way to move it up the list.
 
-**Which GGUF file.** Coachwhip reads the standard GGUF quantisations (Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, F16). Some newer conversions store a few tensors in MXFP4 or fuse the attention weights into one tensor; Coachwhip does not read those yet. For Qwen3-Coder-Next, [MaziyarPanahi's Q4_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) loads as is.
+**Which GGUF file.** Coachwhip reads the standard GGUF quantisations (Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, F16). Some newer conversions store a few tensors in MXFP4 or fuse the attention weights into one tensor; Coachwhip does not read those yet. For Qwen3-Coder-Next, [MaziyarPanahi's Q3_K_M and Q4_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) load as is.
 
 ## What you need
 
@@ -73,7 +73,7 @@ Try other MoE models and tell us what happens. If a model's architecture is not 
 |---|---|---|
 | Mac | Apple silicon (M1 or later). Tested on a Mac mini M4. | the same |
 | Memory | 16 GB | 16 GB; 24 GB has room to spare |
-| Disk | 19 GB for the model, 3 GB for the build | 49 GB for the model, 3 GB for the build |
+| Disk | 19 GB for the model, 3 GB for the build | 39 GB (Q3_K_M) or 49 GB (Q4_K_M) for the model, 3 GB for the build |
 | macOS | Tested on macOS 26 | the same |
 
 ## Install
@@ -92,15 +92,18 @@ If a window asks to install Apple's command line tools, finish it and run the li
 
 Coachwhip is the engine; the model is yours. Any GGUF of a supported model works (see Models).
 
-**Recommended: Qwen3-Coder-Next, the 80B coder.** Download its [Q4_K_M GGUF](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) (48 GB) and its [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next), then start it with a bank of 56:
+**Recommended: Qwen3-Coder-Next, the 80B coder, in its Q3_K_M file.** Download the [Q3_K_M GGUF](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) (38 GB) and its [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next), then start it with a bank of 70:
 
 ```sh
-~/coachwhip/coachwhip.sh ~/Downloads/Qwen3-Coder-Next.Q4_K_M.gguf ~/Downloads/tokenizer.json 56
+~/coachwhip/coachwhip.sh ~/Downloads/Qwen3-Coder-Next.Q3_K_M.gguf ~/Downloads/tokenizer.json 70
 ```
+
+The Q3_K_M file writes faster than Q4_K_M on a 16 GB Mac, and the two scored the same on our quality check; the measurements are in [docs/MODELS.md](docs/MODELS.md).
 
 | Model | GGUF file | Tokenizer | Bank on 16 GB |
 |---|---|---|---|
-| Qwen3-Coder-Next (80B), recommended | [MaziyarPanahi Q4_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next) | 56 |
+| Qwen3-Coder-Next (80B), recommended | [MaziyarPanahi Q3_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next) | 70 |
+| Qwen3-Coder-Next (80B), the 4-bit file | [MaziyarPanahi Q4_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next) | 56 |
 | Qwen3-Coder-30B-A3B, a smaller download | [unsloth Q4_K_M](https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) | 44 |
 
 ## Use
