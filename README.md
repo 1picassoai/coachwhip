@@ -8,11 +8,11 @@ An 80B model, running comfortably on a 16 GB Mac. Coachwhip never needs the whol
 
 One Rust binary. Everything on the GPU. Nothing leaves your machine.
 
-**New in 0.3.0** ([release notes](https://github.com/1picassoai/coachwhip/releases/tag/v0.3.0)): the 80B writes about a quarter faster, from the early guess and a recommended Q3_K_M file; Qwen3.6-35B-A3B, Qwen's newest MoE generation, runs, with a thinking switch; a models page with measured speed and a quality check per file: [docs/MODELS.md](docs/MODELS.md).
+**New in 0.3.0** ([release notes](https://github.com/1picassoai/coachwhip/releases/tag/v0.3.0)). Qwen3-Coder-Next (80B) now writes at **5.4 to 5.7 tok/s** on a 16 GB Mac mini M4, up from 4.5 in 0.2.0, from the early guess and a recommended Q3_K_M file. New model: **Qwen3.6-35B-A3B**, Qwen's newest MoE generation, **6.2 tok/s** on the same Mac, with a thinking switch. Every number, how it was measured and a quality check per file: [docs/MODELS.md](docs/MODELS.md).
 
 **Tried it? Tell us how it ran**, good or bad, especially if it was slow, the fan worked hard, or it ran hot. [Open an issue](https://github.com/1picassoai/coachwhip/issues) with your Mac (chip and memory), macOS version, the model file, the `--bank` you used, and the speed line the chat page shows under each answer. Questions and ideas are welcome there too.
 
-<p align="center"><img src="docs/coachwhip-demo.gif" alt="Qwen3-Coder-Next (80B) writing TypeScript in the Coachwhip chat on a 16 GB Mac" width="720"></p>
+<p align="center"><img src="docs/coachwhip-demo.gif" alt="Qwen3.6-35B-A3B writing TypeScript in the Coachwhip chat on a 16 GB Mac, at 6 tok/s" width="720"></p>
 
 ## Why it works
 
