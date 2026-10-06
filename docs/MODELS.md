@@ -32,7 +32,7 @@ Qwen's newest MoE generation (architecture `qwen35moe`): 40 layers, 256 experts 
 | [unsloth UD-Q4_K_M](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF), recommended | 22.1 GB | 44 | 3.3 GB | **6.2 tok/s**, one run (prompts from 5.8 to 6.5) | 8 / 8 |
 | the same file | 22.1 GB | 56 | 4.3 GB | 6.0 tok/s, one run (prompts from 5.8 to 6.5) | 8 / 8 |
 
-Measured 6 Oct 2026, background load about 1.8. The first word came after 2.5 to 3.9 seconds on each prompt.
+Measured 6 Oct 2026: one person, one run per bank, on the same Mac with a background load of about 1.8, so these are a first measurement, not a settled range like the 80B's. Expect a few percent less when your Mac is doing other things, and tell us what you get. The first word came after 2.5 to 3.9 seconds on each prompt.
 
 - **Why bank 44, not 56:** the two banks write at the same speed (a 2,500-token thinking answer ran at 6.1 tok/s on both), but this model's non-expert part is heavier than the 80B's, and at bank 56 Coachwhip held about 7 GB against 5 GB at 44. On a 16 GB Mac, 56 ran the GPU out of memory once, on a long thinking answer that followed an earlier answer in the same chat. 44 leaves that room.
 - **Quality:** all eight tasks passed, including the duration parser that both 80B files got wrong. Eight tasks is a small sample.
