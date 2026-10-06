@@ -161,7 +161,7 @@ cd ~/coachwhip
 | `--chat 8090` | Serve the chat page on that port, on this machine only |
 | `--max-tokens 4000` | Longest answer |
 | `--temperature 0` | Always pick the likeliest word (same answer every time) |
-| `--bank 44` | Expert slots kept on the GPU per layer (56 for the 80B, 70 for its Q3_K_M file) |
+| `--bank 44` | Expert slots kept on the GPU per layer (56 for the 80B, 70 for its Q3_K_M file, 44 for Qwen3.6-35B) |
 | `--prefetch 10` | Experts guessed and read in ahead, per layer; 0 turns the guess off |
 | `--ahead 4` | How many layers ahead the guess looks |
 | `--think` | Let a thinking model reason before it answers (`--prompt` runs) |
