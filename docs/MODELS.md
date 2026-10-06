@@ -13,10 +13,10 @@ What each model file does on a 16 GB Mac, measured the same way every time. Thes
 
 | GGUF file | Size | `--bank` on 16 GB | Bank memory | Writing, 0.3.0 | Writing, 0.2.0 | Quality |
 |---|---|---|---|---|---|---|
-| [MaziyarPanahi Q3_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF), recommended | 38.2 GB | 70 | 5.5 GB | **5.7 tok/s** (5.5 to 5.9) | 4.5 tok/s | 7 / 8 |
-| [MaziyarPanahi Q4_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) | 48.4 GB | 56 | 5.5 GB | **4.1 tok/s** (3.9 to 4.4) | 3.4 tok/s | 7 / 8 |
+| [MaziyarPanahi Q3_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF), recommended | 38.2 GB | 70 | 5.5 GB | **5.4 to 5.7 tok/s** over three runs (prompts from 5.0 to 5.9) | 4.5 tok/s | 7 / 8 |
+| [MaziyarPanahi Q4_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) | 48.4 GB | 56 | 5.5 GB | **4.1 tok/s**, one run (prompts from 3.9 to 4.4) | 3.4 tok/s | 7 / 8 |
 
-0.3.0 speed measured 5 Oct 2026 over the five prompts; two of them finish before the 300-token cap, so their speed is measured over a shorter answer. 0.2.0 speed measured 3 Oct 2026 on the first prompt only. Quality measured 4 and 5 Oct 2026, the same result both times.
+0.3.0 speed measured 5 and 6 Oct 2026 over the five prompts; two of them finish before the 300-token cap, so their speed is measured over a shorter answer. The Q3_K_M figure is three runs by two people on the same Mac: 5.66 on an otherwise idle machine, 5.38 and 5.39 with a background load of about 2. Expect a few percent less when your Mac is doing other things. 0.2.0 speed measured 3 Oct 2026 on the first prompt only. Quality measured 4 and 5 Oct 2026, the same result both times.
 
 - **Why 0.3.0 is faster:** it guesses each layer's experts four layers early with the model's own routers and reads them in while the GPU is busy, so fewer reads happen with the GPU waiting.
 - **Why Q3_K_M is faster:** its experts are 1.6 MB instead of 2.0 MB, so each one read from the SSD arrives sooner, and the same bank memory holds 70 of them per layer instead of 56.
