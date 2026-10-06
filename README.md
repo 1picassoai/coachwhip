@@ -8,6 +8,8 @@ An 80B model, running comfortably on a 16 GB Mac. Coachwhip never needs the whol
 
 One Rust binary. Everything on the GPU. Nothing leaves your machine.
 
+**New in 0.3.0** ([release notes](https://github.com/1picassoai/coachwhip/releases/tag/v0.3.0)): the 80B writes about a quarter faster, from the early guess and a recommended Q3_K_M file; Qwen3.6-35B-A3B, Qwen's newest MoE generation, runs, with a thinking switch; a models page with measured speed and a quality check per file: [docs/MODELS.md](docs/MODELS.md).
+
 **Tried it? Tell us how it ran**, good or bad, especially if it was slow, the fan worked hard, or it ran hot. [Open an issue](https://github.com/1picassoai/coachwhip/issues) with your Mac (chip and memory), macOS version, the model file, the `--bank` you used, and the speed line the chat page shows under each answer. Questions and ideas are welcome there too.
 
 <p align="center"><img src="docs/coachwhip-demo.gif" alt="Qwen3-Coder-Next (80B) writing TypeScript in the Coachwhip chat on a 16 GB Mac" width="720"></p>
@@ -58,7 +60,9 @@ Coachwhip is an engine for MoE models, in GGUF format.
 | [Qwen3-Coder-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) | qwen3moe | Tested. |
 | [Qwen3-Coder-Next](https://huggingface.co/Qwen/Qwen3-Coder-Next) (80B) | qwen3next | Tested. See below for the file to use. |
 | [Qwen3-Next-80B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct) | qwen3next | Tested. |
+| [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | qwen35moe | Tested. Thinks when asked to. |
 | Qwen3-30B-A3B, other Qwen3 MoE | qwen3moe | Supported. |
+| Qwen3.5 MoE, Qwen3.6-14B-A3B (community) | qwen35moe | Supported. The 14B fits in 16 GB on its own; Coachwhip does not make it faster. |
 | Mixtral, Qwen2-MoE, OLMoE, DeepSeek, gpt-oss, GLM | | Coming next. |
 
 Speed and a quality check for each model file, measured on a 16 GB Mac: [docs/MODELS.md](docs/MODELS.md).
@@ -116,6 +120,8 @@ The Q3_K_M file writes faster than Q4_K_M on a 16 GB Mac, and the two scored the
 
 The last number is the bank (44 if you leave it out). The chat opens in your browser. Type, press Send, and the answer streams as it is written. Follow-up questions read only your new words; press **New chat** to start again. Stop Coachwhip with Ctrl+C.
 
+**Thinking.** A model with a thinking mode (Qwen3.6) shows a **let it think first** box on the page. Off, the model answers straight away; on, it reasons first and you watch it. Either way Coachwhip only puts the model's own template text at the start of its turn, nothing else changes, and each word comes at the same speed; thinking makes the reply longer, not slower per word. In the terminal it is `--think`; through the API it is always off, so coding tools get the answer. The 80B coder has no thinking mode, and the box is not shown for it.
+
 **From your coding tools:** while Coachwhip runs, it also speaks the OpenAI chat API, so any tool that takes an OpenAI base URL can use the model.
 
 | Setting | Value |
@@ -158,6 +164,7 @@ cd ~/coachwhip
 | `--bank 44` | Expert slots kept on the GPU per layer (56 for the 80B, 70 for its Q3_K_M file) |
 | `--prefetch 10` | Experts guessed and read in ahead, per layer; 0 turns the guess off |
 | `--ahead 4` | How many layers ahead the guess looks |
+| `--think` | Let a thinking model reason before it answers (`--prompt` runs) |
 | `--profile` | Print where the time went after each answer |
 | `--help` | Everything else |
 
