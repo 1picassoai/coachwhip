@@ -191,19 +191,33 @@ mod proj_tests {
             ba_rows.extend(a[kh * per_group..(kh + 1) * per_group].iter().cloned());
         }
         let fused = Proj::Fused { qkvz: qm(&Tensor::cat(&fused_rows, 0).unwrap()), ba: qm(&Tensor::cat(&ba_rows, 0).unwrap()) };
-        // Qwen3.5: all q, all k, all v in one; the gate, betas and alphas on their own.
-        let qkv: Vec<Tensor> = q.iter().chain(k.iter()).chain(v.iter()).cloned().collect();
+        // Qwen3.5: all q, all k, all v in one; the gate, betas and alphas on their own. Its value
+        // head j pairs with key head j % n_k, so the same per-head weights sit in a different order.
+        let order: Vec<usize> = (0..n_v).map(|j| (j % n_k) * per_group + j / n_k).collect();
+        let pick = |t: &[Tensor]| -> Vec<Tensor> { order.iter().map(|&j| t[j].clone()).collect() };
+        let qkv: Vec<Tensor> = q.iter().chain(k.iter()).cloned().chain(pick(&v)).collect();
         let split = Proj::Split {
             qkv: qm(&Tensor::cat(&qkv, 0).unwrap()),
-            z: qm(&Tensor::cat(&z, 0).unwrap()),
-            beta: qm(&Tensor::cat(&b, 0).unwrap()),
-            alpha: qm(&Tensor::cat(&a, 0).unwrap()),
+            z: qm(&Tensor::cat(&pick(&z), 0).unwrap()),
+            beta: qm(&Tensor::cat(&pick(&b), 0).unwrap()),
+            alpha: qm(&Tensor::cat(&pick(&a), 0).unwrap()),
         };
 
         let mut shared = Lcg(99);
         let mut lf = layer(fused, &mut shared, n_k, n_v, dk, dv, h);
         let mut shared = Lcg(99);
         let mut ls = layer(split, &mut shared, n_k, n_v, dk, dv, h);
+        // The per-value-head pieces follow the same order.
+        let idx = Tensor::new(order.iter().map(|&j| j as u32).collect::<Vec<_>>(), &Device::Cpu).unwrap();
+        ls.dt_bias = lf.dt_bias.index_select(&idx, 0).unwrap();
+        ls.a = lf.a.index_select(&idx, 0).unwrap();
+        let qk_rows = 2 * n_k * dk;
+        let conv_v = lf.conv_w.narrow(0, qk_rows, n_v * dv).unwrap().reshape((n_v, dv, 4)).unwrap().index_select(&idx, 0).unwrap().reshape((n_v * dv, 4)).unwrap();
+        ls.conv_w = Tensor::cat(&[&lf.conv_w.narrow(0, 0, qk_rows).unwrap(), &conv_v], 0).unwrap();
+        let mut shared = Lcg(99);
+        let _ = (shared.tensor(&[qk_rows + n_v * dv, 4], 0.5), shared.tensor(&[n_v], 0.5), shared.tensor(&[n_v], 0.5));
+        let out_w = shared.tensor(&[h, n_v * dv], 0.3).reshape((h, n_v, dv)).unwrap().index_select(&idx, 1).unwrap().reshape((h, n_v * dv)).unwrap();
+        ls.out = qm(&out_w);
         let x = Lcg(5).tensor(&[1, l, h], 1.0);
         let yf = lf.forward(&x).unwrap();
         let ys = ls.forward(&x).unwrap();
@@ -296,8 +310,15 @@ impl LinearAttn {
         let qc = l2_norm(&conv.narrow(1, 0, n_k * dk)?.reshape((l, n_k, dk))?, self.eps)?;
         let kc = l2_norm(&conv.narrow(1, n_k * dk, n_k * dk)?.reshape((l, n_k, dk))?, self.eps)?;
         let vc = conv.narrow(1, 2 * n_k * dk, n_v * dv)?.reshape((l, n_v, dv))?;
-        // Each key head serves `per_group` value heads, side by side.
-        let widen = |t: Tensor| -> Result<Tensor> { t.unsqueeze(2)?.broadcast_as((l, n_k, per_group, dk))?.reshape((l, n_v, dk)) };
+        // Each key head serves `per_group` value heads. Qwen3-Next lists a key head's value heads
+        // side by side (value head j uses key head j / per_group); Qwen3.5 and 3.6 cycle through the
+        // key heads (value head j uses key head j % n_k).
+        let widen = |t: Tensor| -> Result<Tensor> {
+            match &self.proj {
+                Proj::Fused { .. } => t.unsqueeze(2)?.broadcast_as((l, n_k, per_group, dk))?.reshape((l, n_v, dk)),
+                Proj::Split { .. } => t.unsqueeze(1)?.broadcast_as((l, per_group, n_k, dk))?.reshape((l, n_v, dk)),
+            }
+        };
         let qc = (widen(qc)? * (1.0 / (dk as f64).sqrt()))?;
         let kc = widen(kc)?;
 
@@ -430,7 +451,7 @@ pub struct Qwen3Next {
     output: QMatMul,
     store: Arc<ExpertStore>,
     device: Device,
-    pub thinks: bool,
+    pub think: crate::model::ThinkOpen,
     pub progress: Option<crate::model::Progress>,
 }
 
@@ -461,7 +482,8 @@ impl Qwen3Next {
         let eps = md(&format!("{arch}.attention.layer_norm_rms_epsilon"))?.to_f32()? as f64;
         // Some conversions leave the rope base out; this family's is ten million.
         let freq_base = md(&format!("{arch}.rope.freq_base")).ok().and_then(|v| v.to_f32().ok()).map_or(1e7, |f| f as f64);
-        let thinks = md("tokenizer.chat_template").and_then(|t| t.to_string().cloned()).map_or(false, |t| t.contains("enable_thinking"));
+        let template = md("tokenizer.chat_template").ok().and_then(|t| t.to_string().ok().cloned());
+        let think = crate::model::ThinkOpen::from_template(template.as_deref());
 
         let store = ExpertStore::new(&ct, device, block_count, path, settings)?;
         let mut gg = Gguf::new(ct, &mut file, device.clone());
@@ -546,7 +568,7 @@ impl Qwen3Next {
             });
         }
         wire_lookahead(&mut layers, settings.ahead);
-        Ok(Self { embeddings: Embedding::new(embeddings, embedding_length), layers, norm, output, store, device: device.clone(), thinks, progress: None })
+        Ok(Self { embeddings: Embedding::new(embeddings, embedding_length), layers, norm, output, store, device: device.clone(), think, progress: None })
     }
 
     pub fn report(&self) {

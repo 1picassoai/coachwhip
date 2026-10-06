@@ -79,6 +79,33 @@ struct Layer {
     ffn_norm: RmsNorm,
 }
 
+/// What the chat template puts right after `<|im_start|>assistant\n`. A thinking model's template
+/// opens the turn with an empty think block when thinking is off, so the model answers straight
+/// away; Qwen3.5 and later open a think block for it when thinking is on. Both empty for a model
+/// with no thinking mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThinkOpen {
+    pub off: &'static str,
+    pub on: &'static str,
+}
+
+impl ThinkOpen {
+    pub fn from_template(template: Option<&str>) -> Self {
+        let t = template.unwrap_or("");
+        if !t.contains("enable_thinking") {
+            return Self { off: "", on: "" };
+        }
+        Self {
+            off: if t.contains(r"'<think>\n\n</think>\n\n'") { "<think>\n\n</think>\n\n" } else { "" },
+            on: if t.contains(r"{{- '<think>\n' }}") { "<think>\n" } else { "" },
+        }
+    }
+
+    pub fn thinks(&self) -> bool {
+        !self.off.is_empty()
+    }
+}
+
 pub struct Qwen3Moe {
     embeddings: Embedding,
     layers: Vec<Layer>,
@@ -87,8 +114,7 @@ pub struct Qwen3Moe {
     store: Arc<ExpertStore>,
     dtype: DType,
     device: Device,
-    /// Whether the model has a thinking mode (Qwen3) or answers straight away (Qwen3-Coder).
-    pub thinks: bool,
+    pub think: ThinkOpen,
     pub progress: Option<Progress>,
 }
 
@@ -123,8 +149,8 @@ impl Qwen3Moe {
         let rope_freq_base = md(&format!("{arch}.rope.freq_base")).and_then(|m| m.to_f32()).unwrap_or(10000f32);
         let shared = md_u("expert_shared_feed_forward_length").unwrap_or(0);
         let norm_topk_prob = shared == 0;
-        // A model with a thinking mode says so in its chat template.
-        let thinks = md("tokenizer.chat_template").and_then(|t| t.to_string().cloned()).map_or(false, |t| t.contains("enable_thinking"));
+        let template = md("tokenizer.chat_template").ok().and_then(|t| t.to_string().ok().cloned());
+        let think = ThinkOpen::from_template(template.as_deref());
 
         let store = ExpertStore::new(&ct, device, block_count, path, settings)?;
         let mut gg = Gguf::new(ct, &mut file, device.clone());
@@ -178,7 +204,7 @@ impl Qwen3Moe {
         for i in ahead..layers.len() {
             layers[i - ahead].moe.next_gate = Some(layers[i].moe.gate.clone());
         }
-        Ok(Self { embeddings: Embedding::new(embeddings, embedding_length), layers, norm, output, store, dtype, device: device.clone(), thinks, progress: None })
+        Ok(Self { embeddings: Embedding::new(embeddings, embedding_length), layers, norm, output, store, dtype, device: device.clone(), think, progress: None })
     }
 
     /// Print where each written word's time went since the last call, then reset the counters.
@@ -266,9 +292,19 @@ impl Model {
     }
 
     pub fn thinks(&self) -> bool {
+        self.think().thinks()
+    }
+
+    /// The text that opens the assistant's turn, with thinking on or off.
+    pub fn assistant_open(&self, think: bool) -> &'static str {
+        let t = self.think();
+        if think { t.on } else { t.off }
+    }
+
+    fn think(&self) -> ThinkOpen {
         match self {
-            Self::Qwen3Moe(m) => m.thinks,
-            Self::Qwen3Next(m) => m.thinks,
+            Self::Qwen3Moe(m) => m.think,
+            Self::Qwen3Next(m) => m.think,
         }
     }
 

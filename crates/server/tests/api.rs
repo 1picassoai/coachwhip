@@ -50,13 +50,19 @@ fn the_context_limit_is_16k() {
 
 #[test]
 fn messages_become_the_models_chat_format() {
-    let p = chat_prompt(&[json!({"role": "system", "content": "Be brief."}), json!({"role": "user", "content": "Hi"})]);
+    let p = chat_prompt(&[json!({"role": "system", "content": "Be brief."}), json!({"role": "user", "content": "Hi"})], "");
     assert_eq!(p, "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n");
 }
 
 #[test]
+fn a_thinking_models_turn_opens_the_way_its_template_says() {
+    let p = chat_prompt(&[json!({"role": "user", "content": "Hi"})], "<think>\n\n</think>\n\n");
+    assert!(p.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+}
+
+#[test]
 fn unknown_roles_are_mapped_safely() {
-    let p = chat_prompt(&[json!({"role": "developer", "content": "a"}), json!({"role": "tool", "content": "b"}), json!({"content": "c"})]);
+    let p = chat_prompt(&[json!({"role": "developer", "content": "a"}), json!({"role": "tool", "content": "b"}), json!({"content": "c"})], "");
     assert!(p.starts_with("<|im_start|>system\na<|im_end|>\n<|im_start|>user\nb<|im_end|>\n<|im_start|>user\nc<|im_end|>\n"));
     assert!(p.ends_with("<|im_start|>assistant\n"));
 }

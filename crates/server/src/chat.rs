@@ -108,13 +108,14 @@ pub fn generate(
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<Answer> {
     let think = think && model.thinks();
-    let no_think = if think || !model.thinks() { "" } else { " /no_think" };
+    // The template's way of switching thinking on or off: what opens the assistant's turn.
+    let open = model.assistant_open(think);
     let encode = |text: String| -> Result<Vec<u32>> { Ok(tokenizer.encode(text, true).map_err(anyhow::Error::msg)?.get_ids().to_vec()) };
     let eos = *tokenizer.get_vocab(true).get("<|im_end|>").unwrap();
     let tell = progress.map(|p| Rc::new(RefCell::new(p)));
 
     // A follow-up closes the last answer and adds the new question; nothing earlier is read again.
-    let turn = format!("<|im_start|>user\n{prompt}{no_think}<|im_end|>\n<|im_start|>assistant\n");
+    let turn = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{open}");
     let mut tokens = Vec::new();
     let mut fresh = new_chat || session.pos == 0 || session.by_api;
     let mut summary = None;
@@ -123,7 +124,7 @@ pub fn generate(
         tokens.extend(encode(format!("<|im_end|>\n{turn}"))?);
         // Too long to go on: the model summarises the chat, and the summary opens a new one.
         if session.pos + tokens.len() + max_new > CONTEXT_LIMIT {
-            summary = Some(summarise(model, tokenizer, device, session, no_think, eos, &tell)?);
+            summary = Some(summarise(model, tokenizer, device, session, eos, &tell)?);
             fresh = true;
         }
     }
@@ -131,7 +132,7 @@ pub fn generate(
         model.clear_kv_cache();
         *session = Session::default();
         tokens = encode(match &summary {
-            Some(s) => format!("<|im_start|>user\nSummary of our conversation so far, for context:\n{s}\n\nNow: {prompt}{no_think}<|im_end|>\n<|im_start|>assistant\n"),
+            Some(s) => format!("<|im_start|>user\nSummary of our conversation so far, for context:\n{s}\n\nNow: {prompt}<|im_end|>\n<|im_start|>assistant\n{open}"),
             None => turn,
         })?;
     }
@@ -287,9 +288,9 @@ fn read_prompt(model: &mut Model, device: &Device, pos: usize, tokens: &[u32], t
 
 /// Asks the model, in the chat as it stands, for a summary of the chat; the chat is then thrown
 /// away and the summary opens the next one. Greedy, so it is the same every time.
-fn summarise(model: &mut Model, tokenizer: &Tokenizer, device: &Device, session: &Session, no_think: &str, eos: u32, tell: &Option<Rc<RefCell<Progress>>>) -> Result<String> {
+fn summarise(model: &mut Model, tokenizer: &Tokenizer, device: &Device, session: &Session, eos: u32, tell: &Option<Rc<RefCell<Progress>>>) -> Result<String> {
     let mut tokens: Vec<u32> = session.pending.into_iter().collect();
-    let ask = format!("<|im_end|>\n<|im_start|>user\n{SUMMARY_ASK}{no_think}<|im_end|>\n<|im_start|>assistant\n");
+    let ask = format!("<|im_end|>\n<|im_start|>user\n{SUMMARY_ASK}<|im_end|>\n<|im_start|>assistant\n{}", model.assistant_open(false));
     tokens.extend(tokenizer.encode(ask, true).map_err(anyhow::Error::msg)?.get_ids().to_vec());
     let mut sampler = LogitsProcessor::from_sampling(42, Sampling::ArgMax);
     let logits = read_prompt(model, device, session.pos, &tokens, tell)?;
@@ -325,8 +326,9 @@ pub fn message_text(content: &serde_json::Value) -> String {
     }
 }
 
-/// An OpenAI conversation in the model's chat format, ready for the assistant's turn.
-pub fn chat_prompt(messages: &[serde_json::Value]) -> String {
+/// An OpenAI conversation in the model's chat format, ready for the assistant's turn; `open` is
+/// what the model's template puts at the start of that turn (see `Model::assistant_open`).
+pub fn chat_prompt(messages: &[serde_json::Value], open: &str) -> String {
     let mut text = String::new();
     for m in messages {
         let role = match m["role"].as_str().unwrap_or("user") {
@@ -337,6 +339,7 @@ pub fn chat_prompt(messages: &[serde_json::Value]) -> String {
         text.push_str(&format!("<|im_start|>{role}\n{}<|im_end|>\n", message_text(&m["content"])));
     }
     text.push_str("<|im_start|>assistant\n");
+    text.push_str(open);
     text
 }
 
@@ -358,7 +361,7 @@ fn openai(mut s: TcpStream, body: &[u8], model: &mut Model, model_name: &str, to
     };
     let stream = q["stream"].as_bool().unwrap_or(false);
     let asked = q["max_completion_tokens"].as_u64().or(q["max_tokens"].as_u64());
-    let prompt = tokenizer.encode(chat_prompt(messages), true).map_err(anyhow::Error::msg)?.get_ids().to_vec();
+    let prompt = tokenizer.encode(chat_prompt(messages, model.assistant_open(false)), true).map_err(anyhow::Error::msg)?.get_ids().to_vec();
     let max_new = answer_budget(asked, max_new, prompt.len());
     let id = format!("chatcmpl-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
     let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
