@@ -113,11 +113,113 @@ pub fn delta_chunked(q: &Tensor, k: &Tensor, v: &Tensor, beta: &Tensor, log_deca
     Ok((o, s))
 }
 
+/// The linear-attention input projections, as the two Qwen generations store them.
+enum Proj {
+    /// Qwen3-Next: one matrix holding, per key head, q, k, its values and their gates; and one
+    /// holding, per key head, the betas then the alphas of its value heads.
+    Fused { qkvz: QMatMul, ba: QMatMul },
+    /// Qwen3.5 and 3.6: q, k and v in one matrix (all heads of each in turn), and the gate, beta
+    /// and alpha each in their own.
+    Split { qkv: QMatMul, z: QMatMul, beta: QMatMul, alpha: QMatMul },
+}
+
+#[cfg(test)]
+mod proj_tests {
+    //! The two tensor layouts must be the same layer: a Qwen3.5-style split set of weights and
+    //! the Qwen3-Next fused arrangement of the very same numbers give the same output.
+    use super::*;
+    use candle::quantized::{GgmlDType, QTensor};
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn tensor(&mut self, shape: &[usize], scale: f32) -> Tensor {
+            let n: usize = shape.iter().product();
+            let v: Vec<f32> = (0..n)
+                .map(|_| {
+                    self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (((self.0 >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0) * scale
+                })
+                .collect();
+            Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
+        }
+    }
+
+    fn qm(w: &Tensor) -> QMatMul {
+        QMatMul::from_weights(Arc::new(QTensor::quantize(w, GgmlDType::F32).unwrap())).unwrap()
+    }
+
+    fn layer(proj: Proj, g: &mut Lcg, n_k: usize, n_v: usize, dk: usize, dv: usize, h: usize) -> LinearAttn {
+        let channels = 2 * n_k * dk + n_v * dv;
+        LinearAttn {
+            proj,
+            conv_w: g.tensor(&[channels, 4], 0.5),
+            dt_bias: g.tensor(&[n_v], 0.5),
+            a: (g.tensor(&[n_v], 0.5).abs().unwrap() * -1.0).unwrap(),
+            norm: RmsNorm::from_qtensor(QTensor::quantize(&Tensor::ones(dv, DType::F32, &Device::Cpu).unwrap(), GgmlDType::F32).unwrap(), 1e-6).unwrap(),
+            out: qm(&g.tensor(&[h, n_v * dv], 0.3)),
+            n_k,
+            n_v,
+            dk,
+            dv,
+            eps: 1e-6,
+            conv_state: None,
+            state: None,
+        }
+    }
+
+    #[test]
+    fn split_and_fused_projections_are_the_same_layer() {
+        let (n_k, n_v, dk, dv, h, l) = (2usize, 4usize, 4usize, 4usize, 8usize, 3usize);
+        let per_group = n_v / n_k;
+        let mut g = Lcg(7);
+        let q: Vec<Tensor> = (0..n_k).map(|_| g.tensor(&[dk, h], 0.5)).collect();
+        let k: Vec<Tensor> = (0..n_k).map(|_| g.tensor(&[dk, h], 0.5)).collect();
+        let v: Vec<Tensor> = (0..n_v).map(|_| g.tensor(&[dv, h], 0.5)).collect();
+        let z: Vec<Tensor> = (0..n_v).map(|_| g.tensor(&[dv, h], 0.5)).collect();
+        let b: Vec<Tensor> = (0..n_v).map(|_| g.tensor(&[1, h], 0.5)).collect();
+        let a: Vec<Tensor> = (0..n_v).map(|_| g.tensor(&[1, h], 0.5)).collect();
+
+        // Qwen3-Next: per key head, q, k, its value heads, their gates; betas then alphas per key head.
+        let mut fused_rows = Vec::new();
+        let mut ba_rows = Vec::new();
+        for kh in 0..n_k {
+            fused_rows.push(q[kh].clone());
+            fused_rows.push(k[kh].clone());
+            fused_rows.extend(v[kh * per_group..(kh + 1) * per_group].iter().cloned());
+            fused_rows.extend(z[kh * per_group..(kh + 1) * per_group].iter().cloned());
+            ba_rows.extend(b[kh * per_group..(kh + 1) * per_group].iter().cloned());
+            ba_rows.extend(a[kh * per_group..(kh + 1) * per_group].iter().cloned());
+        }
+        let fused = Proj::Fused { qkvz: qm(&Tensor::cat(&fused_rows, 0).unwrap()), ba: qm(&Tensor::cat(&ba_rows, 0).unwrap()) };
+        // Qwen3.5: all q, all k, all v in one; the gate, betas and alphas on their own.
+        let qkv: Vec<Tensor> = q.iter().chain(k.iter()).chain(v.iter()).cloned().collect();
+        let split = Proj::Split {
+            qkv: qm(&Tensor::cat(&qkv, 0).unwrap()),
+            z: qm(&Tensor::cat(&z, 0).unwrap()),
+            beta: qm(&Tensor::cat(&b, 0).unwrap()),
+            alpha: qm(&Tensor::cat(&a, 0).unwrap()),
+        };
+
+        let mut shared = Lcg(99);
+        let mut lf = layer(fused, &mut shared, n_k, n_v, dk, dv, h);
+        let mut shared = Lcg(99);
+        let mut ls = layer(split, &mut shared, n_k, n_v, dk, dv, h);
+        let x = Lcg(5).tensor(&[1, l, h], 1.0);
+        let yf = lf.forward(&x).unwrap();
+        let ys = ls.forward(&x).unwrap();
+        let diff = (yf - ys).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
+        assert!(diff < 1e-5, "fused and split layouts differ by {diff}");
+        // And a second word, so the carried state and the convolution window agree too.
+        let x2 = Lcg(6).tensor(&[1, 1, h], 1.0);
+        let d2 = (lf.forward(&x2).unwrap() - ls.forward(&x2).unwrap()).unwrap().abs().unwrap().flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
+        assert!(d2 < 1e-5, "second word differs by {d2}");
+    }
+}
+
 /// A running-memory layer: per value head a 128 x 128 matrix that decays, is corrected by each
 /// new key and value (the delta rule), and is read out with the query.
 struct LinearAttn {
-    in_proj: QMatMul,
-    ba: QMatMul,
+    proj: Proj,
     conv_w: Tensor,
     dt_bias: Tensor,
     a: Tensor,
@@ -138,6 +240,33 @@ impl LinearAttn {
         self.state = None;
     }
 
+    /// The projections of one input, in one layout: q, k and v side by side as `(l, channels)`,
+    /// the gate as `(l, n_v, dv)`, and the raw beta and alpha as `(l, n_v)`.
+    fn project(&self, x2: &Tensor, l: usize) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let (n_k, n_v, dk, dv) = (self.n_k, self.n_v, self.dk, self.dv);
+        let per_group = n_v / n_k;
+        match &self.proj {
+            Proj::Fused { qkvz, ba } => {
+                // Per key head: q, k, then the values and gates of its value heads.
+                let mixed = qkvz.forward(x2)?.reshape((l, n_k, 2 * dk + 2 * dv * per_group))?;
+                let q = mixed.narrow(2, 0, dk)?.reshape((l, n_k * dk))?;
+                let k = mixed.narrow(2, dk, dk)?.reshape((l, n_k * dk))?;
+                let v = mixed.narrow(2, 2 * dk, dv * per_group)?.reshape((l, n_v * dv))?;
+                let z = mixed.narrow(2, 2 * dk + dv * per_group, dv * per_group)?.reshape((l, n_v, dv))?;
+                let ba = ba.forward(x2)?.reshape((l, n_k, 2 * per_group))?;
+                let beta = ba.narrow(2, 0, per_group)?.reshape((l, n_v))?;
+                let alpha = ba.narrow(2, per_group, per_group)?.reshape((l, n_v))?;
+                Ok((Tensor::cat(&[&q, &k, &v], 1)?, z, beta, alpha))
+            }
+            Proj::Split { qkv, z, beta, alpha } => Ok((
+                qkv.forward(x2)?, // already q (all heads), k (all heads), v (all heads)
+                z.forward(x2)?.reshape((l, n_v, dv))?,
+                beta.forward(x2)?,
+                alpha.forward(x2)?,
+            )),
+        }
+    }
+
     fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
         let (b, l, h) = x.dims3()?;
         let device = x.device();
@@ -145,18 +274,9 @@ impl LinearAttn {
         let per_group = n_v / n_k;
         let x2 = x.reshape((l, h))?;
 
-        // One projection holds, per key head: q, k, then the values and gates of its value heads.
-        let mixed = self.in_proj.forward(&x2)?.reshape((l, n_k, 2 * dk + 2 * dv * per_group))?;
-        let q = mixed.narrow(2, 0, dk)?.reshape((l, n_k * dk))?;
-        let k = mixed.narrow(2, dk, dk)?.reshape((l, n_k * dk))?;
-        let v = mixed.narrow(2, 2 * dk, dv * per_group)?.reshape((l, n_v * dv))?;
-        let z = mixed.narrow(2, 2 * dk + dv * per_group, dv * per_group)?.reshape((l, n_v, dv))?;
-        let qkv = Tensor::cat(&[&q, &k, &v], 1)?; // (l, channels)
+        let (qkv, z, beta, alpha) = self.project(&x2, l)?;
         let channels = qkv.dim(1)?;
-
-        let ba = self.ba.forward(&x2)?.reshape((l, n_k, 2 * per_group))?;
-        let beta = candle_nn::ops::sigmoid(&ba.narrow(2, 0, per_group)?.reshape((l, n_v))?)?;
-        let alpha = ba.narrow(2, per_group, per_group)?.reshape((l, n_v))?;
+        let beta = candle_nn::ops::sigmoid(&beta)?;
         let log_decay = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?; // (l, n_v)
 
         // Causal depthwise convolution over the last `taps` inputs, carried across calls.
@@ -315,14 +435,17 @@ pub struct Qwen3Next {
 }
 
 impl Qwen3Next {
-    pub fn load(path: &Path, device: &Device, settings: &Settings) -> Result<Self> {
+    /// `arch` is the GGUF architecture name: `qwen3next` (Qwen3-Next, fused projections) or
+    /// `qwen35moe` (Qwen3.5 and 3.6, split projections). Same maths, different tensor layout.
+    pub fn load(path: &Path, device: &Device, settings: &Settings, arch: &str) -> Result<Self> {
         let mut file = std::fs::File::open(path)?;
         let ct = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(path))?;
         let md = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in the GGUF metadata"),
             Some(v) => Ok(v.clone()),
         };
-        let md_u = |s: &str| -> Result<usize> { Ok(md(&format!("qwen3next.{s}"))?.to_u32()? as usize) };
+        let md_u = |s: &str| -> Result<usize> { Ok(md(&format!("{arch}.{s}"))?.to_u32()? as usize) };
+        let split = ct.tensor_infos.contains_key("blk.0.attn_qkv.weight");
         let n_head = md_u("attention.head_count")?;
         let n_kv = md_u("attention.head_count_kv")?;
         let hd = md_u("attention.key_length")?;
@@ -335,9 +458,9 @@ impl Qwen3Next {
         let dt_rank = md_u("ssm.time_step_rank")?;
         let inner = md_u("ssm.inner_size")?;
         let interval = md_u("full_attention_interval").unwrap_or(4);
-        let eps = md("qwen3next.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
-        // Some conversions leave the rope base out; Qwen3-Next's is ten million.
-        let freq_base = md("qwen3next.rope.freq_base").ok().and_then(|v| v.to_f32().ok()).map_or(1e7, |f| f as f64);
+        let eps = md(&format!("{arch}.attention.layer_norm_rms_epsilon"))?.to_f32()? as f64;
+        // Some conversions leave the rope base out; this family's is ten million.
+        let freq_base = md(&format!("{arch}.rope.freq_base")).ok().and_then(|v| v.to_f32().ok()).map_or(1e7, |f| f as f64);
         let thinks = md("tokenizer.chat_template").and_then(|t| t.to_string().cloned()).map_or(false, |t| t.contains("enable_thinking"));
 
         let store = ExpertStore::new(&ct, device, block_count, path, settings)?;
@@ -371,9 +494,18 @@ impl Qwen3Next {
                 })
             } else {
                 let conv_w = dense(&mut gg, &format!("{p}.ssm_conv1d.weight"))?; // (channels, taps)
+                let proj = if split {
+                    Proj::Split {
+                        qkv: gg.qmatmul(&format!("{p}.attn_qkv.weight"))?,
+                        z: gg.qmatmul(&format!("{p}.attn_gate.weight"))?,
+                        beta: gg.qmatmul(&format!("{p}.ssm_beta.weight"))?,
+                        alpha: gg.qmatmul(&format!("{p}.ssm_alpha.weight"))?,
+                    }
+                } else {
+                    Proj::Fused { qkvz: gg.qmatmul(&format!("{p}.ssm_in.weight"))?, ba: gg.qmatmul(&format!("{p}.ssm_ba.weight"))? }
+                };
                 Mixer::Linear(LinearAttn {
-                    in_proj: gg.qmatmul(&format!("{p}.ssm_in.weight"))?,
-                    ba: gg.qmatmul(&format!("{p}.ssm_ba.weight"))?,
+                    proj,
                     conv_w,
                     dt_bias: dense(&mut gg, &format!("{p}.ssm_dt.bias"))?,
                     a: dense(&mut gg, &format!("{p}.ssm_a"))?,

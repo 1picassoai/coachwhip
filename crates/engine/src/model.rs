@@ -236,7 +236,7 @@ impl Model {
         match arch.as_str() {
             // f16 for attention: bf16 garbles long answers in this model.
             "qwen3moe" => Ok(Self::Qwen3Moe(Qwen3Moe::load(path, device, DType::F16, settings)?)),
-            "qwen3next" => Ok(Self::Qwen3Next(crate::model_next::Qwen3Next::load(path, device, settings)?)),
+            "qwen3next" | "qwen35moe" => Ok(Self::Qwen3Next(crate::model_next::Qwen3Next::load(path, device, settings, arch.as_str())?)),
             other => candle::bail!(
                 "this model's architecture is \"{other}\", which Coachwhip does not support yet (today: qwen3moe, qwen3next). \
                  Open an issue at https://github.com/1picassoai/coachwhip/issues so it moves up the list."
