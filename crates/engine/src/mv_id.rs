@@ -31,7 +31,7 @@ pub fn matvec_id(
 ) -> Result<(), MetalKernelError> {
     let (nth0, nth1, align) = match dtype {
         GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1 | GgmlDType::Q8_0 | GgmlDType::Q8_1 => (8, 8, 8),
-        GgmlDType::Q2K => (2, 32, 4),
+        GgmlDType::Q2K => (2, 32, 8),
         GgmlDType::Q4K => (4, 8, 4),
         GgmlDType::Q3K | GgmlDType::Q5K => (2, 32, 4),
         GgmlDType::Q6K => (2, 32, 2),

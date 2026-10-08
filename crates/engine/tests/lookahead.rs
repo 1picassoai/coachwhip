@@ -45,6 +45,11 @@ fn a_guess_is_stale_once_the_word_reaches_its_layer() {
 }
 
 #[test]
+fn a_guess_for_the_next_word_is_fresh_whatever_the_layer() {
+    assert!(!is_stale(3, 8, 40, 7), "foresight reads for the coming word must survive");
+}
+
+#[test]
 fn a_guess_from_an_earlier_word_is_stale_whatever_its_layer() {
     assert!(is_stale(40, 6, 3, 7));
     assert!(is_stale(0, 0, 0, 1));

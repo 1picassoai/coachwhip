@@ -12,4 +12,6 @@ candle-nn.workspace = true
 candle-transformers.workspace = true
 candle-metal-kernels.workspace = true
 objc2-metal.workspace = true
+objc2.workspace = true
 rayon.workspace = true
+libc = "0.2"

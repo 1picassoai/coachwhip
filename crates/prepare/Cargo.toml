@@ -1,0 +1,16 @@
+[package]
+name = "coachwhip-prepare"
+description = "Prepare a model file for Coachwhip: rewrite the experts of a GGUF for speed on a 16 GB Mac."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "coachwhip-prepare"
+path = "src/main.rs"
+
+[dependencies]
+candle.workspace = true
+anyhow.workspace = true
+byteorder = "1"

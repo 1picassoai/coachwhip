@@ -94,6 +94,13 @@ pub struct Answer {
 
 /// Runs the model and hands every new piece of text to `emit` as soon as it exists.
 #[allow(clippy::too_many_arguments)]
+
+/// Foresight (lab): COACHWHIP_FORESIGHT=N drafts N words from the bank before each real word, only
+/// to start the reads those words will need; the text is unchanged.
+fn foresight() -> usize {
+    std::env::var("COACHWHIP_FORESIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
 pub fn generate(
     model: &mut Model,
     tokenizer: &Tokenizer,
@@ -232,7 +239,41 @@ fn answer(
     };
     stream_text(&out, &mut sent)?;
     let t1 = std::time::Instant::now();
+    // S6 (lab): COACHWHIP_SPECULATE=K drafts K words from the bank and checks them in one pass;
+    // COACHWHIP_SPECULATE_MEASURE=K only measures, writing the answer the plain way.
+    let speculate: usize = std::env::var("COACHWHIP_SPECULATE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let measure: usize = std::env::var("COACHWHIP_SPECULATE_MEASURE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let greedy = matches!(sampling, Sampling::ArgMax);
     while out.len() < max_new && next != eos {
+        if speculate > 0 && greedy && max_new - out.len() > speculate {
+            if let Some(seq) = model.speculate(next, base + out.len() - 1, speculate)? {
+                for &w in &seq {
+                    next = w;
+                    if w == eos {
+                        break;
+                    }
+                    out.push(w);
+                    stream_text(&out, &mut sent)?;
+                }
+                continue;
+            }
+        }
+        if measure > 0 && greedy && max_new - out.len() >= measure {
+            if let Some((plain, _accepted)) = model.speculate_measure(next, base + out.len() - 1, measure)? {
+                for &w in &plain {
+                    next = w;
+                    if w == eos {
+                        break;
+                    }
+                    out.push(w);
+                    stream_text(&out, &mut sent)?;
+                }
+                continue;
+            }
+        }
+        if foresight() > 0 {
+            model.foresee(next, base + out.len() - 1, foresight())?;
+        }
         let logits = model.forward(&Tensor::new(&[next], device)?.unsqueeze(0)?, base + out.len() - 1)?.squeeze(0)?;
         next = sampler.sample(&logits)?;
         if next != eos {
@@ -303,6 +344,9 @@ fn summarise(model: &mut Model, tokenizer: &Tokenizer, device: &Device, session:
             if out.len() % 8 == 0 {
                 (t.borrow_mut())(Step::Summary(out.len()));
             }
+        }
+        if foresight() > 0 {
+            model.foresee(next, base + out.len() - 1, foresight())?;
         }
         let logits = model.forward(&Tensor::new(&[next], device)?.unsqueeze(0)?, base + out.len() - 1)?.squeeze(0)?;
         next = sampler.sample(&logits)?;

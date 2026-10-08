@@ -44,11 +44,39 @@ struct BankMat {
     k: usize,
 }
 
+/// Two kinds of slot (`COACHWHIP_SHARP=<n>`, Captain's design): the experts the model leans on
+/// keep the file's own bytes in `n` sharp slots per layer; the rest go through the GPU shrink
+/// into the small (Q2) bank. A sharp slot's index carries `SHARP_FLAG`.
+pub const SHARP_FLAG: usize = 1 << 30;
+
+struct SharpBank {
+    mats: [BankMat; 3],
+    slots: Slots,
+    ready: Vec<Arc<AtomicBool>>,
+}
+
 struct Bank {
     mats: [BankMat; 3],
     slots: Slots,
+    sharp: Option<SharpBank>,
     /// False while the prefetch thread is still reading an expert into the slot.
     ready: Vec<Arc<AtomicBool>>,
+    /// The GPU's own copy of which slot holds which expert, and which slots are ready (S4).
+    gpu: Arc<crate::gpu_sync::GpuBank>,
+    /// S4: slots the GPU is about to read for the word in flight; a prefetch may not take them.
+    pinned: Vec<AtomicBool>,
+}
+
+impl Bank {
+    /// Rewrite the GPU's table from the CPU's: every expert's slot, or none.
+    fn sync_table(&self) {
+        for e in 0..self.gpu.experts as u32 {
+            match self.slots.slot_of.get(&e) {
+                Some(&s) => self.gpu.set_slot(e, s),
+                None => self.gpu.clear(e),
+            }
+        }
+    }
 }
 
 /// A bank's bookkeeping, apart from the GPU memory it describes: which expert sits in which
@@ -118,6 +146,17 @@ impl Slots {
             plan.misses.push((e, self.put(pos, e)));
         }
         Some(plan)
+    }
+
+    /// The toaster: once a layer has used these experts, their slots go to the front of the
+    /// eviction line, so the next reads take them first instead of the longest-unused slots.
+    pub fn pop(&mut self, used: &[u32]) {
+        for &e in used {
+            if let Some(&slot) = self.slot_of.get(&e) {
+                self.lru.retain(|&x| x != slot);
+                self.lru.push_front(slot);
+            }
+        }
     }
 
     /// Reserve slots for the predicted experts not already held, best first, as far as free slots
@@ -247,6 +286,26 @@ struct Trail {
     lines: Vec<String>,
     /// Finished forward passes, waiting to be saved.
     blocks: Vec<String>,
+    /// The words of the forward pass in progress, for the block's T line.
+    tokens: Vec<u32>,
+}
+
+/// Our register: per layer, what each expert adds to the running vector (`d`), what the layer adds
+/// regardless (`d0`), and the last prediction waiting to be checked against the truth.
+struct Register {
+    d: Vec<Tensor>,
+    d0: Vec<Tensor>,
+    lr: f32,
+    lr0: f32,
+    last: Option<(usize, Tensor, Tensor, Tensor)>,
+    /// The input the last prediction was made from (measurement only).
+    last_x: Tensor,
+}
+
+impl Default for Register {
+    fn default() -> Self {
+        Self { d: Vec::new(), d0: Vec::new(), lr: 1.0, lr0: 0.05, last: None, last_x: Tensor::zeros(1, DType::F32, &Device::Cpu).unwrap() }
+    }
 }
 
 #[derive(Default)]
@@ -272,12 +331,93 @@ struct Stats {
     expert_seconds: f64,
     load_phase_seconds: f64,
     maths_seconds: f64,
+    /// S6 measurement: how often a bank-only route (experts already resident) would have picked
+    /// the same experts as the real route. Layers seen, summed agreement fraction, layers fully
+    /// agreeing, words where every layer agreed, and whether the current word has agreed so far.
+    draft_layers: u64,
+    draft_agree: f64,
+    draft_layers_full: u64,
+    draft_words_full: u64,
+    draft_word_ok: bool,
+    /// S6 measurement: drafts run, words drafted, words the plain path agreed with.
+    spec_passes: u64,
+    spec_drafted: u64,
+    spec_accepted: u64,
+    /// Register measurement: relative error of its predicted state against the truth, summed per
+    /// layer step, and the same for the plain carry-over (x alone) as the yardstick.
+    /// Where the CPU time around the loads goes, per layer step (profile mode, plain path):
+    /// waiting for the GPU to hand the picks back, placing the experts in the bank (no reads),
+    /// the reads themselves, the bookkeeping (learn, log, guess, prefetch requests), and the encode.
+    t_readback: f64,
+    t_place: f64,
+    t_books: f64,
+    t_encode: f64,
+    reg_steps: u64,
+    reg_err: f64,
+    reg_err_plain: f64,
+    reg_err_by_layer: Vec<f64>,
+    reg_plain_by_layer: Vec<f64>,
 }
 
 static PROFILE: AtomicBool = AtomicBool::new(false);
 
 fn profiling() -> bool {
     PROFILE.load(Ordering::Relaxed)
+}
+
+fn toaster() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_TOASTER").is_ok())
+}
+
+/// Lab (`COACHWHIP_STAGE=1`): file reads land in ordinary memory and are copied into the bank.
+fn staged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_STAGE").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Lab (`COACHWHIP_QRULE=<p>`): prefetch every early-guess candidate whose router probability is
+/// at least `p`, instead of a flat `prefetch` per layer. `COACHWHIP_QCAP` caps the width (16).
+fn q_rule() -> Option<f32> {
+    static V: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("COACHWHIP_QRULE").ok().and_then(|v| v.parse().ok()))
+}
+
+fn q_cap() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("COACHWHIP_QCAP").ok().and_then(|v| v.parse().ok()).unwrap_or(16))
+}
+
+/// Lab (`COACHWHIP_SPLIT=1`): a layer's maths starts on the resident experts while its misses
+/// are read, then finishes with the misses. Same sum, two halves.
+fn split_maths() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_SPLIT").map(|v| v == "1").unwrap_or(false))
+}
+
+/// The GPU shrink (`COACHWHIP_GPUQ2=1`): the bank holds Q2_K copies, shrunk on arrival.
+pub fn gpuq2() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_GPUQ2").map(|v| v == "1").unwrap_or(false))
+}
+
+/// The shaped shrink (`COACHWHIP_SHAPE=1`): the shrink's fit is weighted by the token's shape.
+pub fn shaped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_SHAPE").map(|v| v == "1").unwrap_or(false))
+}
+
+/// With the GPU shrink on, squeeze the down matrix too (`COACHWHIP_Q2_DOWN=1`). Off by default:
+/// down is the fat, sensitive one, and the Q2 file that read well last night kept it sharp.
+fn shrink_down() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_Q2_DOWN").map(|v| v == "1").unwrap_or(false))
+}
+
+/// S4: the GPU never stops for the CPU (`COACHWHIP_PARALLEL=1`).
+pub fn parallel() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_PARALLEL").is_ok())
 }
 
 pub struct ExpertStore {
@@ -299,6 +439,54 @@ pub struct ExpertStore {
     /// The word being written (one-word steps only) and the layer it has reached.
     word: AtomicU64,
     now_layer: AtomicUsize,
+    /// S6: routing confined to the bank, nothing read or learned.
+    draft: AtomicBool,
+    /// Foresight: the draft pass also tells the bank what the real pass of this word will need.
+    foresee: AtomicBool,
+    /// Which word ahead the foresight draft is on (0 = the word about to be written).
+    foresee_step: AtomicU64,
+    foresight_lists: Mutex<Vec<(usize, Tensor)>>,
+    /// Lab (`COACHWHIP_DUMP=file`): every layer's MoE input and router scores, one record per
+    /// layer per word, to fit the expert predictor from.
+    dump: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
+    /// Our register (`COACHWHIP_REGISTER=1`): what each expert adds to the running vector, per
+    /// layer, learned on the GPU as the words go by; the early guess reads the state it predicts.
+    register: Mutex<Option<Register>>,
+    /// S4: the resolve-and-wait kernel, when the parallel path is on (`COACHWHIP_PARALLEL=1`).
+    /// The parallel path (S4), when `COACHWHIP_PARALLEL` is set.
+    s4: Option<S4>,
+    /// The GPU shrink (`COACHWHIP_GPUQ2=1`): arriving experts are shrunk to Q2_K on the GPU on
+    /// their way into the bank, which holds Q2 copies and so parks more of them.
+    requant: Option<crate::requant::Requant>,
+    /// Staging buffers for the shrink, by size, reused across reads.
+    staging: Mutex<HashMap<usize, Vec<Arc<candle_metal_kernels::metal::Buffer>>>>,
+    /// Sharp slots per layer (0 = one kind of slot) and the hot experts per layer that get them,
+    /// from the route logs at load: the most-used experts of each layer.
+    sharp_n: usize,
+    hot: Vec<Vec<u32>>,
+    /// The token's shape per layer (`COACHWHIP_SHAPE=1`): running mean of x² over the hidden
+    /// size (for gate and up) and of the expert's hidden² over the intermediate size (for down),
+    /// in shared buffers the shaped shrink reads. Count of updates alongside.
+    shape: Mutex<HashMap<usize, (Arc<candle_metal_kernels::metal::Buffer>, Arc<candle_metal_kernels::metal::Buffer>, u64)>>,
+}
+
+/// The parallel path's fixed parts: the two kernels, the shared event, the sequence of waits and
+/// the service thread's queue.
+struct S4 {
+    pipes: crate::gpu_sync::Pipelines,
+    event: crate::gpu_sync::GpuEvent,
+    seq: AtomicU64,
+    tx: Mutex<Option<mpsc::Sender<S4Job>>>,
+}
+
+/// One layer's picks for the service thread: read them, place the experts, signal the GPU.
+struct S4Job {
+    layer: usize,
+    seq: u64,
+    n_ids: usize,
+    n_guess: usize,
+    prefetch_k: usize,
+    ahead: usize,
 }
 
 /// Expert ids ordered by a router's scores, best first. Equal scores keep expert order, so the
@@ -312,7 +500,7 @@ pub fn rank(scores: &[f32]) -> Vec<u32> {
 /// A guessed read is stale once its word is over, or the word has reached its layer: from then
 /// on that layer reads its own misses, and a late guess would only evict experts still to be used.
 pub fn is_stale(job_layer: usize, job_word: u64, now_layer: usize, now_word: u64) -> bool {
-    job_word != now_word || job_layer <= now_layer
+    job_word < now_word || (job_word == now_word && job_layer <= now_layer)
 }
 
 impl ExpertStore {
@@ -347,6 +535,13 @@ impl ExpertStore {
             slices.push(per_expert);
         }
         let file = std::fs::File::open(path)?;
+        // Lab (`COACHWHIP_NOCACHE=1`): read experts straight from the flash, bypassing the page
+        // cache. On a 16 GB box the cache has nothing to give back and costs a copy per read.
+        if std::env::var("COACHWHIP_NOCACHE").map(|v| v == "1").unwrap_or(false) {
+            use std::os::unix::io::AsRawFd;
+            let r = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+            eprintln!("coachwhip: page cache bypassed for expert reads (fcntl F_NOCACHE -> {r})");
+        }
         let experts = slices[0].len();
         let per_expert_mb = slices[0][0].iter().map(|s| s.bytes).sum::<usize>() as f64 / 1e6;
         eprintln!(
@@ -356,6 +551,18 @@ impl ExpertStore {
         let dirs: Vec<&Path> = settings.routes.iter().chain(settings.learned.iter()).map(|p| p.as_path()).collect();
         let routes = load_routes(&dirs, layers);
         eprintln!("coachwhip: route table for {} (layer, expert) pairs", routes.len());
+        let sharp_n: usize = std::env::var("COACHWHIP_SHARP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let hot: Vec<Vec<u32>> = (0..layers)
+            .map(|l| {
+                let mut use_count: Vec<(u32, u64)> = (0..slices[l].len() as u32).map(|e| (e, routes.get(&(l, e)).map_or(0, |row| row.values().sum()))).collect();
+                use_count.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                use_count.into_iter().take(sharp_n).filter(|(_, n)| *n > 0).map(|(e, _)| e).collect()
+            })
+            .collect();
+        if sharp_n > 0 {
+            let known: usize = hot.iter().map(|h| h.len()).sum();
+            eprintln!("coachwhip: two kinds of slot: {sharp_n} sharp per layer for the hot experts ({known} known from the route logs), {per_layer} small");
+        }
         let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let store = Arc::new(Self {
             file,
@@ -374,7 +581,39 @@ impl ExpertStore {
             prefetch_tx: Mutex::new(None),
             word: AtomicU64::new(0),
             now_layer: AtomicUsize::new(0),
+            draft: AtomicBool::new(false),
+            foresee: AtomicBool::new(false),
+            foresee_step: AtomicU64::new(0),
+            foresight_lists: Mutex::new(Vec::new()),
+            dump: Mutex::new(std::env::var("COACHWHIP_DUMP").ok().and_then(|p| std::fs::File::create(p).ok()).map(std::io::BufWriter::new)),
+            register: Mutex::new(if std::env::var("COACHWHIP_REGISTER").map(|v| v == "1").unwrap_or(false) { Some(Register::default()) } else { None }),
+            s4: if parallel() {
+                Some(S4 { pipes: crate::gpu_sync::pipelines(metal.device())?, event: crate::gpu_sync::GpuEvent::new(metal.device())?, seq: AtomicU64::new(0), tx: Mutex::new(None) })
+            } else {
+                None
+            },
+            requant: if gpuq2() { Some(crate::requant::Requant::new(metal)?) } else { None },
+            staging: Mutex::new(HashMap::new()),
+            shape: Mutex::new(HashMap::new()),
+            sharp_n,
+            hot,
         });
+        if gpuq2() {
+            let q2_mb = store.slices[0][0].iter().enumerate().map(|(i, s)| if i < 2 || shrink_down() { s.dims.iter().product::<usize>() / crate::requant::QK_K * crate::requant::Q2K_BLOCK_BYTES } else { s.bytes }).sum::<usize>() as f64 / 1e6;
+            eprintln!("coachwhip: GPU shrink on: experts are shrunk to Q2_K on arrival, {q2_mb:.1} MB each in the bank ({:.2} GB)", per_layer as f64 * layers as f64 * q2_mb / 1e3);
+        }
+        if let Some(s4) = &store.s4 {
+            eprintln!("coachwhip: parallel path on: the GPU waits on a shared event for its experts; the CPU never waits for the GPU inside a word");
+            let (tx, rx) = mpsc::channel::<S4Job>();
+            *s4.tx.lock().unwrap() = Some(tx);
+            let weak: Weak<Self> = Arc::downgrade(&store);
+            std::thread::spawn(move || {
+                for job in rx {
+                    let Some(st) = weak.upgrade() else { break };
+                    st.s4_service(job);
+                }
+            });
+        }
         // The prefetch threads read guessed experts into free slots while the GPU works on the
         // current layer. They hold only a weak handle, so the store still shuts down with the model.
         let (tx, rx) = mpsc::channel::<(usize, u64, Vec<u32>)>();
@@ -416,9 +655,121 @@ impl ExpertStore {
         scores
             .into_iter()
             .map(|(e, _)| e)
-            .filter(|e| present.map_or(true, |b| !b.slots.slot_of.contains_key(e)))
+            .filter(|e| present.map_or(true, |b| !b.slots.slot_of.contains_key(e) && !b.sharp.as_ref().map_or(false, |sb| sb.slots.slot_of.contains_key(e))))
             .take(k)
             .collect()
+    }
+
+    pub fn register_on(&self) -> bool {
+        self.register.lock().unwrap().is_some()
+    }
+
+    /// One step of the register at `layer`: learn from the layer before (its prediction against
+    /// this layer's real input), then predict this layer's output state from the experts it chose.
+    /// `xs` is (1, h), `ids` the chosen experts, `top_w` their weights (1, k). Returns x̂ (1, h).
+    fn register_step(&self, layer: usize, xs: &Tensor, ids: &[u32], top_w: &Tensor) -> Result<Tensor> {
+        let mut guard = self.register.lock().unwrap();
+        let Some(reg) = guard.as_mut() else { return Ok(xs.clone()) };
+        let h = xs.dim(1)?;
+        let experts = self.slices[layer].len();
+        let device = xs.device();
+        if reg.d.is_empty() {
+            for l in 0..self.layers {
+                reg.d.push(Tensor::zeros((experts, h), DType::F32, device)?);
+                reg.d0.push(Tensor::zeros(h, DType::F32, device)?);
+            }
+            reg.lr = std::env::var("COACHWHIP_REGISTER_LR").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+            reg.lr0 = std::env::var("COACHWHIP_REGISTER_LR0").ok().and_then(|v| v.parse().ok()).unwrap_or(0.05);
+            eprintln!("coachwhip: register on: {} layers x {experts} experts x {h}, lr {} / {}", self.layers, reg.lr, reg.lr0);
+        }
+        // Learn: the layer before predicted x̂; this layer's input is the truth.
+        if let Some((l, x_hat, ids_t, w_t)) = reg.last.take() {
+            if l + 1 == layer {
+                let err = (xs - &x_hat)?; // (1, h)
+                if profiling() {
+                    let truth = xs.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt().max(1e-6);
+                    let e = err.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+                    let plain = (xs - &reg.last_x)?.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+                    let mut st = self.stats.lock().unwrap();
+                    if st.reg_err_by_layer.len() < self.layers {
+                        st.reg_err_by_layer = vec![0.0; self.layers];
+                        st.reg_plain_by_layer = vec![0.0; self.layers];
+                    }
+                    st.reg_steps += 1;
+                    st.reg_err += (e / truth) as f64;
+                    st.reg_err_plain += (plain / truth) as f64;
+                    st.reg_err_by_layer[layer] += (e / truth) as f64;
+                    st.reg_plain_by_layer[layer] += (plain / truth) as f64;
+                }
+                let delta = w_t.broadcast_mul(&err)?.affine(reg.lr as f64, 0.0)?; // (k, h)
+                reg.d[l] = reg.d[l].index_add(&ids_t, &delta, 0)?;
+                reg.d0[l] = (&reg.d0[l] + err.squeeze(0)?.affine(reg.lr0 as f64, 0.0)?)?;
+            }
+        }
+        // Predict: x̂ = x + d0 + Σ w_e d[e].
+        let ids_t = Tensor::new(ids, device)?;
+        let w_t = top_w.reshape((ids.len(), 1))?.to_dtype(DType::F32)?;
+        let adds = reg.d[layer].index_select(&ids_t, 0)?; // (k, h)
+        let x_hat = (xs.broadcast_add(&reg.d0[layer])? + w_t.broadcast_mul(&adds)?.sum_keepdim(0)?)?;
+        reg.last = Some((layer, x_hat.clone(), ids_t, w_t));
+        reg.last_x = xs.clone();
+        Ok(x_hat)
+    }
+
+    /// The register step with the picks still on the GPU (the parallel path never reads them
+    /// back): `top_ids` (1, k) u32, `top_w` (1, k). Learns from the layer before, predicts x̂.
+    fn register_step_gpu(&self, layer: usize, xs: &Tensor, top_ids: &Tensor, top_w: &Tensor) -> Result<Tensor> {
+        let mut guard = self.register.lock().unwrap();
+        let Some(reg) = guard.as_mut() else { return Ok(xs.clone()) };
+        let h = xs.dim(1)?;
+        let k = top_ids.elem_count();
+        let experts = self.slices[layer].len();
+        let device = xs.device();
+        if reg.d.is_empty() {
+            for _ in 0..self.layers {
+                reg.d.push(Tensor::zeros((experts, h), DType::F32, device)?);
+                reg.d0.push(Tensor::zeros(h, DType::F32, device)?);
+            }
+            reg.lr = std::env::var("COACHWHIP_REGISTER_LR").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+            reg.lr0 = std::env::var("COACHWHIP_REGISTER_LR0").ok().and_then(|v| v.parse().ok()).unwrap_or(0.05);
+            eprintln!("coachwhip: register on (GPU): {} layers x {experts} experts x {h}, lr {} / {}", self.layers, reg.lr, reg.lr0);
+        }
+        if let Some((l, x_hat, ids_t, w_t)) = reg.last.take() {
+            if l + 1 == layer {
+                let err = (xs - &x_hat)?;
+                let delta = w_t.broadcast_mul(&err)?.affine(reg.lr as f64, 0.0)?;
+                reg.d[l] = reg.d[l].index_add(&ids_t, &delta, 0)?;
+                reg.d0[l] = (&reg.d0[l] + err.squeeze(0)?.affine(reg.lr0 as f64, 0.0)?)?;
+            }
+        }
+        let ids_t = top_ids.flatten_all()?.contiguous()?;
+        let w_t = top_w.reshape((k, 1))?.to_dtype(DType::F32)?;
+        let adds = reg.d[layer].index_select(&ids_t, 0)?;
+        let x_hat = (xs.broadcast_add(&reg.d0[layer])? + w_t.broadcast_mul(&adds)?.sum_keepdim(0)?)?;
+        reg.last = Some((layer, x_hat.clone(), ids_t, w_t));
+        Ok(x_hat)
+    }
+
+    /// Chain one more layer on the GPU: route x̂ with `gate` (the next layer's router), then add
+    /// what those experts typically add. No read-back.
+    fn register_chain(&self, layer: usize, x_hat: &Tensor, gate: &Linear, k: usize) -> Result<Tensor> {
+        let guard = self.register.lock().unwrap();
+        let Some(reg) = guard.as_ref() else { return Ok(x_hat.clone()) };
+        if reg.d.is_empty() || layer >= reg.d.len() {
+            return Ok(x_hat.clone());
+        }
+        let scores = gate.forward(x_hat)?; // (1, e)
+        let top = scores.arg_sort_last_dim(false)?.narrow(D::Minus1, 0, k)?.contiguous()?; // (1, k)
+        let p = candle_nn::ops::softmax_last_dim(&scores.gather(&top, D::Minus1)?)?; // (1, k)
+        let adds = reg.d[layer].index_select(&top.flatten_all()?, 0)?; // (k, h)
+        Ok((x_hat.broadcast_add(&reg.d0[layer])? + p.reshape((k, 1))?.broadcast_mul(&adds)?.sum_keepdim(0)?)?)
+    }
+
+    /// Lab: how many experts beyond the top k the foresight peek fetches per layer
+    /// (`COACHWHIP_FORESIGHT_EXTRA`, default 0).
+    fn foresight_extra() -> usize {
+        static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *V.get_or_init(|| std::env::var("COACHWHIP_FORESIGHT_EXTRA").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
     }
 
     /// Hand a layer's guessed experts to the prefetch threads.
@@ -427,7 +778,9 @@ impl ExpertStore {
             return;
         }
         if let Some(tx) = self.prefetch_tx.lock().unwrap().as_ref() {
-            let _ = tx.send((layer, self.word.load(Ordering::Acquire), predicted));
+            // A draft pass runs ahead of the real pass of the same word: its reads belong to that word.
+            let word = self.word.load(Ordering::Acquire) + if self.drafting() { 1 + self.foresee_step.load(Ordering::Acquire) } else { 0 };
+            let _ = tx.send((layer, word, predicted));
         }
     }
 
@@ -437,7 +790,7 @@ impl ExpertStore {
         let missing: Vec<u32> = {
             let banks = self.banks.lock().unwrap();
             let present = banks.get(&layer);
-            guess.iter().take(k).copied().filter(|e| present.map_or(true, |b| !b.slots.slot_of.contains_key(e))).collect()
+            guess.iter().take(k).copied().filter(|e| present.map_or(true, |b| !b.slots.slot_of.contains_key(e) && !b.sharp.as_ref().map_or(false, |sb| sb.slots.slot_of.contains_key(e)))).collect()
         };
         for pair in missing.chunks(2) {
             self.request_prefetch(layer, pair.to_vec());
@@ -454,35 +807,190 @@ impl ExpertStore {
 
     /// Prefetch thread: reserve free slots for the predicted experts, then read them in with the
     /// bank unlocked, so the main thread is never held up by a read it did not ask for.
-    fn prefetch(&self, layer: usize, predicted: &[u32]) -> Result<()> {
-        let mut jobs: Vec<(u32, [(usize, usize); 3], Arc<AtomicBool>)> = Vec::new();
+    fn prefetch(&self, layer: usize, predicted_all: &[u32]) -> Result<()> {
+        // Two kinds: hot predictions go to the sharp bank, read plain.
+        let (hot, cold): (Vec<u32>, Vec<u32>) = predicted_all.iter().partition(|&&e| self.is_hot(layer, e));
+        if !hot.is_empty() {
+            let mut sjobs: Vec<(u32, usize, [(usize, usize); 3], Arc<AtomicBool>)> = Vec::new();
+            {
+                let mut banks = self.banks.lock().unwrap();
+                if let Some(bank) = banks.get_mut(&layer) {
+                    if let Some(sb) = bank.sharp.as_mut() {
+                        let ready = &sb.ready;
+                        let reserved = sb.slots.reserve(&hot, |s| ready[s].load(Ordering::Acquire));
+                        for &(_, slot) in &reserved {
+                            ready[slot].store(false, Ordering::Release);
+                        }
+                        for (e, slot) in reserved {
+                            let ptrs = [0, 1, 2].map(|i| (sb.mats[i].base + slot * sb.mats[i].bytes, sb.mats[i].bytes));
+                            sjobs.push((e, slot, ptrs, ready[slot].clone()));
+                        }
+                    }
+                }
+            }
+            for (e, _slot, ptrs, ready) in sjobs {
+                for (i, s) in self.slices[layer][e as usize].iter().enumerate() {
+                    let dst = unsafe { std::slice::from_raw_parts_mut(ptrs[i].0 as *mut u8, s.bytes) };
+                    self.file.read_exact_at(dst, s.offset)?;
+                }
+                ready.store(true, Ordering::Release);
+                self.stats.lock().unwrap().prefetch_copies += 1;
+            }
+        }
+        let predicted: &[u32] = &cold;
+        if predicted.is_empty() {
+            return Ok(());
+        }
+        let mut jobs: Vec<(u32, usize, [(usize, usize); 3], Arc<AtomicBool>, Arc<crate::gpu_sync::GpuBank>)> = Vec::new();
         {
             let mut banks = self.banks.lock().unwrap();
             let Some(bank) = banks.get_mut(&layer) else { return Ok(()) };
             let ready = &bank.ready;
-            for (e, slot) in bank.slots.reserve(predicted, |s| ready[s].load(Ordering::Acquire)) {
+            let pinned = &bank.pinned;
+            let reserved = bank.slots.reserve(predicted, |s| ready[s].load(Ordering::Acquire) && !pinned[s].load(Ordering::Acquire));
+            for &(_, slot) in &reserved {
                 ready[slot].store(false, Ordering::Release);
+                bank.gpu.set_ready(slot, false);
+            }
+            // The GPU's table follows the CPU's: evicted experts gone, new ones present but not ready.
+            bank.sync_table();
+            let gpu = bank.gpu.clone();
+            for (e, slot) in reserved {
                 let ptrs = [0, 1, 2].map(|i| (bank.mats[i].base + slot * bank.mats[i].bytes, bank.mats[i].bytes));
-                jobs.push((e, ptrs, ready[slot].clone()));
+                jobs.push((e, slot, ptrs, ready[slot].clone(), gpu.clone()));
             }
         }
-        for (e, ptrs, ready) in jobs {
+        if self.requant.is_some() {
+            let mats: [(Arc<QMetalStorage>, usize); 3] = {
+                let banks = self.banks.lock().unwrap();
+                let bank = &banks[&layer];
+                [0, 1, 2].map(|i| (bank.mats[i].storage.clone(), bank.mats[i].bytes))
+            };
+            for (e, slot, _ptrs, ready, gpu) in jobs {
+                self.shrink_into(layer, e, slot, &mats)?;
+                ready.store(true, Ordering::Release);
+                gpu.set_ready(slot, true);
+                self.stats.lock().unwrap().prefetch_copies += 1;
+            }
+            return Ok(());
+        }
+        for (e, slot, ptrs, ready, gpu) in jobs {
             for (i, s) in self.slices[layer][e as usize].iter().enumerate() {
                 let dst = unsafe { std::slice::from_raw_parts_mut(ptrs[i].0 as *mut u8, s.bytes) };
-                self.file.read_exact_at(dst, s.offset)?;
+                if staged() {
+                    let mut tmp = vec![0u8; s.bytes];
+                    self.file.read_exact_at(&mut tmp, s.offset)?;
+                    dst.copy_from_slice(&tmp);
+                } else {
+                    self.file.read_exact_at(dst, s.offset)?;
+                }
             }
             ready.store(true, Ordering::Release);
+            gpu.set_ready(slot, true);
             self.stats.lock().unwrap().prefetch_copies += 1;
         }
+        Ok(())
+    }
+
+    fn take_staging(&self, bytes: usize) -> Result<Arc<candle_metal_kernels::metal::Buffer>> {
+        if let Some(b) = self.staging.lock().unwrap().entry(bytes).or_default().pop() {
+            return Ok(b);
+        }
+        Ok(self.metal.new_buffer_builder().with_size(bytes).with_label("shrink_staging").build()?)
+    }
+
+    fn put_staging(&self, bytes: usize, b: Arc<candle_metal_kernels::metal::Buffer>) {
+        self.staging.lock().unwrap().entry(bytes).or_default().push(b);
+    }
+
+    /// Read one expert of `layer` from the file and shrink it on the GPU straight into `slot`
+    /// of the bank's three matrices (`mats`: storage and bytes per slot). Returns when the slot
+    /// holds the shrunk bytes.
+    fn shrink_into(&self, layer: usize, e: u32, slot: usize, mats: &[(Arc<QMetalStorage>, usize); 3]) -> Result<()> {
+        let Some(rq) = self.requant.as_ref() else { candle::bail!("shrink_into without the GPU shrink") };
+        for (i, sl) in self.slices[layer][e as usize].iter().enumerate() {
+            if i == 2 && !shrink_down() {
+                // The down matrix keeps the file's bytes: read it straight into its slot.
+                let dst = unsafe { std::slice::from_raw_parts_mut((mats[i].0.buffer().contents() as usize + slot * mats[i].1) as *mut u8, sl.bytes) };
+                self.file.read_exact_at(dst, sl.offset)?;
+                continue;
+            }
+            let Some(kind) = crate::requant::SrcKind::of(sl.dtype) else {
+                candle::bail!("the GPU shrink takes Q3_K, Q4_K or Q5_K experts, this file has {:?}", sl.dtype)
+            };
+            let staging = self.take_staging(sl.bytes)?;
+            let dst = unsafe { std::slice::from_raw_parts_mut(staging.contents() as *mut u8, sl.bytes) };
+            self.file.read_exact_at(dst, sl.offset)?;
+            let n_blocks = sl.dims.iter().product::<usize>() / crate::requant::QK_K;
+            let shape_buf = if shaped() {
+                let shapes = self.shape.lock().unwrap();
+                shapes.get(&layer).filter(|(_, _, n)| *n >= 32).map(|(xs, hs, _)| if i == 2 { hs.clone() } else { xs.clone() })
+            } else {
+                None
+            };
+            match shape_buf {
+                Some(sh) => rq.run_shaped(kind, &staging, 0, mats[i].0.buffer(), slot * mats[i].1, n_blocks, &sh, sl.dims[1], )?,
+                None => rq.run(kind, &staging, 0, mats[i].0.buffer(), slot * mats[i].1, n_blocks)?,
+            }
+            self.put_staging(sl.bytes, staging);
+        }
+        Ok(())
+    }
+
+    /// Fold one token's shape into `layer`'s running shape: x² over the hidden size, hidden² over
+    /// the intermediate size (averaged over the experts the token used). CPU side, ~20k floats.
+    fn note_shape(&self, layer: usize, xs: &Tensor, hidden: &Tensor) -> Result<()> {
+        let x: Vec<f32> = xs.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
+        let h2: Vec<Vec<f32>> = hidden.to_dtype(DType::F32)?.to_vec2()?;
+        let inter = h2.first().map_or(0, |r| r.len());
+        let mut shapes = self.shape.lock().unwrap();
+        let entry = match shapes.get(&layer) {
+            Some(_) => shapes.get_mut(&layer).unwrap(),
+            None => {
+                let xb = self.metal.new_buffer_builder().with_size(x.len() * 4).with_label("shape_x").build()?;
+                let hb = self.metal.new_buffer_builder().with_size(inter * 4).with_label("shape_h").build()?;
+                unsafe {
+                    std::ptr::write_bytes(xb.contents() as *mut u8, 0, x.len() * 4);
+                    std::ptr::write_bytes(hb.contents() as *mut u8, 0, inter * 4);
+                }
+                shapes.insert(layer, (xb, hb, 0));
+                shapes.get_mut(&layer).unwrap()
+            }
+        };
+        let n = entry.2 as f32;
+        let a = 1.0 / (n + 1.0);
+        let xp = entry.0.contents() as *mut f32;
+        let hp = entry.1.contents() as *mut f32;
+        unsafe {
+            for (i, v) in x.iter().enumerate() {
+                let old = *xp.add(i);
+                *xp.add(i) = old + a * (v * v - old);
+            }
+            for (i, row) in h2.iter().enumerate() {
+                let w = 1.0 / h2.len() as f32;
+                for (j, v) in row.iter().enumerate() {
+                    let old = *hp.add(j);
+                    let target = v * v;
+                    // average over the experts used this token, then fold into the running mean
+                    *hp.add(j) = old + a * w * (target - old) * if i == 0 { 1.0 } else { 1.0 };
+                }
+            }
+        }
+        entry.2 += 1;
         Ok(())
     }
 
     /// A layer's bank: three shared buffers, each `per_layer` expert slots of one matrix.
     fn make_bank(&self, layer: usize) -> Result<Bank> {
         let mut mats = Vec::with_capacity(3);
-        for s in self.slices[layer][0].iter() {
+        for (i, s) in self.slices[layer][0].iter().enumerate() {
             let elems: usize = s.dims.iter().product();
-            let storage = QMetalStorage::zeros(&self.metal, elems * self.per_layer, s.dtype)?;
+            let (dtype, bytes) = if self.requant.is_some() && (i < 2 || shrink_down()) {
+                (GgmlDType::Q2K, elems / crate::requant::QK_K * crate::requant::Q2K_BLOCK_BYTES)
+            } else {
+                (s.dtype, s.bytes)
+            };
+            let storage = QMetalStorage::zeros(&self.metal, elems * self.per_layer, dtype)?;
             let base = storage.buffer().contents() as usize;
             if base == 0 {
                 candle::bail!("Metal gave a buffer the CPU cannot write to");
@@ -490,8 +998,8 @@ impl ExpertStore {
             mats.push(BankMat {
                 storage: Arc::new(storage),
                 base,
-                bytes: s.bytes,
-                dtype: s.dtype,
+                bytes,
+                dtype,
                 n: s.dims[0],
                 k: s.dims[1],
             });
@@ -502,10 +1010,34 @@ impl ExpertStore {
         };
         // `zeros` queues a GPU fill; let it run now, or it would wipe the experts written in afterwards.
         self.device.synchronize()?;
+        let gpu = Arc::new(crate::gpu_sync::GpuBank::new(&self.metal, self.slices[layer].len(), self.per_layer, 8 * 16 + 32)?);
+        let sharp = if self.sharp_n > 0 {
+            let mut smats = Vec::with_capacity(3);
+            for s in self.slices[layer][0].iter() {
+                let elems: usize = s.dims.iter().product();
+                let storage = QMetalStorage::zeros(&self.metal, elems * self.sharp_n, s.dtype)?;
+                let base = storage.buffer().contents() as usize;
+                if base == 0 {
+                    candle::bail!("Metal gave a buffer the CPU cannot write to");
+                }
+                smats.push(BankMat { storage: Arc::new(storage), base, bytes: s.bytes, dtype: s.dtype, n: s.dims[0], k: s.dims[1] });
+            }
+            let smats: [BankMat; 3] = match smats.try_into() {
+                Ok(m) => m,
+                Err(_) => candle::bail!("a bank has three matrices"),
+            };
+            self.device.synchronize()?;
+            Some(SharpBank { mats: smats, slots: Slots::new(self.sharp_n), ready: (0..self.sharp_n).map(|_| Arc::new(AtomicBool::new(true))).collect() })
+        } else {
+            None
+        };
         Ok(Bank {
             mats,
             slots: Slots::new(self.per_layer),
+            sharp,
             ready: (0..self.per_layer).map(|_| Arc::new(AtomicBool::new(true))).collect(),
+            gpu,
+            pinned: (0..self.per_layer).map(|_| AtomicBool::new(false)).collect(),
         })
     }
 
@@ -555,15 +1087,75 @@ impl ExpertStore {
 
     /// Makes sure every needed expert of one layer sits in the bank; returns expert -> slot.
     /// None when the bank is too small for this forward.
-    fn ensure(&self, layer: usize, needed: &[u32]) -> Result<Option<HashMap<u32, usize>>> {
-        if needed.len() > self.per_layer {
+    fn is_hot(&self, layer: usize, e: u32) -> bool {
+        self.sharp_n > 0 && self.hot[layer].contains(&e)
+    }
+
+    /// The sharp bank's half of a forward: give the hot experts sharp slots, read the missing
+    /// ones straight from the file (no shrink). Returns expert -> slot | SHARP_FLAG, or None when
+    /// the sharp bank cannot hold them (the caller then treats them as cold).
+    fn ensure_sharp(&self, layer: usize, bank: &mut Bank, hot: &[u32]) -> Result<Option<HashMap<u32, usize>>> {
+        let Some(sb) = bank.sharp.as_mut() else { return Ok(None) };
+        if hot.is_empty() {
+            return Ok(Some(HashMap::new()));
+        }
+        if hot.len() > self.sharp_n {
             return Ok(None);
         }
+        let ready = &sb.ready;
+        let Some(plan) = sb.slots.assign(hot, |s| ready[s].load(Ordering::Acquire)) else { return Ok(None) };
+        for &(_, slot) in &plan.hits {
+            while !sb.ready[slot].load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
+        self.stats.lock().unwrap().hits += plan.hits.len() as u64;
+        if !plan.misses.is_empty() {
+            let places: [(usize, usize); 3] = [0, 1, 2].map(|i| (sb.mats[i].base, sb.mats[i].bytes));
+            let reads: Vec<(usize, usize, u64)> = plan
+                .misses
+                .iter()
+                .flat_map(|&(e, slot)| self.slices[layer][e as usize].iter().enumerate().map(move |(i, s)| (places[i].0 + slot * places[i].1, s.bytes, s.offset)).collect::<Vec<_>>())
+                .collect();
+            let started = Instant::now();
+            reads.par_iter().try_for_each(|&(dst, len, offset)| {
+                let dst = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
+                self.file.read_exact_at(dst, offset)
+            })?;
+            let mut st = self.stats.lock().unwrap();
+            st.loads += plan.misses.len() as u64;
+            st.bytes_loaded += reads.iter().map(|r| r.1 as u64).sum::<u64>();
+            st.load_seconds += started.elapsed().as_secs_f64();
+        }
+        Ok(Some(hot.iter().map(|&e| (e, sb.slots.slot_of[&e] | SHARP_FLAG)).collect()))
+    }
+
+    fn ensure(&self, layer: usize, needed_all: &[u32]) -> Result<Option<HashMap<u32, usize>>> {
         let mut banks = self.banks.lock().unwrap();
         if !banks.contains_key(&layer) {
             banks.insert(layer, self.make_bank(layer)?);
         }
         let bank = banks.get_mut(&layer).unwrap();
+        // Two kinds: the hot experts go to the sharp bank; what it cannot take is cold.
+        let (hot, mut cold): (Vec<u32>, Vec<u32>) = needed_all.iter().partition(|&&e| self.is_hot(layer, e));
+        let sharp_map = if self.sharp_n > 0 {
+            match self.ensure_sharp(layer, bank, &hot)? {
+                Some(m) => m,
+                None => {
+                    cold.extend(hot.iter().copied());
+                    HashMap::new()
+                }
+            }
+        } else {
+            HashMap::new()
+        };
+        let needed: &[u32] = &cold;
+        if needed.len() > self.per_layer {
+            return Ok(None);
+        }
+        if needed.is_empty() {
+            return Ok(Some(sharp_map));
+        }
         // A slot still being filled by a prefetch cannot be taken; if too few are free for this
         // layer's misses, read them fresh instead, before the bank is touched.
         let ready = &bank.ready;
@@ -571,6 +1163,16 @@ impl ExpertStore {
             self.stats.lock().unwrap().crowded += 1;
             return Ok(None);
         };
+        // S4: the GPU reads these slots later than now; keep the prefetch readers off them until
+        // this layer is placed again for the next word.
+        if self.s4.is_some() {
+            for p in &bank.pinned {
+                p.store(false, Ordering::Release);
+            }
+            for &(_, slot) in plan.hits.iter().chain(plan.misses.iter()) {
+                bank.pinned[slot].store(true, Ordering::Release);
+            }
+        }
         // A prefetch may still be reading a hit in; wait for it rather than read it twice.
         let mut waited = 0.0;
         for &(_, slot) in &plan.hits {
@@ -589,7 +1191,20 @@ impl ExpertStore {
             st.prefetch_wait_seconds += waited;
         }
         let misses = plan.misses;
-        if !misses.is_empty() {
+        // The GPU's table follows: misses are placed but not ready until their bytes land.
+        for &(_, slot) in &misses {
+            bank.gpu.set_ready(slot, false);
+        }
+        bank.sync_table();
+        if !misses.is_empty() && self.requant.is_some() {
+            let mats: [(Arc<QMetalStorage>, usize); 3] = [0, 1, 2].map(|i| (bank.mats[i].storage.clone(), bank.mats[i].bytes));
+            let started = Instant::now();
+            misses.par_iter().try_for_each(|&(e, slot)| self.shrink_into(layer, e, slot, &mats))?;
+            let mut st = self.stats.lock().unwrap();
+            st.loads += misses.len() as u64;
+            st.bytes_loaded += misses.len() as u64 * self.slices[layer][0].iter().map(|s| s.bytes as u64).sum::<u64>();
+            st.load_seconds += started.elapsed().as_secs_f64();
+        } else if !misses.is_empty() {
             // All of this layer's misses go to the SSD at once: it serves several requests in
             // parallel far faster than one after another. Each matrix of each expert is one read.
             let places: [(usize, usize); 3] = [0, 1, 2].map(|i| (bank.mats[i].base, bank.mats[i].bytes));
@@ -607,14 +1222,334 @@ impl ExpertStore {
             reads.par_iter().try_for_each(|&(dst, len, offset)| {
                 // Each read fills its own slot of a shared buffer that no GPU work in flight uses.
                 let dst = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
-                self.file.read_exact_at(dst, offset)
+                if staged() {
+                    // Lab: read into ordinary memory first, then copy; the shared buffer may be
+                    // slower to write straight from the file.
+                    let mut tmp = vec![0u8; len];
+                    self.file.read_exact_at(&mut tmp, offset)?;
+                    dst.copy_from_slice(&tmp);
+                    Ok(())
+                } else {
+                    self.file.read_exact_at(dst, offset)
+                }
             })?;
             let mut st = self.stats.lock().unwrap();
             st.loads += misses.len() as u64;
             st.bytes_loaded += reads.iter().map(|r| r.1 as u64).sum::<u64>();
             st.load_seconds += started.elapsed().as_secs_f64();
         }
-        Ok(Some(bank.slots.slot_of.clone()))
+        for &(_, slot) in &misses {
+            bank.gpu.set_ready(slot, true);
+        }
+        let mut map = bank.slots.slot_of.clone();
+        map.extend(sharp_map);
+        Ok(Some(map))
+    }
+
+    /// Like `ensure`, but hands the miss reads back instead of doing them, so the caller can
+    /// start the GPU on the hits first. Returns expert -> slot, the misses, and their reads
+    /// (destination, length, file offset); None when the bank is too small or crowded.
+    fn ensure_split(&self, layer: usize, needed: &[u32]) -> Result<Option<(HashMap<u32, usize>, Vec<(u32, usize)>, Vec<(usize, usize, u64)>)>> {
+        if needed.len() > self.per_layer {
+            return Ok(None);
+        }
+        let mut banks = self.banks.lock().unwrap();
+        if !banks.contains_key(&layer) {
+            banks.insert(layer, self.make_bank(layer)?);
+        }
+        let bank = banks.get_mut(&layer).unwrap();
+        let ready = &bank.ready;
+        let Some(plan) = bank.slots.assign(needed, |s| ready[s].load(Ordering::Acquire)) else {
+            self.stats.lock().unwrap().crowded += 1;
+            return Ok(None);
+        };
+        let mut waited = 0.0;
+        for &(_, slot) in &plan.hits {
+            if !bank.ready[slot].load(Ordering::Acquire) {
+                let wait = Instant::now();
+                while !bank.ready[slot].load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                waited += wait.elapsed().as_secs_f64();
+            }
+        }
+        {
+            let mut st = self.stats.lock().unwrap();
+            st.hits += plan.hits.len() as u64;
+            st.prefetch_hits += plan.prefetch_hits;
+            st.prefetch_wait_seconds += waited;
+        }
+        let misses = plan.misses;
+        for &(_, slot) in &misses {
+            bank.gpu.set_ready(slot, false);
+            // The prefetchers must not take a slot whose bytes are still to come.
+            bank.ready[slot].store(false, Ordering::Release);
+        }
+        bank.sync_table();
+        let places: [(usize, usize); 3] = [0, 1, 2].map(|i| (bank.mats[i].base, bank.mats[i].bytes));
+        let reads: Vec<(usize, usize, u64)> = misses
+            .iter()
+            .flat_map(|&(e, slot)| {
+                self.slices[layer][e as usize]
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, s)| (places[i].0 + slot * places[i].1, s.bytes, s.offset))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        Ok(Some((bank.slots.slot_of.clone(), misses, reads)))
+    }
+
+    /// The second half of `ensure_split`: read the misses in, then mark their slots ready.
+    fn read_misses(&self, layer: usize, misses: &[(u32, usize)], reads: &[(usize, usize, u64)]) -> Result<()> {
+        if misses.is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        reads.par_iter().try_for_each(|&(dst, len, offset)| {
+            let dst = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
+            self.file.read_exact_at(dst, offset)
+        })?;
+        {
+            let mut st = self.stats.lock().unwrap();
+            st.loads += misses.len() as u64;
+            st.bytes_loaded += reads.iter().map(|r| r.1 as u64).sum::<u64>();
+            st.load_seconds += started.elapsed().as_secs_f64();
+        }
+        let banks = self.banks.lock().unwrap();
+        if let Some(bank) = banks.get(&layer) {
+            for &(_, slot) in misses {
+                bank.ready[slot].store(true, Ordering::Release);
+                bank.gpu.set_ready(slot, true);
+            }
+        }
+        Ok(())
+    }
+
+    /// S4: the GPU's view of `layer`'s bank, making the bank if the layer has none yet.
+    fn gpu_bank(&self, layer: usize) -> Result<Arc<crate::gpu_sync::GpuBank>> {
+        let mut banks = self.banks.lock().unwrap();
+        if !banks.contains_key(&layer) {
+            banks.insert(layer, self.make_bank(layer)?);
+        }
+        Ok(banks[&layer].gpu.clone())
+    }
+
+    /// S4: every layer's bank must exist before a word starts, so none is made mid-word while the
+    /// GPU queue is waiting on the service thread. Called at layer 0; cheap once they exist.
+    fn ensure_all_banks(&self) -> Result<()> {
+        let mut banks = self.banks.lock().unwrap();
+        if banks.len() >= self.layers {
+            return Ok(());
+        }
+        for layer in 0..self.layers {
+            if !banks.contains_key(&layer) {
+                let bank = self.make_bank(layer)?;
+                banks.insert(layer, bank);
+            }
+        }
+        Ok(())
+    }
+
+    /// S4 service: wait for the GPU to publish a layer's picks, place and read its experts, hand
+    /// the early guess to the readers, then let the GPU go on. Never touches the GPU queue.
+    fn s4_service(&self, job: S4Job) {
+        let Some(s4) = &self.s4 else { return };
+        let dbg = std::env::var("COACHWHIP_S4_DEBUG").is_ok();
+        let Ok(gpu) = self.gpu_bank(job.layer) else { return };
+        let started = Instant::now();
+        if dbg {
+            eprintln!("s4: job layer {} seq {} received", job.layer, job.seq);
+        }
+        let mut picks: Option<Vec<u32>> = None;
+        while picks.is_none() {
+            let flag = gpu.flag();
+            if flag != 0 {
+                picks = gpu.picks_checked(job.n_ids + job.n_guess, flag);
+            }
+            if picks.is_none() && started.elapsed().as_secs() > 15 {
+                eprintln!("coachwhip: parallel: layer {} never published its picks; releasing the GPU", job.layer);
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        if let Some(picks) = picks {
+            if dbg {
+                eprintln!("s4: layer {} flag seen after {:.1} ms", job.layer, started.elapsed().as_secs_f64() * 1e3);
+            }
+            self.reached(job.layer);
+            let ids = vec![picks[..job.n_ids].to_vec()];
+            self.learn(job.layer, &ids);
+            let mut needed: Vec<u32> = ids[0].clone();
+            needed.sort_unstable();
+            needed.dedup();
+            let placed = Instant::now();
+            loop {
+                match self.ensure(job.layer, &needed) {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if placed.elapsed().as_secs() > 15 {
+                            eprintln!("coachwhip: parallel: layer {} found no free slots; releasing the GPU", job.layer);
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                    Err(e) => {
+                        eprintln!("coachwhip: parallel: layer {}: {e}", job.layer);
+                        break;
+                    }
+                }
+            }
+            if dbg {
+                // Every needed expert must sit ready in a slot the GPU's table knows about.
+                let banks = self.banks.lock().unwrap();
+                if let Some(bank) = banks.get(&job.layer) {
+                    for e in &needed {
+                        match bank.slots.slot_of.get(e) {
+                            Some(&slot) if bank.ready[slot].load(Ordering::Acquire) => {}
+                            Some(&slot) => eprintln!("s4: MISSING layer {} expert {e}: slot {slot} not ready", job.layer),
+                            None => eprintln!("s4: MISSING layer {} expert {e}: no slot", job.layer),
+                        }
+                    }
+                }
+            }
+            if job.n_guess > 0 && job.layer + job.ahead < self.layers {
+                self.prefetch_guess(job.layer + job.ahead, &picks[job.n_ids..], job.prefetch_k);
+            }
+            let mut st = self.stats.lock().unwrap();
+            st.load_phase_seconds += started.elapsed().as_secs_f64();
+        }
+        s4.event.signal(job.seq);
+        if dbg {
+            eprintln!("s4: layer {} signalled seq {} after {:.1} ms", job.layer, job.seq, started.elapsed().as_secs_f64() * 1e3);
+        }
+        if job.layer + 1 == self.layers {
+            let missing: u32 = (0..self.layers).filter_map(|l| self.banks.lock().unwrap().get(&l).map(|b| b.gpu.missing())).sum();
+            if missing > 0 {
+                eprintln!("coachwhip: parallel: {missing} expert picks so far had no slot when the GPU looked them up");
+            }
+        }
+    }
+
+    /// S6 measurement bookkeeping: one draft of `k` words, `accepted` of them matched the plain path.
+    pub fn note_speculation(&self, k: usize, accepted: usize) {
+        let mut st = self.stats.lock().unwrap();
+        st.spec_passes += 1;
+        st.spec_drafted += k as u64;
+        st.spec_accepted += accepted as u64;
+    }
+
+    /// S6 draft mode: route only among experts already in the bank, read nothing, learn nothing.
+    pub fn set_draft(&self, on: bool) {
+        self.draft.store(on, Ordering::Release);
+    }
+
+    pub fn drafting(&self) -> bool {
+        self.draft.load(Ordering::Acquire)
+    }
+
+    /// Foresight (`COACHWHIP_FORESIGHT=1`): during the draft pass, each layer's unrestricted route
+    /// is handed to the readers a whole word before the real pass asks for it.
+    pub fn set_foresee(&self, on: bool, step: u64) {
+        self.foresee.store(on, Ordering::Release);
+        self.foresee_step.store(step, Ordering::Release);
+    }
+
+    pub fn foreseeing(&self) -> bool {
+        self.foresee.load(Ordering::Acquire)
+    }
+
+    /// The bank's map for the GPU: a mask that shuts out every expert not sitting ready in a slot
+    /// (0 / -1e30, one per expert) and the slot each expert sits in (u32, one per expert).
+    fn peek_tables(&self, layer: usize, top_k: usize, device: &Device) -> Result<(Tensor, Tensor)> {
+        let (mask, table) = {
+            let banks = self.banks.lock().unwrap();
+            let Some(bank) = banks.get(&layer) else { candle::bail!("draft: layer {layer} has no bank yet") };
+            let experts = self.slices[layer].len();
+            let mut mask = vec![-1e30f32; experts];
+            let mut table = vec![0u32; experts];
+            let mut ready = 0;
+            for (&e, &s) in bank.slots.slot_of.iter() {
+                if bank.ready[s].load(Ordering::Acquire) {
+                    mask[e as usize] = 0.0;
+                    table[e as usize] = s as u32;
+                    ready += 1;
+                }
+            }
+            if ready < top_k {
+                candle::bail!("draft: layer {layer} holds only {ready} ready experts")
+            }
+            (mask, table)
+        };
+        let n = mask.len();
+        Ok((Tensor::from_vec(mask, n, device)?, Tensor::from_vec(table, n, device)?))
+    }
+
+    /// A layer's foresight list, kept on the GPU until `flush_foresight`.
+    fn keep_foresight(&self, layer: usize, list: Tensor) {
+        self.foresight_lists.lock().unwrap().push((layer, list));
+    }
+
+    /// After a peek pass: read every layer's foresight list back (one wait) and start the reads.
+    pub fn flush_foresight(&self, top_k: usize) -> Result<()> {
+        let lists: Vec<(usize, Tensor)> = std::mem::take(&mut *self.foresight_lists.lock().unwrap());
+        for (layer, list) in lists {
+            let ids: Vec<u32> = list.to_vec1()?;
+            self.prefetch_guess(layer, &ids, top_k + ExpertStore::foresight_extra());
+        }
+        Ok(())
+    }
+
+    /// The experts of `layer` sitting in a ready slot right now, expert -> slot; None before the
+    /// layer has a bank at all.
+    pub fn resident_ready(&self, layer: usize) -> Option<HashMap<u32, usize>> {
+        let banks = self.banks.lock().unwrap();
+        let bank = banks.get(&layer)?;
+        Some(bank.slots.slot_of.iter().filter(|(_, &s)| bank.ready[s].load(Ordering::Acquire)).map(|(&e, &s)| (e, s)).collect())
+    }
+
+    /// The toaster (`COACHWHIP_TOASTER=1`): after a layer has computed, its experts' slots become
+    /// the first to be evicted.
+    fn pop_used(&self, layer: usize, used: &[u32]) {
+        if let Some(bank) = self.banks.lock().unwrap().get_mut(&layer) {
+            bank.slots.pop(used);
+        }
+    }
+
+    /// The experts of `layer` in the bank right now, before this layer's loads.
+    fn resident(&self, layer: usize) -> Vec<u32> {
+        let banks = self.banks.lock().unwrap();
+        banks.get(&layer).map(|b| b.slots.slot_of.keys().copied().collect()).unwrap_or_default()
+    }
+
+    /// S6 measurement: compare the real route with the route a draft confined to the bank would
+    /// take, and keep the score.
+    fn measure_draft(&self, layer: usize, scores: &[f32], real: &[u32], top_k: usize) {
+        let mut resident = self.resident(layer);
+        resident.sort_by(|a, b| scores[*b as usize].partial_cmp(&scores[*a as usize]).unwrap_or(std::cmp::Ordering::Equal));
+        let draft: Vec<u32> = resident.into_iter().take(top_k).collect();
+        let agree = real.iter().filter(|e| draft.contains(e)).count();
+        let mut st = self.stats.lock().unwrap();
+        if layer == 0 {
+            st.draft_word_ok = true;
+        }
+        st.draft_layers += 1;
+        st.draft_agree += agree as f64 / top_k as f64;
+        if agree == top_k {
+            st.draft_layers_full += 1;
+        } else {
+            st.draft_word_ok = false;
+        }
+        if layer + 1 == self.slices.len() && st.draft_word_ok {
+            st.draft_words_full += 1;
+        }
+    }
+
+    /// One `mul_mv_id` dispatch over the sharp bank's matrix.
+    fn bank_op_sharp(&self, layer: usize, which: usize, nei0: usize, rows_per_expert: bool) -> MoeMatvec {
+        let banks = self.banks.lock().unwrap();
+        let m = &banks[&layer].sharp.as_ref().expect("a sharp bank").mats[which];
+        MoeMatvec { bank: m.storage.clone(), dtype: m.dtype, n: m.n, k: m.k, slots: self.sharp_n, bytes: m.bytes, nei0, rows_per_expert }
     }
 
     /// One `mul_mv_id` dispatch over a bank matrix.
@@ -635,6 +1570,25 @@ impl ExpertStore {
 
     /// Learn from one layer's picks: add the step from the layer before to the route table at once,
     /// and keep the line for the log.
+    /// Lab: append one record (layer, the MoE input, the router's scores) to the dump file.
+    fn dump_record(&self, layer: usize, xs: &[f32], scores: &[f32]) {
+        use std::io::Write;
+        let mut d = self.dump.lock().unwrap();
+        if let Some(f) = d.as_mut() {
+            let mut buf = Vec::with_capacity(4 + 4 * (xs.len() + scores.len()));
+            buf.extend_from_slice(&(layer as u32).to_le_bytes());
+            for v in xs.iter().chain(scores.iter()) {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            let _ = f.write_all(&buf);
+        }
+    }
+
+    /// The words a forward pass is about to route, so the log's T line can name them.
+    pub fn note_tokens(&self, tokens: Vec<u32>) {
+        self.trail.lock().unwrap().tokens = tokens;
+    }
+
     fn learn(&self, layer: usize, ids: &[Vec<u32>]) {
         let mut trail = self.trail.lock().unwrap();
         if layer == 0 {
@@ -647,7 +1601,11 @@ impl ExpertStore {
         let line = ids.iter().map(|t| t.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(",");
         trail.lines.push(line);
         if layer + 1 == self.layers {
-            let block = format!("T -\n{}\n", trail.lines.join("\n"));
+            let words = if trail.tokens.is_empty() { "-".to_string() } else { trail.tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ") };
+            let block = format!("T {words}
+{}
+", trail.lines.join("
+"));
             trail.blocks.push(block);
             trail.lines.clear();
         } else {
@@ -708,8 +1666,45 @@ impl ExpertStore {
                 s.fresh, s.fresh_read_seconds, s.fresh_build_seconds
             );
         }
+        if s.spec_passes > 0 {
+            eprintln!(
+                "coachwhip S6: {} drafts of {} words: {} of {} drafted words accepted ({:.1}%), {:.2} accepted per draft",
+                s.spec_passes,
+                s.spec_drafted / s.spec_passes,
+                s.spec_accepted,
+                s.spec_drafted,
+                100.0 * s.spec_accepted as f64 / s.spec_drafted.max(1) as f64,
+                s.spec_accepted as f64 / s.spec_passes as f64
+            );
+        }
+        if profiling() && s.draft_layers > 0 {
+            eprintln!(
+                "coachwhip S6: bank-only route agrees with the real route on {:.1}% of experts; {:.1}% of layers fully; {} of {} words fully",
+                100.0 * s.draft_agree / s.draft_layers as f64,
+                100.0 * s.draft_layers_full as f64 / s.draft_layers as f64,
+                s.draft_words_full,
+                s.words
+            );
+        }
+        if profiling() && s.reg_steps > 0 {
+            let n = s.reg_steps as f64;
+            eprintln!(
+                "coachwhip register: predicted state is {:.1}% off the truth on average (carrying the input unchanged: {:.1}% off); by layer:",
+                100.0 * s.reg_err / n,
+                100.0 * s.reg_err_plain / n
+            );
+            let per = n / s.reg_err_by_layer.len().max(1) as f64;
+            let line: Vec<String> = s.reg_err_by_layer.iter().zip(s.reg_plain_by_layer.iter()).enumerate().filter(|(l, _)| *l > 0).map(|(l, (e, p))| format!("{l}:{:.0}/{:.0}", 100.0 * e / per, 100.0 * p / per)).collect();
+            eprintln!("coachwhip register by layer (register/plain, % off): {}", line.join(" "));
+        }
         if profiling() && s.words > 2 {
             let words = (s.words - 1) as f64;
+            eprintln!(
+                "coachwhip cpu split per word: readback {:.1} ms, placing {:.1} ms, bookkeeping {:.1} ms (the rest of router+loads is the reads and the encode)",
+                1000.0 * s.t_readback / words,
+                1000.0 * s.t_place / words,
+                1000.0 * s.t_books / words
+            );
             eprintln!(
                 "coachwhip profile: {} written words after the first, {:.1} ms per word in total, {:.1} ms in the expert layers: router+loads {:.1} (of which file reads {:.1}), expert maths {:.1}",
                 s.words - 1,
@@ -795,6 +1790,15 @@ impl CustomOp2 for MoeMatvec {
     }
 }
 
+/// Router scores with every expert not `allowed` pushed far below the rest, so `route` picks
+/// only among the allowed ones (S6 draft: the experts already in the bank).
+pub fn restrict(logits: &Tensor, allowed: impl Fn(u32) -> bool) -> Result<Tensor> {
+    let n = logits.dim(D::Minus1)?;
+    let mask: Vec<f32> = (0..n as u32).map(|e| if allowed(e) { 0.0 } else { -1e30 }).collect();
+    let mask = Tensor::from_vec(mask, n, logits.device())?.to_dtype(logits.dtype())?;
+    logits.broadcast_add(&mask)
+}
+
 /// The router's choice for each token: the `top_k` likeliest experts from the router's scores,
 /// best first, and their weights, rescaled to sum to 1 when `norm`.
 pub fn route(logits: &Tensor, top_k: usize, norm: bool) -> Result<(Tensor, Tensor)> {
@@ -814,6 +1818,8 @@ pub struct StreamedMoe {
     /// A later layer's router (`ahead` layers on), run early on this layer's input to guess
     /// that layer's experts while there is still time to read them in.
     pub next_gate: Option<Linear>,
+    /// The very next layer's router, for the register to chain through when `ahead` is 2.
+    pub gate1: Option<Linear>,
     pub ahead: usize,
     pub store: Arc<ExpertStore>,
     pub top_k: usize,
@@ -861,8 +1867,8 @@ impl StreamedMoe {
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (b, s, h) = xs.dims3()?;
-        let prof = profiling() && b * s == 1;
-        if prof && self.layer == 0 {
+        let prof = profiling() && b * s == 1 && self.store.s4.is_none();
+        if prof && self.layer == 0 && !self.store.drafting() {
             self.store.device.synchronize()?;
             let mut st = self.store.stats.lock().unwrap();
             if let Some(t) = st.word_started {
@@ -876,29 +1882,184 @@ impl StreamedMoe {
         let started = Instant::now();
         let dtype = xs.dtype();
         let n = b * s;
-        if n == 1 {
+        if n == 1 && !self.store.drafting() && self.store.s4.is_none() {
             self.store.reached(self.layer);
         }
         let xs = xs.reshape((n, h))?.to_dtype(DType::F32)?.contiguous()?;
 
-        let (top_ids, top_w) = route(&self.gate.forward(&xs)?, self.top_k, self.norm_topk_prob)?;
+        // S6 draft: the bank as it stands is the whole model for this word. No reads, no learning,
+        // no prefetch, no bookkeeping; the LRU order is left alone too.
+        if self.store.drafting() {
+            if n != 1 {
+                candle::bail!("draft: one word at a time")
+            }
+            // No round trip to the CPU: the bank's map goes up to the GPU as two small tensors, the
+            // GPU picks among the resident experts and looks their slots up itself. The foresight
+            // list (the unrestricted route) is kept on the GPU and read back once, after the pass.
+            let device = xs.device();
+            let logits = self.gate.forward(&xs)?;
+            let (mask, table) = self.store.peek_tables(self.layer, self.top_k, device)?;
+            if self.store.foreseeing() {
+                let want = (self.top_k + ExpertStore::foresight_extra()).min(logits.dim(D::Minus1)?);
+                let list = logits.arg_sort_last_dim(false)?.narrow(D::Minus1, 0, want)?.flatten_all()?.contiguous()?;
+                self.store.keep_foresight(self.layer, list);
+            }
+            let (top_ids, top_w) = route(&logits.broadcast_add(&mask)?, self.top_k, self.norm_topk_prob)?;
+            let slots = table.gather(&top_ids.flatten_all()?, 0)?.reshape((n, self.top_k))?;
+            let gate = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 0, self.top_k, false))?;
+            let up = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 1, self.top_k, false))?;
+            let inter = gate.dim(2)?;
+            let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((n * self.top_k, inter))?;
+            let down = hidden.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 2, self.top_k, true))?;
+            let out = down.broadcast_mul(&top_w.unsqueeze(2)?)?.sum(1)?;
+            return out.reshape((b, s, h))?.to_dtype(dtype);
+        }
+
+        let logits = self.gate.forward(&xs)?;
+        let (top_ids, top_w) = route(&logits, self.top_k, self.norm_topk_prob)?;
+
+        // S4, the parallel path: nothing here waits for the GPU. The picks stay on the GPU; a tiny
+        // kernel publishes them for the service thread, the maths is queued behind a wait on the
+        // shared event, and a second kernel looks the slots up once the service thread has placed
+        // the experts and signalled. The CPU moves straight on to the next layer.
+        if n == 1 && self.store.s4.is_some() {
+            let s4 = self.store.s4.as_ref().unwrap();
+            if self.layer == 0 {
+                self.store.ensure_all_banks()?;
+            }
+            let device = xs.device();
+            let (guess, n_guess) = match &self.next_gate {
+                Some(g) if self.prefetch_k > 0 => {
+                    // With the register on, guess from the state it predicts, all on the GPU.
+                    let x_in = if self.store.register_on() {
+                        let mut x_hat = self.store.register_step_gpu(self.layer, &xs, &top_ids, &top_w)?;
+                        if self.ahead >= 2 {
+                            if let Some(g1) = &self.gate1 {
+                                x_hat = self.store.register_chain(self.layer + 1, &x_hat, g1, self.top_k)?;
+                            }
+                        }
+                        x_hat
+                    } else {
+                        xs.clone()
+                    };
+                    let scores = g.forward(&x_in)?;
+                    let n_guess = 32.min(scores.dim(D::Minus1)?);
+                    (scores.arg_sort_last_dim(false)?.narrow(D::Minus1, 0, n_guess)?.flatten_all()?.contiguous()?, n_guess)
+                }
+                _ => (Tensor::zeros(1, DType::U32, device)?, 0),
+            };
+            // Metal's rule: a command buffer must be committed after the CPU writes the data it
+            // reads. The buffer holding the layer before's maths is committed by this layer's flush,
+            // so wait here until the service thread has placed and written that layer's experts.
+            // The GPU keeps its queue; only the CPU's run-ahead is capped at one layer.
+            let last = s4.seq.load(Ordering::Acquire);
+            let held = Instant::now();
+            while s4.event.value() < last {
+                if held.elapsed().as_secs() > 20 {
+                    candle::bail!("parallel: layer {} waited too long for the layer before", self.layer)
+                }
+                std::hint::spin_loop();
+            }
+            let gpu = self.store.gpu_bank(self.layer)?;
+            gpu.reset_flag();
+            if std::env::var("COACHWHIP_S4_DEBUG").is_ok() {
+                eprintln!("s4: encode layer {}", self.layer);
+            }
+            let publish = crate::gpu_sync::Publish { bank: gpu.clone(), pipeline: s4.pipes.publish.clone(), n_guess };
+            let _published = top_ids.apply_op2_no_bwd(&guess, &publish)?;
+            crate::gpu_sync::flush()?;
+            let seq = s4.seq.fetch_add(1, Ordering::AcqRel) + 1;
+            s4.event.gpu_wait(seq)?;
+            let resolve = crate::gpu_sync::Resolve { bank: gpu.clone(), pipeline: s4.pipes.resolve.clone() };
+            let slots = top_ids.apply_op1_no_bwd(&resolve)?;
+            let gate = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 0, self.top_k, false))?;
+            let up = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 1, self.top_k, false))?;
+            let inter = gate.dim(2)?;
+            let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((n * self.top_k, inter))?;
+            let down = hidden.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 2, self.top_k, true))?;
+            let out = down.broadcast_mul(&top_w.unsqueeze(2)?)?.sum(1)?;
+            if let Some(tx) = s4.tx.lock().unwrap().as_ref() {
+                let _ = tx.send(S4Job { layer: self.layer, seq, n_ids: self.top_k, n_guess, prefetch_k: self.prefetch_k, ahead: self.ahead });
+            }
+            return out.reshape((b, s, h))?.to_dtype(dtype);
+        }
+        // S6 measurement (profile mode, one word at a time): what a bank-only draft would pick.
+        let draft_scores: Option<Vec<f32>> = if prof { Some(logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?) } else { None };
+        if n == 1 && self.store.dump.lock().unwrap().is_some() {
+            let x: Vec<f32> = xs.flatten_all()?.to_vec1()?;
+            let s: Vec<f32> = logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
+            self.store.dump_record(self.layer, &x, &s);
+        }
         // The guess for a later layer is queued before the read-back below, so it costs no wait.
+        let register = n == 1 && self.store.register_on();
         let early = match &self.next_gate {
-            Some(g) if n == 1 && self.prefetch_k > 0 => Some(g.forward(&xs)?),
+            Some(g) if n == 1 && self.prefetch_k > 0 && !register => Some(g.forward(&xs)?),
             _ => None,
         };
         // Reading the picks back waits for the GPU to finish everything queued so far, so no
         // kernel is still reading a bank slot when `ensure` and the prefetchers overwrite it.
         // Keep this wait if this code ever changes.
+        let t_rb = Instant::now();
         let ids: Vec<Vec<u32>> = top_ids.to_vec2()?;
+        let t_rb = t_rb.elapsed().as_secs_f64();
+        let t_bk = Instant::now();
+        if let Some(scores) = &draft_scores {
+            self.store.measure_draft(self.layer, scores, &ids[0], self.top_k);
+        }
         self.store.learn(self.layer, &ids);
         let mut needed: Vec<u32> = ids.iter().flatten().copied().collect();
         needed.sort_unstable();
         needed.dedup();
-        let slot_of = self.store.ensure(self.layer, &needed)?;
+        let books_a = t_bk.elapsed().as_secs_f64();
+        let loads_before = if prof { self.store.stats.lock().unwrap().load_seconds } else { 0.0 };
+        let t_pl = Instant::now();
+        // Split path: assign now, read the misses after the hits' maths has been queued.
+        let split = n == 1 && split_maths();
+        let mut pending: Option<(Vec<(u32, usize)>, Vec<(usize, usize, u64)>)> = None;
+        let slot_of = if split {
+            match self.store.ensure_split(self.layer, &needed)? {
+                Some((slot_of, misses, reads)) => {
+                    pending = Some((misses, reads));
+                    Some(slot_of)
+                }
+                None => None,
+            }
+        } else {
+            self.store.ensure(self.layer, &needed)?
+        };
+        let t_pl = t_pl.elapsed().as_secs_f64();
+        let loads_in = if prof { self.store.stats.lock().unwrap().load_seconds - loads_before } else { 0.0 };
+        let t_bk2 = Instant::now();
+        // Our register: predict the state this layer hands on, chain to the layer before the
+        // target if need be, and run the target layer's router on the predicted state.
+        let early = match (&self.next_gate, register) {
+            (Some(g), true) if self.prefetch_k > 0 => {
+                let mut x_hat = self.store.register_step(self.layer, &xs, &ids[0], &top_w)?;
+                if self.ahead >= 2 {
+                    if let Some(g1) = &self.gate1 {
+                        x_hat = self.store.register_chain(self.layer + 1, &x_hat, g1, self.top_k)?;
+                    }
+                }
+                Some(g.forward(&x_hat)?)
+            }
+            _ => early,
+        };
         if let Some(logits) = early {
             let scores: Vec<f32> = logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
-            self.store.prefetch_guess(self.layer + self.ahead, &rank(&scores), self.prefetch_k);
+            if let Some(p_min) = q_rule() {
+                // The probability rule: a candidate is read iff its router probability, calibrated
+                // on the route dumps, says it is more likely needed than its bytes cost. On the
+                // 122B that line sits at a router probability of about 1%.
+                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let ex: Vec<f32> = scores.iter().map(|&z| (z - m).exp()).collect();
+                let sum: f32 = ex.iter().sum();
+                let ranked = rank(&scores);
+                let cands: Vec<u32> = ranked.iter().copied().take_while(|&e| ex[e as usize] / sum >= p_min).take(q_cap()).collect();
+                let k = cands.len().max(1);
+                self.store.prefetch_guess(self.layer + self.ahead, &cands, k);
+            } else {
+                self.store.prefetch_guess(self.layer + self.ahead, &rank(&scores), self.prefetch_k);
+            }
         } else if n == 1 && self.prefetch_k > 0 {
             for ahead in 1..=self.store.ahead {
                 if self.layer + ahead < self.store.slices.len() {
@@ -907,17 +2068,81 @@ impl StreamedMoe {
                 }
             }
         }
+        let books_b = t_bk2.elapsed().as_secs_f64();
         if prof {
             self.store.device.synchronize()?;
             let mut st = self.store.stats.lock().unwrap();
             if st.words > 1 {
                 st.load_phase_seconds += started.elapsed().as_secs_f64();
+                st.t_readback += t_rb;
+                st.t_place += (t_pl - loads_in).max(0.0);
+                st.t_books += books_a + books_b;
             }
         }
         let maths_started = Instant::now();
         let device = xs.device();
 
-        let out = if let Some(slot_of) = slot_of {
+        let out = if let (Some(slot_of), Some((misses, reads))) = (&slot_of, pending.take()) {
+            // The resident experts first, queued and flushed so the GPU works while the CPU reads.
+            let miss_set: HashSet<u32> = misses.iter().map(|&(e, _)| e).collect();
+            let row = &ids[0];
+            let part = |positions: &[usize]| -> Result<Option<Tensor>> {
+                if positions.is_empty() {
+                    return Ok(None);
+                }
+                let k = positions.len();
+                let slots: Vec<u32> = positions.iter().map(|&p| slot_of[&row[p]] as u32).collect();
+                let slots = Tensor::from_vec(slots, (1, k), device)?;
+                let idx = Tensor::new(positions.iter().map(|&p| p as u32).collect::<Vec<_>>(), device)?;
+                let w = top_w.index_select(&idx, 1)?; // (1, k)
+                let gate = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 0, k, false))?;
+                let up = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 1, k, false))?;
+                let inter = gate.dim(2)?;
+                let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((k, inter))?;
+                let down = hidden.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 2, k, true))?;
+                Ok(Some(down.broadcast_mul(&w.unsqueeze(2)?)?.sum(1)?))
+            };
+            let hit_pos: Vec<usize> = (0..row.len()).filter(|&p| !miss_set.contains(&row[p])).collect();
+            let miss_pos: Vec<usize> = (0..row.len()).filter(|&p| miss_set.contains(&row[p])).collect();
+            let hits_out = part(&hit_pos)?;
+            if hits_out.is_some() && !misses.is_empty() {
+                crate::gpu_sync::flush()?;
+            }
+            self.store.read_misses(self.layer, &misses, &reads)?;
+            let miss_out = part(&miss_pos)?;
+            match (hits_out, miss_out) {
+                (Some(a), Some(b)) => (a + b)?,
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => xs.zeros_like()?,
+            }
+        } else if let (Some(slot_of), true) = (&slot_of, n == 1 && self.store.sharp_n > 0) {
+            // Two kinds of slot: the sharp experts and the small ones each get their dispatches; the sums add.
+            let row = &ids[0];
+            let part = |positions: &[usize], sharp: bool| -> Result<Option<Tensor>> {
+                if positions.is_empty() {
+                    return Ok(None);
+                }
+                let k = positions.len();
+                let slots: Vec<u32> = positions.iter().map(|&p| (slot_of[&row[p]] & !SHARP_FLAG) as u32).collect();
+                let slots = Tensor::from_vec(slots, (1, k), device)?;
+                let idx = Tensor::new(positions.iter().map(|&p| p as u32).collect::<Vec<_>>(), device)?;
+                let w = top_w.index_select(&idx, 1)?;
+                let op = |which: usize, nei0: usize, rpe: bool| if sharp { self.store.bank_op_sharp(self.layer, which, nei0, rpe) } else { self.store.bank_op(self.layer, which, nei0, rpe) };
+                let gate = xs.apply_op2_no_bwd(&slots, &op(0, k, false))?;
+                let up = xs.apply_op2_no_bwd(&slots, &op(1, k, false))?;
+                let inter = gate.dim(2)?;
+                let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((k, inter))?;
+                let down = hidden.apply_op2_no_bwd(&slots, &op(2, k, true))?;
+                Ok(Some(down.broadcast_mul(&w.unsqueeze(2)?)?.sum(1)?))
+            };
+            let sharp_pos: Vec<usize> = (0..row.len()).filter(|&p| slot_of[&row[p]] & SHARP_FLAG != 0).collect();
+            let small_pos: Vec<usize> = (0..row.len()).filter(|&p| slot_of[&row[p]] & SHARP_FLAG == 0).collect();
+            match (part(&sharp_pos, true)?, part(&small_pos, false)?) {
+                (Some(a), Some(b)) => (a + b)?,
+                (Some(a), None) | (None, Some(a)) => a,
+                (None, None) => xs.zeros_like()?,
+            }
+        } else if let Some(slot_of) = slot_of {
             let slots: Vec<u32> = ids.iter().flatten().map(|e| slot_of[e] as u32).collect();
             let slots = Tensor::from_vec(slots, (n, self.top_k), device)?;
             let gate = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 0, self.top_k, false))?; // (n, k, inter)
@@ -925,10 +2150,16 @@ impl StreamedMoe {
             let inter = gate.dim(2)?;
             let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((n * self.top_k, inter))?;
             let down = hidden.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 2, self.top_k, true))?; // (n, k, h)
+            if n == 1 && shaped() && self.store.requant.is_some() {
+                self.store.note_shape(self.layer, &xs, &hidden)?;
+            }
             down.broadcast_mul(&top_w.unsqueeze(2)?)?.sum(1)?
         } else {
             self.reference(&xs, &ids, &top_w)?
         };
+        if n == 1 && toaster() {
+            self.store.pop_used(self.layer, &needed);
+        }
         if prof {
             self.store.device.synchronize()?;
             let mut st = self.store.stats.lock().unwrap();

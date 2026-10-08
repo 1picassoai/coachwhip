@@ -76,10 +76,41 @@ struct Args {
     /// Print where each word's time went after every answer.
     #[arg(long)]
     profile: bool,
+
+    /// Ask the router for this many experts per word instead of the model's own number (Qwen3.5-122B:
+    /// 4 instead of 8). Fewer experts means fewer bytes per word and faster writing; the answers
+    /// change, so check them for your use.
+    #[arg(long)]
+    experts: Option<usize>,
+
+    /// The parallel path: the GPU waits on a shared event for its experts instead of the CPU
+    /// re-queuing each layer. Faster on big models; the answers do not change.
+    #[arg(long)]
+    parallel: bool,
+
+    /// The register: learns, as it runs, what each expert adds to the running state, and guesses
+    /// the next layers' experts from the state it predicts. Fewer reads; the answers do not change.
+    #[arg(long)]
+    register: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    // The engine reads these as switches; the flags are their front door.
+    if let Some(k) = args.experts {
+        std::env::set_var("COACHWHIP_TOPK", k.to_string());
+    }
+    if args.parallel {
+        std::env::set_var("COACHWHIP_PARALLEL", "1");
+    }
+    // The parallel path commits GPU work itself, layer by layer, once the CPU has written what
+    // that work reads; Candle must not commit on its own count in between.
+    if coachwhip_engine::experts::parallel() && std::env::var("CANDLE_METAL_COMPUTE_PER_BUFFER").is_err() {
+        std::env::set_var("CANDLE_METAL_COMPUTE_PER_BUFFER", "1000000");
+    }
+    if args.register {
+        std::env::set_var("COACHWHIP_REGISTER", "1");
+    }
     let device = Device::new_metal(0)?;
     // A hot path belongs to one model: its routes live in a folder named after the model file.
     let model_name = args.model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "model".into());

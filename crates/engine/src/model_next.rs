@@ -6,9 +6,94 @@
 //! Follows llama.cpp's qwen3next graph for the tensor layout and the maths.
 
 use crate::experts::{ExpertStore, Settings, StreamedMoe};
-use candle::quantized::gguf_file;
+use candle::quantized::{ggml_file::qtensor_from_ggml, gguf_file, GgmlDType, QTensor};
 use candle::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::kv_cache::KvCache;
+/// Inputs this long or shorter run the delta rule word by word (exact); longer ones block-wise.
+pub const DELTA_STEPS_MAX: usize = 8;
+
+/// The delta rule one word at a time over the first `upto` positions: the memory decays, is
+/// corrected by each key and value, and is read out with the query. Returns the outputs
+/// `(upto, n_v, dv)` and the memory after them.
+pub fn delta_steps(qc: &Tensor, kc: &Tensor, vc: &Tensor, beta: &Tensor, log_decay: &Tensor, mut s: Tensor, upto: usize) -> Result<(Tensor, Tensor)> {
+    let n_v = kc.dim(1)?;
+    let decay = log_decay.exp()?;
+    let mut outs = Vec::with_capacity(upto);
+    for t in 0..upto {
+        let kt = kc.get(t)?.unsqueeze(1)?.contiguous()?; // (n_v, 1, dk)
+        let qt = qc.get(t)?.unsqueeze(1)?.contiguous()?;
+        let vt = vc.get(t)?.unsqueeze(1)?; // (n_v, 1, dv)
+        let bt = beta.get(t)?.reshape((n_v, 1, 1))?;
+        let gt = decay.get(t)?.reshape((n_v, 1, 1))?;
+        s = s.broadcast_mul(&gt)?;
+        let sk = kt.matmul(&s)?; // (n_v, 1, dv)
+        let d = (vt - sk)?.broadcast_mul(&bt)?;
+        s = (s + kt.transpose(1, 2)?.contiguous()?.matmul(&d)?)?;
+        outs.push(qt.matmul(&s)?.squeeze(1)?); // (n_v, dv)
+    }
+    Ok((Tensor::stack(&outs, 0)?, s))
+}
+
+/// What a recorded forward leaves behind, so the layer's memory can be rewound to any prefix of
+/// it: the memory before, the convolution window before, and every word's inputs.
+struct Trail {
+    s0: Tensor,
+    conv_before: Tensor,
+    padded: Tensor,
+    qc: Tensor,
+    kc: Tensor,
+    vc: Tensor,
+    beta: Tensor,
+    log_decay: Tensor,
+}
+
+/// Keys and values kept between words, like candle's KvCache, plus `truncate` so a speculative
+/// draft can be taken back.
+struct KvBuf {
+    k: Option<Tensor>,
+    v: Option<Tensor>,
+    len: usize,
+    cap: usize,
+}
+
+impl KvBuf {
+    fn new(cap: usize) -> Self {
+        Self { k: None, v: None, len: 0, cap }
+    }
+
+    /// Appends along the sequence axis (dim 2) and returns everything kept so far.
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        let l = k.dim(2)?;
+        if self.k.is_none() || self.len + l > self.cap {
+            let (b, h, _, d) = k.dims4()?;
+            let cap = (self.len + l).max(self.cap) + 1024;
+            let len = self.len;
+            let grow = |old: &Option<Tensor>, t: &Tensor| -> Result<Tensor> {
+                let fresh = Tensor::zeros((b, h, cap, d), t.dtype(), t.device())?;
+                if let (Some(o), true) = (old, len > 0) {
+                    fresh.slice_set(&o.narrow(2, 0, len)?, 2, 0)?;
+                }
+                Ok(fresh)
+            };
+            self.k = Some(grow(&self.k, k)?);
+            self.v = Some(grow(&self.v, v)?);
+            self.cap = cap;
+        }
+        let kb = self.k.as_ref().unwrap();
+        let vb = self.v.as_ref().unwrap();
+        kb.slice_set(k, 2, self.len)?;
+        vb.slice_set(v, 2, self.len)?;
+        self.len += l;
+        Ok((kb.narrow(2, 0, self.len)?, vb.narrow(2, 0, self.len)?))
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
+
+    fn reset(&mut self) {
+        self.len = 0;
+    }
+}
 use candle_nn::{Embedding, Linear};
 use candle_transformers::models::quantized_qwen3::Gguf;
 use candle_transformers::models::with_tracing::QMatMul;
@@ -28,7 +113,33 @@ fn wire_lookahead(layers: &mut [Layer], ahead: usize) {
     let ahead = ahead.max(1);
     for i in ahead..layers.len() {
         layers[i - ahead].moe.next_gate = Some(layers[i].moe.gate.clone());
+        if ahead >= 2 {
+            layers[i - ahead].moe.gate1 = Some(layers[i - ahead + 1].moe.gate.clone());
+        }
     }
+}
+
+/// Lab (`COACHWHIP_PREDICTOR=file`): fitted expert predictors in place of the borrowed routers.
+/// File: u32 layers, hidden, experts, ahead; then per layer L in 0..layers-ahead: f32 W[experts x
+/// hidden] (row-major), f32 b[experts]. W maps layer L's MoE input to layer L+ahead's scores.
+fn load_predictor(layers: &mut [Layer], path: &str, ahead: usize, device: &Device) -> Result<()> {
+    let bytes = std::fs::read(path).map_err(|e| candle::Error::Msg(format!("predictor {path}: {e}")))?;
+    let u32_at = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+    let (n_layers, hidden, experts, f_ahead) = (u32_at(0), u32_at(4), u32_at(8), u32_at(12));
+    if n_layers != layers.len() || f_ahead != ahead {
+        candle::bail!("predictor {path}: {n_layers} layers, ahead {f_ahead}; model has {} layers, ahead {ahead}", layers.len())
+    }
+    let mut pos = 16;
+    let floats = |pos: usize, n: usize| -> Vec<f32> { bytes[pos..pos + 4 * n].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect() };
+    for l in 0..n_layers - ahead {
+        let w = Tensor::from_vec(floats(pos, experts * hidden), (experts, hidden), device)?;
+        pos += 4 * experts * hidden;
+        let b = Tensor::from_vec(floats(pos, experts), experts, device)?;
+        pos += 4 * experts;
+        layers[l].moe.next_gate = Some(Linear::new(w, Some(b)));
+    }
+    eprintln!("coachwhip: fitted expert predictor loaded from {path} ({} layers, {ahead} ahead)", n_layers - ahead);
+    Ok(())
 }
 
 fn softplus(x: &Tensor) -> Result<Tensor> {
@@ -164,6 +275,9 @@ mod proj_tests {
             eps: 1e-6,
             conv_state: None,
             state: None,
+            snapshot: None,
+            record: false,
+            trail: None,
         }
     }
 
@@ -246,12 +360,39 @@ struct LinearAttn {
     eps: f64,
     conv_state: Option<Tensor>,
     state: Option<Tensor>,
+    /// The memories as they were before a speculative draft, to go back to.
+    snapshot: Option<(Option<Tensor>, Option<Tensor>)>,
+    /// Keep a trail of the next forward, so it can be rewound.
+    record: bool,
+    trail: Option<Trail>,
 }
 
 impl LinearAttn {
     fn reset(&mut self) {
         self.conv_state = None;
         self.state = None;
+        self.snapshot = None;
+    }
+
+    fn take_snapshot(&mut self) {
+        self.snapshot = Some((self.conv_state.clone(), self.state.clone()));
+    }
+
+    fn restore_snapshot(&mut self) {
+        if let Some((c, s)) = self.snapshot.take() {
+            self.conv_state = c;
+            self.state = s;
+        }
+    }
+
+    /// Rewind the last recorded forward to its first `m` words: the memory is replayed from
+    /// before it over those words, the convolution window set as it was after them.
+    fn rewind(&mut self, m: usize) -> Result<()> {
+        let Some(t) = self.trail.take() else { return Ok(()) };
+        let taps = self.conv_w.dim(1)?;
+        self.state = Some(if m == 0 { t.s0 } else { delta_steps(&t.qc, &t.kc, &t.vc, &t.beta, &t.log_decay, t.s0, m)?.1 });
+        self.conv_state = Some(if m == 0 { t.conv_before } else { t.padded.narrow(0, m, taps - 1)?.contiguous()? });
+        Ok(())
     }
 
     /// The projections of one input, in one layout: q, k and v side by side as `(l, channels)`,
@@ -326,26 +467,18 @@ impl LinearAttn {
             Some(s) => s.clone(),
             None => Tensor::zeros((n_v, dk, dv), DType::F32, device)?,
         };
-        let (o, s) = if l > 1 {
+        // Long inputs take the block-at-a-time path; short ones (one word, or a speculative
+        // verify of a few) go word by word, the exact arithmetic plain decoding uses.
+        let s0 = s.clone();
+        let (o, s) = if l > DELTA_STEPS_MAX {
             delta_chunked(&qc, &kc, &vc, &beta, &log_decay, s)?
         } else {
-            let decay = log_decay.exp()?;
-            let mut outs = Vec::with_capacity(l);
-            for t in 0..l {
-                let kt = kc.get(t)?.unsqueeze(1)?.contiguous()?; // (n_v, 1, dk)
-                let qt = qc.get(t)?.unsqueeze(1)?.contiguous()?;
-                let vt = vc.get(t)?.unsqueeze(1)?; // (n_v, 1, dv)
-                let bt = beta.get(t)?.reshape((n_v, 1, 1))?;
-                let gt = decay.get(t)?.reshape((n_v, 1, 1))?;
-                s = s.broadcast_mul(&gt)?;
-                let sk = kt.matmul(&s)?; // (n_v, 1, dv)
-                let d = (vt - sk)?.broadcast_mul(&bt)?;
-                s = (s + kt.transpose(1, 2)?.contiguous()?.matmul(&d)?)?;
-                outs.push(qt.matmul(&s)?.squeeze(1)?); // (n_v, dv)
-            }
-            (Tensor::stack(&outs, 0)?, s) // (l, n_v, dv)
+            delta_steps(&qc, &kc, &vc, &beta, &log_decay, s, l)?
         };
         self.state = Some(s);
+        if self.record {
+            self.trail = Some(Trail { s0, conv_before: past, padded: padded.clone(), qc: qc.clone(), kc: kc.clone(), vc: vc.clone(), beta: beta.clone(), log_decay: log_decay.clone() });
+        }
 
         let o = (self.norm.forward(&o)? * candle_nn::ops::silu(&z)?)?;
         self.out.forward(&o.reshape((l, n_v * dv))?)?.reshape((b, l, h))
@@ -365,7 +498,7 @@ struct FullAttn {
     hd: usize,
     rot: usize,
     freq_base: f64,
-    kv_cache: KvCache,
+    kv_cache: KvBuf,
 }
 
 impl FullAttn {
@@ -473,6 +606,15 @@ impl Qwen3Next {
         let rot = md_u("rope.dimension_count")?;
         let block_count = md_u("block_count")?;
         let top_k = md_u("expert_used_count")?;
+        // Lab (`COACHWHIP_TOPK=n`): ask fewer experts per word than the model was trained with.
+        // Fewer experts = fewer bytes per word; the text changes, so quality is measured alongside.
+        let top_k = match std::env::var("COACHWHIP_TOPK").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(k) if k >= 1 && k < top_k => {
+                eprintln!("coachwhip: lab top-k {k} (model uses {top_k})");
+                k
+            }
+            _ => top_k,
+        };
         let embedding_length = md_u("embedding_length")?;
         let d_state = md_u("ssm.state_size")?;
         let n_group = md_u("ssm.group_count")?;
@@ -488,12 +630,82 @@ impl Qwen3Next {
         let store = ExpertStore::new(&ct, device, block_count, path, settings)?;
         let mut gg = Gguf::new(ct, &mut file, device.clone());
         let dense = |gg: &mut Gguf<&mut std::fs::File>, name: &str| -> Result<Tensor> { gg.tensor(name)?.dequantize(device)?.to_dtype(DType::F32) };
+        // Lab (`COACHWHIP_DENSE=q2k|q3k|q4k`): the dense weights are shrunk once at load, so the
+        // memory they give back can hold more expert slots. The answers change with them.
+        let dense_q: Option<GgmlDType> = match std::env::var("COACHWHIP_DENSE").ok().as_deref() {
+            Some("q2k") => Some(GgmlDType::Q2K),
+            Some("q3k") => Some(GgmlDType::Q3K),
+            Some("q4k") => Some(GgmlDType::Q4K),
+            _ => None,
+        };
+        let shrunk = std::cell::Cell::new(0usize);
+        let saved = std::cell::Cell::new(0usize);
+        let qm = |gg: &mut Gguf<&mut std::fs::File>, name: &str| -> Result<QMatMul> {
+            let t = gg.tensor(name)?;
+            let Some(dt) = dense_q else { return QMatMul::from_weights(Arc::new(t)) };
+            // Only shrink what is bigger than the target and quantised to begin with.
+            if t.dtype().block_size() == 1 || t.dtype().type_size() * dt.block_size() <= dt.type_size() * t.dtype().block_size() {
+                return QMatMul::from_weights(Arc::new(t));
+            }
+            let dims = t.shape().dims().to_vec();
+            if dims.last().map_or(true, |&k| k % dt.block_size() != 0) {
+                return QMatMul::from_weights(Arc::new(t));
+            }
+            let before = t.storage_size_in_bytes();
+            let f = t.dequantize(&Device::Cpu)?.to_dtype(DType::F32)?;
+            let q = QTensor::quantize(&f, dt)?;
+            let bytes = q.data()?;
+            let on_device = qtensor_from_ggml(dt, &bytes, dims, device)?;
+            shrunk.set(shrunk.get() + 1);
+            saved.set(saved.get() + before.saturating_sub(on_device.storage_size_in_bytes()));
+            QMatMul::from_weights(Arc::new(on_device))
+        };
 
         let embeddings = gg.tensor("token_embd.weight")?.dequantize(device)?.to_dtype(DType::F16)?.to_device(&Device::Cpu)?;
         let norm = gg.rms_norm("output_norm.weight", eps)?;
-        let output = match gg.qmatmul("output.weight") {
-            Ok(v) => v,
-            _ => gg.qmatmul("token_embd.weight")?,
+        // The output head goes through the shrink in slices (conveyor belt): dequantise 8,192 rows,
+        // shrink them, stack the bytes, so the load never holds more than one slice in f32 on the CPU.
+        let head_q: Option<GgmlDType> = match std::env::var("COACHWHIP_DENSE_HEAD").ok().as_deref() {
+            Some("q2k") => Some(GgmlDType::Q2K),
+            Some("q3k") => Some(GgmlDType::Q3K),
+            Some("q4k") => Some(GgmlDType::Q4K),
+            Some("off") => None,
+            _ => dense_q,
+        };
+        let head_name = if gg.qmatmul("output.weight").is_ok() { "output.weight" } else { "token_embd.weight" };
+        let output = match head_q {
+            Some(dt) => {
+                let t = gg.tensor(head_name)?;
+                let dims = t.shape().dims().to_vec();
+                let before = t.storage_size_in_bytes();
+                if t.dtype().block_size() == 1 || dims.len() != 2 || dims[1] % dt.block_size() != 0 || t.dtype().type_size() * dt.block_size() <= dt.type_size() * t.dtype().block_size() {
+                    QMatMul::from_weights(Arc::new(t))?
+                } else {
+                    let f = t.dequantize(device)?.to_dtype(DType::F32)?; // on the GPU, once
+                    drop(t);
+                    let rows = dims[0];
+                    let step = 8192usize;
+                    let mut bytes: Vec<u8> = Vec::with_capacity(rows / dt.block_size() * dims[1] * dt.type_size() / dims[1].max(1) * dims[1] / dt.block_size() * dt.type_size() / 1);
+                    let mut r = 0;
+                    while r < rows {
+                        let n = step.min(rows - r);
+                        let slice = f.narrow(0, r, n)?.to_device(&Device::Cpu)?;
+                        let q = QTensor::quantize(&slice, dt)?;
+                        bytes.extend_from_slice(&q.data()?);
+                        r += n;
+                    }
+                    drop(f);
+                    let on_device = qtensor_from_ggml(dt, &bytes, dims, device)?;
+                    shrunk.set(shrunk.get() + 1);
+                    saved.set(saved.get() + before.saturating_sub(on_device.storage_size_in_bytes()));
+                    eprintln!("coachwhip: output head shrunk in slices: {:.2} GB -> {:.2} GB", before as f64 / 1e9, on_device.storage_size_in_bytes() as f64 / 1e9);
+                    QMatMul::from_weights(Arc::new(on_device))?
+                }
+            }
+            None => match gg.qmatmul("output.weight") {
+                Ok(v) => v,
+                _ => gg.qmatmul("token_embd.weight")?,
+            },
         };
 
         let mut layers = Vec::with_capacity(block_count);
@@ -501,10 +713,10 @@ impl Qwen3Next {
             let p = format!("blk.{layer}");
             let mixer = if (layer + 1) % interval == 0 {
                 Mixer::Full(FullAttn {
-                    wq: gg.qmatmul(&format!("{p}.attn_q.weight"))?,
-                    wk: gg.qmatmul(&format!("{p}.attn_k.weight"))?,
-                    wv: gg.qmatmul(&format!("{p}.attn_v.weight"))?,
-                    wo: gg.qmatmul(&format!("{p}.attn_output.weight"))?,
+                    wq: qm(&mut gg, &format!("{p}.attn_q.weight"))?,
+                    wk: qm(&mut gg, &format!("{p}.attn_k.weight"))?,
+                    wv: qm(&mut gg, &format!("{p}.attn_v.weight"))?,
+                    wo: qm(&mut gg, &format!("{p}.attn_output.weight"))?,
                     q_norm: gg.rms_norm(&format!("{p}.attn_q_norm.weight"), eps)?,
                     k_norm: gg.rms_norm(&format!("{p}.attn_k_norm.weight"), eps)?,
                     n_head,
@@ -512,19 +724,19 @@ impl Qwen3Next {
                     hd,
                     rot,
                     freq_base,
-                    kv_cache: KvCache::new(2, 4096),
+                    kv_cache: KvBuf::new(4096),
                 })
             } else {
                 let conv_w = dense(&mut gg, &format!("{p}.ssm_conv1d.weight"))?; // (channels, taps)
                 let proj = if split {
                     Proj::Split {
-                        qkv: gg.qmatmul(&format!("{p}.attn_qkv.weight"))?,
-                        z: gg.qmatmul(&format!("{p}.attn_gate.weight"))?,
-                        beta: gg.qmatmul(&format!("{p}.ssm_beta.weight"))?,
-                        alpha: gg.qmatmul(&format!("{p}.ssm_alpha.weight"))?,
+                        qkv: qm(&mut gg, &format!("{p}.attn_qkv.weight"))?,
+                        z: qm(&mut gg, &format!("{p}.attn_gate.weight"))?,
+                        beta: qm(&mut gg, &format!("{p}.ssm_beta.weight"))?,
+                        alpha: qm(&mut gg, &format!("{p}.ssm_alpha.weight"))?,
                     }
                 } else {
-                    Proj::Fused { qkvz: gg.qmatmul(&format!("{p}.ssm_in.weight"))?, ba: gg.qmatmul(&format!("{p}.ssm_ba.weight"))? }
+                    Proj::Fused { qkvz: qm(&mut gg, &format!("{p}.ssm_in.weight"))?, ba: qm(&mut gg, &format!("{p}.ssm_ba.weight"))? }
                 };
                 Mixer::Linear(LinearAttn {
                     proj,
@@ -532,7 +744,7 @@ impl Qwen3Next {
                     dt_bias: dense(&mut gg, &format!("{p}.ssm_dt.bias"))?,
                     a: dense(&mut gg, &format!("{p}.ssm_a"))?,
                     norm: gg.rms_norm(&format!("{p}.ssm_norm.weight"), eps)?,
-                    out: gg.qmatmul(&format!("{p}.ssm_out.weight"))?,
+                    out: qm(&mut gg, &format!("{p}.ssm_out.weight"))?,
                     n_k: n_group,
                     n_v: dt_rank,
                     dk: d_state,
@@ -540,6 +752,9 @@ impl Qwen3Next {
                     eps,
                     conv_state: None,
                     state: None,
+                    snapshot: None,
+                    record: false,
+                    trail: None,
                 })
             };
             let gate = dense(&mut gg, &format!("{p}.ffn_gate_inp.weight"))?;
@@ -547,6 +762,7 @@ impl Qwen3Next {
                 layer,
                 gate: Linear::new(gate, None),
                 next_gate: None,
+                gate1: None,
                 ahead: settings.ahead.max(1),
                 store: store.clone(),
                 top_k,
@@ -555,9 +771,9 @@ impl Qwen3Next {
             };
             let shared = SharedExpert {
                 gate_inp: dense(&mut gg, &format!("{p}.ffn_gate_inp_shexp.weight"))?,
-                gate: gg.qmatmul(&format!("{p}.ffn_gate_shexp.weight"))?,
-                up: gg.qmatmul(&format!("{p}.ffn_up_shexp.weight"))?,
-                down: gg.qmatmul(&format!("{p}.ffn_down_shexp.weight"))?,
+                gate: qm(&mut gg, &format!("{p}.ffn_gate_shexp.weight"))?,
+                up: qm(&mut gg, &format!("{p}.ffn_up_shexp.weight"))?,
+                down: qm(&mut gg, &format!("{p}.ffn_down_shexp.weight"))?,
             };
             layers.push(Layer {
                 mixer,
@@ -567,7 +783,13 @@ impl Qwen3Next {
                 shared,
             });
         }
+        if dense_q.is_some() {
+            eprintln!("coachwhip: dense weights shrunk at load: {} tensors, {:.2} GB given back to the bank", shrunk.get(), saved.get() as f64 / 1e9);
+        }
         wire_lookahead(&mut layers, settings.ahead);
+        if let Ok(path) = std::env::var("COACHWHIP_PREDICTOR") {
+            load_predictor(&mut layers, &path, settings.ahead.max(1), device)?;
+        }
         Ok(Self { embeddings: Embedding::new(embeddings, embedding_length), layers, norm, output, store, device: device.clone(), think, progress: None })
     }
 
@@ -585,7 +807,210 @@ impl Qwen3Next {
         }
     }
 
+    /// S6 measurement. Drafts `k` words after `last` with routing confined to the bank (no reads),
+    /// takes the memories back, then writes the same `k` words the plain way and counts how many
+    /// drafted words the plain path agrees with, in order. Returns the plain words (the model has
+    /// read all but the last, exactly as after `k` plain steps) and the accepted count.
+    pub fn speculate_measure(&mut self, last: u32, offset: usize, k: usize) -> Result<(Vec<u32>, usize)> {
+        let argmax = |logits: Tensor| -> Result<u32> { Ok(logits.argmax(D::Minus1)?.to_vec1::<u32>()?[0]) };
+        // A cold bank (right after a prompt read outside it) has nothing to draft from: write the
+        // words the plain way and count nothing; the next block drafts.
+        let cold = self.layers.iter().any(|l| self.store.resident_ready(l.moe.layer).map_or(true, |r| r.len() < l.moe.top_k));
+        if cold {
+            let mut plain = Vec::with_capacity(k);
+            let mut t = last;
+            for i in 0..k {
+                let x = Tensor::new(&[t], &self.device)?.unsqueeze(0)?;
+                t = argmax(self.forward(&x, offset + i)?)?;
+                plain.push(t);
+            }
+            return Ok((plain, 0));
+        }
+        let kv_len = self.layers.iter().find_map(|l| match &l.mixer {
+            Mixer::Full(a) => Some(a.kv_cache.len),
+            _ => None,
+        });
+        for layer in self.layers.iter_mut() {
+            if let Mixer::Linear(a) = &mut layer.mixer {
+                a.take_snapshot();
+            }
+        }
+        self.store.set_draft(true);
+        let mut draft = Vec::with_capacity(k);
+        let mut t = last;
+        let drafted: Result<()> = (|| {
+            for i in 0..k {
+                let x = Tensor::new(&[t], &self.device)?.unsqueeze(0)?;
+                t = argmax(self.forward(&x, offset + i)?)?;
+                draft.push(t);
+            }
+            Ok(())
+        })();
+        self.store.set_draft(false);
+        for layer in self.layers.iter_mut() {
+            match &mut layer.mixer {
+                Mixer::Linear(a) => a.restore_snapshot(),
+                Mixer::Full(a) => a.kv_cache.truncate(kv_len.unwrap_or(0)),
+            }
+        }
+        drafted?;
+        // The plain way, word by word: the truth the draft is scored against.
+        let mut plain = Vec::with_capacity(k);
+        let mut t = last;
+        for i in 0..k {
+            let x = Tensor::new(&[t], &self.device)?.unsqueeze(0)?;
+            t = argmax(self.forward(&x, offset + i)?)?;
+            plain.push(t);
+        }
+        let accepted = draft.iter().zip(plain.iter()).take_while(|(d, p)| d == p).count();
+        self.store.note_speculation(k, accepted);
+        Ok((plain, accepted))
+    }
+
+    /// S6: draft `k` words from the bank, check them all in one plain pass, keep the ones the
+    /// model agrees with and the corrected word after them, and rewind the memories to match.
+    /// Returns None when speculation cannot run (cold bank); otherwise the words to emit, the
+    /// last of which the model has not read yet, exactly as after that many plain steps.
+    pub fn speculate(&mut self, last: u32, offset: usize, k: usize) -> Result<Option<Vec<u32>>> {
+        let argmax = |logits: Tensor| -> Result<u32> { Ok(logits.argmax(D::Minus1)?.to_vec1::<u32>()?[0]) };
+        if k == 0 || self.layers.iter().any(|l| self.store.resident_ready(l.moe.layer).map_or(true, |r| r.len() < l.moe.top_k)) {
+            return Ok(None);
+        }
+        let kv_len = self.layers.iter().find_map(|l| match &l.mixer {
+            Mixer::Full(a) => Some(a.kv_cache.len),
+            _ => None,
+        }).unwrap_or(0);
+        for layer in self.layers.iter_mut() {
+            if let Mixer::Linear(a) = &mut layer.mixer {
+                a.take_snapshot();
+            }
+        }
+        // Draft.
+        self.store.set_draft(true);
+        let mut draft = Vec::with_capacity(k);
+        let mut t = last;
+        let drafted: Result<()> = (|| {
+            for i in 0..k {
+                let x = Tensor::new(&[t], &self.device)?.unsqueeze(0)?;
+                t = argmax(self.forward(&x, offset + i)?)?;
+                draft.push(t);
+            }
+            Ok(())
+        })();
+        self.store.set_draft(false);
+        for layer in self.layers.iter_mut() {
+            match &mut layer.mixer {
+                Mixer::Linear(a) => {
+                    a.restore_snapshot();
+                    a.record = true;
+                }
+                Mixer::Full(a) => a.kv_cache.truncate(kv_len),
+            }
+        }
+        drafted?;
+        // Load: the last word and the draft in one pass. Its only job is to bring every expert
+        // those words need into the bank in one batched read; its arithmetic is thrown away, so
+        // the words below come from the exact same path plain decoding takes.
+        let mut words = Vec::with_capacity(k + 1);
+        words.push(last);
+        words.extend_from_slice(&draft);
+        let x = Tensor::new(words.as_slice(), &self.device)?.unsqueeze(0)?;
+        let loaded = self.forward_inner(&x, offset, false);
+        for layer in self.layers.iter_mut() {
+            match &mut layer.mixer {
+                Mixer::Linear(a) => {
+                    a.record = false;
+                    a.rewind(0)?;
+                }
+                Mixer::Full(a) => a.kv_cache.truncate(kv_len),
+            }
+        }
+        loaded?;
+        // Check, the plain way, word by word, with the bank hot: keep a drafted word only while
+        // the plain path says the same; the first disagreement is the plain word, and ends it.
+        let mut seq = Vec::with_capacity(k + 1);
+        let mut t = last;
+        for i in 0..=k {
+            let x = Tensor::new(&[t], &self.device)?.unsqueeze(0)?;
+            let w = argmax(self.forward(&x, offset + i)?)?;
+            seq.push(w);
+            if i < k && w == draft[i] {
+                t = w;
+            } else {
+                break;
+            }
+        }
+        let accepted = seq.len() - 1;
+        self.store.note_speculation(k, accepted);
+        Ok(Some(seq))
+    }
+
+    /// Foresight: one bank-only draft pass of `last`, whose only product is the reads it starts for
+    /// the real pass that follows. Nothing it computes is kept. False when the bank is cold.
+    pub fn foresee(&mut self, last: u32, offset: usize, steps: usize) -> Result<bool> {
+        let argmax = |logits: Tensor| -> Result<u32> { Ok(logits.argmax(D::Minus1)?.to_vec1::<u32>()?[0]) };
+        if self.layers.iter().any(|l| self.store.resident_ready(l.moe.layer).map_or(true, |r| r.len() < l.moe.top_k)) {
+            return Ok(false);
+        }
+        let kv_len = self.layers.iter().find_map(|l| match &l.mixer {
+            Mixer::Full(a) => Some(a.kv_cache.len),
+            _ => None,
+        }).unwrap_or(0);
+        for layer in self.layers.iter_mut() {
+            if let Mixer::Linear(a) = &mut layer.mixer {
+                a.take_snapshot();
+            }
+        }
+        self.store.set_draft(true);
+        let mut t = last;
+        let drafted: Result<()> = (|| {
+            let steps = steps.max(1);
+            for i in 0..steps {
+                self.store.set_foresee(true, i as u64);
+                let x = Tensor::new(&[t], &self.device)?.unsqueeze(0)?;
+                if i + 1 == steps {
+                    // The last step's word is never needed, only the reads its layers started.
+                    self.body(&x, offset + i)?;
+                } else {
+                    t = argmax(self.forward(&x, offset + i)?)?;
+                }
+                let top_k = self.layers[0].moe.top_k;
+                self.store.flush_foresight(top_k)?;
+            }
+            Ok(())
+        })();
+        self.store.set_foresee(false, 0);
+        self.store.set_draft(false);
+        for layer in self.layers.iter_mut() {
+            match &mut layer.mixer {
+                Mixer::Linear(a) => a.restore_snapshot(),
+                Mixer::Full(a) => a.kv_cache.truncate(kv_len),
+            }
+        }
+        drafted?;
+        Ok(true)
+    }
+
     pub fn forward(&mut self, x: &Tensor, offset: usize) -> Result<Tensor> {
+        self.forward_inner(x, offset, false)
+    }
+
+    /// `all`: scores for every position, not only the last.
+    fn forward_inner(&mut self, x: &Tensor, offset: usize, all: bool) -> Result<Tensor> {
+        let (xs, l) = self.body(x, offset)?;
+        if all {
+            let xs = self.norm.forward(&xs)?;
+            return self.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(0);
+        }
+        let xs = self.norm.forward(&xs.narrow(1, l - 1, 1)?)?;
+        self.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
+    }
+
+    /// The layers only, no output head: the hidden state and the number of positions.
+    fn body(&mut self, x: &Tensor, offset: usize) -> Result<(Tensor, usize)> {
+        if !self.store.drafting() {
+            self.store.note_tokens(x.flatten_all()?.to_vec1()?);
+        }
         let mut xs = self.embeddings.forward(&x.to_device(&Device::Cpu)?)?.to_device(&self.device)?.to_dtype(DType::F32)?;
         let (_b, l) = x.dims2()?;
         let mask = if l == 1 {
@@ -611,7 +1036,6 @@ impl Qwen3Next {
                 }
             }
         }
-        let xs = self.norm.forward(&xs.narrow(1, l - 1, 1)?)?;
-        self.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
+        Ok((xs, l))
     }
 }

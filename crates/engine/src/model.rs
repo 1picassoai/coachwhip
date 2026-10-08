@@ -171,6 +171,7 @@ impl Qwen3Moe {
                 layer,
                 gate: Linear::new(gate, None),
                 next_gate: None,
+                gate1: None,
                 ahead: settings.ahead.max(1),
                 store: store.clone(),
                 top_k,
@@ -293,6 +294,30 @@ impl Model {
 
     pub fn thinks(&self) -> bool {
         self.think().thinks()
+    }
+
+    /// S6 measurement (Qwen3-Next family only): see `Qwen3Next::speculate_measure`.
+    pub fn speculate_measure(&mut self, last: u32, offset: usize, k: usize) -> Result<Option<(Vec<u32>, usize)>> {
+        match self {
+            Self::Qwen3Moe(_) => Ok(None),
+            Self::Qwen3Next(m) => m.speculate_measure(last, offset, k).map(Some),
+        }
+    }
+
+    /// Foresight (Qwen3-Next family only): see `Qwen3Next::foresee`.
+    pub fn foresee(&mut self, last: u32, offset: usize, steps: usize) -> Result<bool> {
+        match self {
+            Self::Qwen3Moe(_) => Ok(false),
+            Self::Qwen3Next(m) => m.foresee(last, offset, steps),
+        }
+    }
+
+    /// S6 (Qwen3-Next family only): see `Qwen3Next::speculate`.
+    pub fn speculate(&mut self, last: u32, offset: usize, k: usize) -> Result<Option<Vec<u32>>> {
+        match self {
+            Self::Qwen3Moe(_) => Ok(None),
+            Self::Qwen3Next(m) => m.speculate(last, offset, k),
+        }
     }
 
     /// The text that opens the assistant's turn, with thinking on or off.
