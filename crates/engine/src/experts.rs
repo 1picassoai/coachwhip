@@ -150,6 +150,16 @@ impl Slots {
         Some(plan)
     }
 
+    /// Let an expert go: its slot is emptied and goes to the front of the eviction line.
+    pub fn release(&mut self, e: u32) {
+        if let Some(slot) = self.slot_of.remove(&e) {
+            self.holder[slot] = None;
+            self.prefetched.remove(&e);
+            self.lru.retain(|&x| x != slot);
+            self.lru.push_front(slot);
+        }
+    }
+
     /// The toaster: once a layer has used these experts, their slots go to the front of the
     /// eviction line, so the next reads take them first instead of the longest-unused slots.
     pub fn pop(&mut self, used: &[u32]) {
@@ -424,6 +434,14 @@ fn sharp_weight() -> Option<f32> {
     *V.get_or_init(|| std::env::var("COACHWHIP_SHARP_W").ok().and_then(|v| v.parse().ok()))
 }
 
+/// Admission (`COACHWHIP_ADMIT_W=<w>`, Captain's board): with use-sharp on, a miss whose router
+/// weight for this token is below `w` is used from its sharp staging and let go — no slot kept,
+/// no squeeze. Above it, it earns a slot and is squeezed for reuse.
+fn admit_w() -> Option<f32> {
+    static V: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("COACHWHIP_ADMIT_W").ok().and_then(|v| v.parse().ok()))
+}
+
 /// Use sharp, then squeeze (`COACHWHIP_USE_SHARP=1`): misses compute from their fresh bytes
 /// and are squeezed into the bank afterwards.
 pub fn use_sharp() -> bool {
@@ -482,7 +500,7 @@ pub struct ExpertStore {
     /// GPU has drained at the next layer it is squeezed into its Q2 slot. The stagings, pooled by
     /// (dtype, elements); the misses waiting for their squeeze; and this forward's fresh experts.
     sharp_pool: Mutex<HashMap<(GgmlDType, usize), Vec<Arc<QMetalStorage>>>>,
-    pending_squeeze: Mutex<Vec<(usize, u32, usize, [Arc<QMetalStorage>; 3])>>,
+    pending_squeeze: Mutex<Vec<(usize, u32, usize, [Arc<QMetalStorage>; 3], f32)>>,
     fresh: Mutex<HashMap<(usize, u32), [Arc<QMetalStorage>; 3]>>,
     /// Sharp slots per layer (0 = one kind of slot) and the hot experts per layer that get them,
     /// from the route logs at load: the most-used experts of each layer.
@@ -954,7 +972,7 @@ impl ExpertStore {
 
     /// Read one miss into three sharp stagings (the file's bytes as they are) and remember it as
     /// this forward's fresh expert; its Q2 slot stays not-ready until the squeeze.
-    fn stage_sharp(&self, layer: usize, e: u32, slot: usize) -> Result<()> {
+    fn stage_sharp(&self, layer: usize, e: u32, slot: usize, weight: f32) -> Result<()> {
         let mut parts: Vec<Arc<QMetalStorage>> = Vec::with_capacity(3);
         for sl in self.slices[layer][e as usize].iter() {
             let elems: usize = sl.dims.iter().product();
@@ -968,19 +986,35 @@ impl ExpertStore {
             Err(_) => candle::bail!("an expert has three matrices"),
         };
         self.fresh.lock().unwrap().insert((layer, e), parts.clone());
-        self.pending_squeeze.lock().unwrap().push((layer, e, slot, parts));
+        self.pending_squeeze.lock().unwrap().push((layer, e, slot, parts, weight));
         Ok(())
     }
 
     /// After the GPU has drained: squeeze every pending miss from its sharp staging into its Q2
     /// slot, mark the slot ready, return the stagings to the pool.
     fn squeeze_pending(&self) -> Result<()> {
-        let pending: Vec<(usize, u32, usize, [Arc<QMetalStorage>; 3])> = std::mem::take(&mut *self.pending_squeeze.lock().unwrap());
+        let pending: Vec<(usize, u32, usize, [Arc<QMetalStorage>; 3], f32)> = std::mem::take(&mut *self.pending_squeeze.lock().unwrap());
         if pending.is_empty() {
             return Ok(());
         }
         let Some(rq) = self.requant.as_ref() else { return Ok(()) };
-        for (layer, e, slot, parts) in pending {
+        for (layer, e, slot, parts, weight) in pending {
+            // Below the admission line: used, done, let go. No squeeze, no slot.
+            if admit_w().map_or(false, |line| weight < line) {
+                for (i, sl) in self.slices[layer][e as usize].iter().enumerate() {
+                    self.put_sharp(sl.dtype, sl.dims.iter().product(), parts[i].clone());
+                }
+                self.fresh.lock().unwrap().remove(&(layer, e));
+                let mut banks = self.banks.lock().unwrap();
+                if let Some(bank) = banks.get_mut(&layer) {
+                    bank.slots.release(e);
+                    bank.ready[slot].store(true, Ordering::Release);
+                    bank.gpu.clear(e);
+                    bank.gpu.set_ready(slot, false);
+                }
+                self.stats.lock().unwrap().stale_dropped += 0;
+                continue;
+            }
             let mats: [(Arc<QMetalStorage>, usize); 3] = {
                 let banks = self.banks.lock().unwrap();
                 let bank = &banks[&layer];
@@ -1267,6 +1301,13 @@ impl ExpertStore {
     }
 
     fn ensure_weighted(&self, layer: usize, needed_all: &[u32], weights: Option<&HashMap<u32, f32>>) -> Result<Option<HashMap<u32, usize>>> {
+        // A forward that needs more experts than the banks hold (reading a prompt) goes the fresh
+        // way and must not make the banks here: their 8 GB would land on top of the prompt's
+        // transient reads and push the GPU out of memory. Found 8 Oct: the two-kinds change had
+        // moved this check below the bank's creation.
+        if needed_all.len() > self.per_layer + self.sharp_n {
+            return Ok(None);
+        }
         let mut banks = self.banks.lock().unwrap();
         if !banks.contains_key(&layer) {
             banks.insert(layer, self.make_bank(layer)?);
@@ -1337,7 +1378,7 @@ impl ExpertStore {
             for &(_, slot) in &misses {
                 bank.ready[slot].store(false, Ordering::Release);
             }
-            misses.par_iter().try_for_each(|&(e, slot)| self.stage_sharp(layer, e, slot))?;
+            misses.par_iter().try_for_each(|&(e, slot)| self.stage_sharp(layer, e, slot, weights.and_then(|m| m.get(&e).copied()).unwrap_or(1.0)))?;
             let mut st = self.stats.lock().unwrap();
             st.loads += misses.len() as u64;
             st.bytes_loaded += misses.len() as u64 * self.slices[layer][0].iter().map(|s| s.bytes as u64).sum::<u64>();
@@ -2178,7 +2219,7 @@ impl StreamedMoe {
                 }
                 None => None,
             }
-        } else if n == 1 && self.store.sharp_n > 0 && sharp_weight().is_some() {
+        } else if n == 1 && ((self.store.sharp_n > 0 && sharp_weight().is_some()) || (use_sharp() && admit_w().is_some())) {
             let w: Vec<f32> = top_w.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
             let weights: HashMap<u32, f32> = ids[0].iter().copied().zip(w.into_iter()).collect();
             self.store.ensure_weighted(self.layer, &needed, Some(&weights))?
