@@ -48,6 +48,8 @@ struct BankMat {
 /// keep the file's own bytes in `n` sharp slots per layer; the rest go through the GPU shrink
 /// into the small (Q2) bank. A sharp slot's index carries `SHARP_FLAG`.
 pub const SHARP_FLAG: usize = 1 << 30;
+/// A prefetch job's expert id with this bit set goes to the sharp bank (decided by weight).
+pub const SHARP_TAG: u32 = 1 << 31;
 
 struct SharpBank {
     mats: [BankMat; 3],
@@ -414,6 +416,21 @@ fn shrink_down() -> bool {
     *ON.get_or_init(|| std::env::var("COACHWHIP_Q2_DOWN").map(|v| v == "1").unwrap_or(false))
 }
 
+/// By weight (`COACHWHIP_SHARP_W=<w>`, Captain's board): with two kinds of slot, the bank an
+/// expert goes to is chosen by its router weight for this token: at or above `w` it fetches
+/// sharp, below it Q2. Guesses use their router probability the same way. Off: the hot list rules.
+fn sharp_weight() -> Option<f32> {
+    static V: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("COACHWHIP_SHARP_W").ok().and_then(|v| v.parse().ok()))
+}
+
+/// Use sharp, then squeeze (`COACHWHIP_USE_SHARP=1`): misses compute from their fresh bytes
+/// and are squeezed into the bank afterwards.
+pub fn use_sharp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_USE_SHARP").map(|v| v == "1").unwrap_or(false))
+}
+
 /// S4: the GPU never stops for the CPU (`COACHWHIP_PARALLEL=1`).
 pub fn parallel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -460,6 +477,13 @@ pub struct ExpertStore {
     requant: Option<crate::requant::Requant>,
     /// Staging buffers for the shrink, by size, reused across reads.
     staging: Mutex<HashMap<usize, Vec<Arc<candle_metal_kernels::metal::Buffer>>>>,
+    /// Use-sharp-then-squeeze (`COACHWHIP_USE_SHARP=1`, Captain's board): a miss is read into a
+    /// sharp one-slot staging (the file's own dtype), this token computes from it, and once the
+    /// GPU has drained at the next layer it is squeezed into its Q2 slot. The stagings, pooled by
+    /// (dtype, elements); the misses waiting for their squeeze; and this forward's fresh experts.
+    sharp_pool: Mutex<HashMap<(GgmlDType, usize), Vec<Arc<QMetalStorage>>>>,
+    pending_squeeze: Mutex<Vec<(usize, u32, usize, [Arc<QMetalStorage>; 3])>>,
+    fresh: Mutex<HashMap<(usize, u32), [Arc<QMetalStorage>; 3]>>,
     /// Sharp slots per layer (0 = one kind of slot) and the hot experts per layer that get them,
     /// from the route logs at load: the most-used experts of each layer.
     sharp_n: usize,
@@ -595,6 +619,9 @@ impl ExpertStore {
             requant: if gpuq2() { Some(crate::requant::Requant::new(metal)?) } else { None },
             staging: Mutex::new(HashMap::new()),
             shape: Mutex::new(HashMap::new()),
+            sharp_pool: Mutex::new(HashMap::new()),
+            pending_squeeze: Mutex::new(Vec::new()),
+            fresh: Mutex::new(HashMap::new()),
             sharp_n,
             hot,
         });
@@ -808,8 +835,17 @@ impl ExpertStore {
     /// Prefetch thread: reserve free slots for the predicted experts, then read them in with the
     /// bank unlocked, so the main thread is never held up by a read it did not ask for.
     fn prefetch(&self, layer: usize, predicted_all: &[u32]) -> Result<()> {
-        // Two kinds: hot predictions go to the sharp bank, read plain.
-        let (hot, cold): (Vec<u32>, Vec<u32>) = predicted_all.iter().partition(|&&e| self.is_hot(layer, e));
+        // Two kinds: a guess tagged SHARP_TAG by the forward (its probability was above the line)
+        // goes to the sharp bank; untagged guesses go by the hot list when no tags are present,
+        // else to the small bank.
+        let tagged = predicted_all.iter().any(|&e| e & SHARP_TAG != 0);
+        let (hot, cold): (Vec<u32>, Vec<u32>) = if tagged {
+            let hot: Vec<u32> = predicted_all.iter().filter(|&&e| e & SHARP_TAG != 0).map(|&e| e & !SHARP_TAG).collect();
+            let cold: Vec<u32> = predicted_all.iter().filter(|&&e| e & SHARP_TAG == 0).copied().collect();
+            (hot, cold)
+        } else {
+            predicted_all.iter().partition(|&&e| self.is_hot(layer, e))
+        };
         if !hot.is_empty() {
             let mut sjobs: Vec<(u32, usize, [(usize, usize); 3], Arc<AtomicBool>)> = Vec::new();
             {
@@ -901,6 +937,82 @@ impl ExpertStore {
 
     fn put_staging(&self, bytes: usize, b: Arc<candle_metal_kernels::metal::Buffer>) {
         self.staging.lock().unwrap().entry(bytes).or_default().push(b);
+    }
+
+    fn take_sharp(&self, dtype: GgmlDType, elems: usize) -> Result<Arc<QMetalStorage>> {
+        if let Some(b) = self.sharp_pool.lock().unwrap().entry((dtype, elems)).or_default().pop() {
+            return Ok(b);
+        }
+        let st = QMetalStorage::zeros(&self.metal, elems, dtype)?;
+        self.device.synchronize()?;
+        Ok(Arc::new(st))
+    }
+
+    fn put_sharp(&self, dtype: GgmlDType, elems: usize, b: Arc<QMetalStorage>) {
+        self.sharp_pool.lock().unwrap().entry((dtype, elems)).or_default().push(b);
+    }
+
+    /// Read one miss into three sharp stagings (the file's bytes as they are) and remember it as
+    /// this forward's fresh expert; its Q2 slot stays not-ready until the squeeze.
+    fn stage_sharp(&self, layer: usize, e: u32, slot: usize) -> Result<()> {
+        let mut parts: Vec<Arc<QMetalStorage>> = Vec::with_capacity(3);
+        for sl in self.slices[layer][e as usize].iter() {
+            let elems: usize = sl.dims.iter().product();
+            let st = self.take_sharp(sl.dtype, elems)?;
+            let dst = unsafe { std::slice::from_raw_parts_mut(st.buffer().contents() as *mut u8, sl.bytes) };
+            self.file.read_exact_at(dst, sl.offset)?;
+            parts.push(st);
+        }
+        let parts: [Arc<QMetalStorage>; 3] = match parts.try_into() {
+            Ok(p) => p,
+            Err(_) => candle::bail!("an expert has three matrices"),
+        };
+        self.fresh.lock().unwrap().insert((layer, e), parts.clone());
+        self.pending_squeeze.lock().unwrap().push((layer, e, slot, parts));
+        Ok(())
+    }
+
+    /// After the GPU has drained: squeeze every pending miss from its sharp staging into its Q2
+    /// slot, mark the slot ready, return the stagings to the pool.
+    fn squeeze_pending(&self) -> Result<()> {
+        let pending: Vec<(usize, u32, usize, [Arc<QMetalStorage>; 3])> = std::mem::take(&mut *self.pending_squeeze.lock().unwrap());
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let Some(rq) = self.requant.as_ref() else { return Ok(()) };
+        for (layer, e, slot, parts) in pending {
+            let mats: [(Arc<QMetalStorage>, usize); 3] = {
+                let banks = self.banks.lock().unwrap();
+                let bank = &banks[&layer];
+                [0, 1, 2].map(|i| (bank.mats[i].storage.clone(), bank.mats[i].bytes))
+            };
+            for (i, sl) in self.slices[layer][e as usize].iter().enumerate() {
+                let elems: usize = sl.dims.iter().product();
+                if i == 2 && !shrink_down() {
+                    let dst = unsafe { std::slice::from_raw_parts_mut((mats[i].0.buffer().contents() as usize + slot * mats[i].1) as *mut u8, sl.bytes) };
+                    let src = unsafe { std::slice::from_raw_parts(parts[i].buffer().contents() as *const u8, sl.bytes) };
+                    dst.copy_from_slice(src);
+                } else {
+                    let Some(kind) = crate::requant::SrcKind::of(sl.dtype) else { candle::bail!("the GPU shrink takes Q3_K, Q4_K or Q5_K experts") };
+                    let n_blocks = elems / crate::requant::QK_K;
+                    rq.run(kind, parts[i].buffer(), 0, mats[i].0.buffer(), slot * mats[i].1, n_blocks)?;
+                }
+                self.put_sharp(sl.dtype, elems, parts[i].clone());
+            }
+            self.fresh.lock().unwrap().remove(&(layer, e));
+            let banks = self.banks.lock().unwrap();
+            if let Some(bank) = banks.get(&layer) {
+                bank.ready[slot].store(true, Ordering::Release);
+                bank.gpu.set_ready(slot, true);
+            }
+        }
+        Ok(())
+    }
+
+    /// A one-slot `mul_mv_id` over a sharp staging (a fresh miss, the file's own dtype).
+    fn fresh_op(&self, st: &Arc<QMetalStorage>, layer: usize, which: usize, nei0: usize, rows_per_expert: bool) -> MoeMatvec {
+        let sl = &self.slices[layer][0][which];
+        MoeMatvec { bank: st.clone(), dtype: sl.dtype, n: sl.dims[0], k: sl.dims[1], slots: 1, bytes: sl.bytes, nei0, rows_per_expert }
     }
 
     /// Read one expert of `layer` from the file and shrink it on the GPU straight into `slot`
@@ -1091,6 +1203,26 @@ impl ExpertStore {
         self.sharp_n > 0 && self.hot[layer].contains(&e)
     }
 
+    /// Where an expert goes with two kinds of slot: by its weight for this token when the weight
+    /// line is set (and the expert is not already parked somewhere), else by the hot list.
+    fn goes_sharp(&self, layer: usize, e: u32, weight: Option<f32>, bank: &Bank) -> bool {
+        if self.sharp_n == 0 {
+            return false;
+        }
+        if let Some(sb) = bank.sharp.as_ref() {
+            if sb.slots.slot_of.contains_key(&e) {
+                return true;
+            }
+        }
+        if bank.slots.slot_of.contains_key(&e) {
+            return false;
+        }
+        match (sharp_weight(), weight) {
+            (Some(line), Some(w)) => w >= line,
+            _ => self.is_hot(layer, e),
+        }
+    }
+
     /// The sharp bank's half of a forward: give the hot experts sharp slots, read the missing
     /// ones straight from the file (no shrink). Returns expert -> slot | SHARP_FLAG, or None when
     /// the sharp bank cannot hold them (the caller then treats them as cold).
@@ -1131,13 +1263,17 @@ impl ExpertStore {
     }
 
     fn ensure(&self, layer: usize, needed_all: &[u32]) -> Result<Option<HashMap<u32, usize>>> {
+        self.ensure_weighted(layer, needed_all, None)
+    }
+
+    fn ensure_weighted(&self, layer: usize, needed_all: &[u32], weights: Option<&HashMap<u32, f32>>) -> Result<Option<HashMap<u32, usize>>> {
         let mut banks = self.banks.lock().unwrap();
         if !banks.contains_key(&layer) {
             banks.insert(layer, self.make_bank(layer)?);
         }
         let bank = banks.get_mut(&layer).unwrap();
-        // Two kinds: the hot experts go to the sharp bank; what it cannot take is cold.
-        let (hot, mut cold): (Vec<u32>, Vec<u32>) = needed_all.iter().partition(|&&e| self.is_hot(layer, e));
+        // Two kinds: by weight when the line is set, else the hot experts go to the sharp bank.
+        let (hot, mut cold): (Vec<u32>, Vec<u32>) = needed_all.iter().partition(|&&e| self.goes_sharp(layer, e, weights.and_then(|m| m.get(&e).copied()), bank));
         let sharp_map = if self.sharp_n > 0 {
             match self.ensure_sharp(layer, bank, &hot)? {
                 Some(m) => m,
@@ -1196,7 +1332,21 @@ impl ExpertStore {
             bank.gpu.set_ready(slot, false);
         }
         bank.sync_table();
-        if !misses.is_empty() && self.requant.is_some() {
+        if !misses.is_empty() && self.requant.is_some() && use_sharp() {
+            let started = Instant::now();
+            for &(_, slot) in &misses {
+                bank.ready[slot].store(false, Ordering::Release);
+            }
+            misses.par_iter().try_for_each(|&(e, slot)| self.stage_sharp(layer, e, slot))?;
+            let mut st = self.stats.lock().unwrap();
+            st.loads += misses.len() as u64;
+            st.bytes_loaded += misses.len() as u64 * self.slices[layer][0].iter().map(|s| s.bytes as u64).sum::<u64>();
+            st.load_seconds += started.elapsed().as_secs_f64();
+            // The slots are claimed but not ready; the squeeze at the next layer fills them.
+            let mut map = bank.slots.slot_of.clone();
+            map.extend(sharp_map);
+            return Ok(Some(map));
+        } else if !misses.is_empty() && self.requant.is_some() {
             let mats: [(Arc<QMetalStorage>, usize); 3] = [0, 1, 2].map(|i| (bank.mats[i].storage.clone(), bank.mats[i].bytes));
             let started = Instant::now();
             misses.par_iter().try_for_each(|&(e, slot)| self.shrink_into(layer, e, slot, &mats))?;
@@ -2002,6 +2152,10 @@ impl StreamedMoe {
         let t_rb = Instant::now();
         let ids: Vec<Vec<u32>> = top_ids.to_vec2()?;
         let t_rb = t_rb.elapsed().as_secs_f64();
+        // The GPU has drained: the misses the layer before used sharp can be squeezed now.
+        if use_sharp() {
+            self.store.squeeze_pending()?;
+        }
         let t_bk = Instant::now();
         if let Some(scores) = &draft_scores {
             self.store.measure_draft(self.layer, scores, &ids[0], self.top_k);
@@ -2024,6 +2178,10 @@ impl StreamedMoe {
                 }
                 None => None,
             }
+        } else if n == 1 && self.store.sharp_n > 0 && sharp_weight().is_some() {
+            let w: Vec<f32> = top_w.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
+            let weights: HashMap<u32, f32> = ids[0].iter().copied().zip(w.into_iter()).collect();
+            self.store.ensure_weighted(self.layer, &needed, Some(&weights))?
         } else {
             self.store.ensure(self.layer, &needed)?
         };
@@ -2055,8 +2213,23 @@ impl StreamedMoe {
                 let sum: f32 = ex.iter().sum();
                 let ranked = rank(&scores);
                 let cands: Vec<u32> = ranked.iter().copied().take_while(|&e| ex[e as usize] / sum >= p_min).take(q_cap()).collect();
-                let k = cands.len().max(1);
-                self.store.prefetch_guess(self.layer + self.ahead, &cands, k);
+                if let (Some(line), true) = (sharp_weight(), self.store.sharp_n > 0) {
+                    // By weight: the guess's share among the candidates stands in for the token's
+                    // weight; above the line it is tagged for the sharp bank. Reader threads do the reads.
+                    let tot: f32 = cands.iter().map(|&e| ex[e as usize]).sum::<f32>().max(1e-9);
+                    let missing: Vec<u32> = {
+                        let banks = self.store.banks.lock().unwrap();
+                        let present = banks.get(&(self.layer + self.ahead));
+                        cands.iter().copied().filter(|e| present.map_or(true, |b| !b.slots.slot_of.contains_key(e) && !b.sharp.as_ref().map_or(false, |sb| sb.slots.slot_of.contains_key(e)))).collect()
+                    };
+                    let tagged: Vec<u32> = missing.iter().map(|&e| if ex[e as usize] / tot >= line { e | SHARP_TAG } else { e }).collect();
+                    for pair in tagged.chunks(2) {
+                        self.store.request_prefetch(self.layer + self.ahead, pair.to_vec());
+                    }
+                } else {
+                    let k = cands.len().max(1);
+                    self.store.prefetch_guess(self.layer + self.ahead, &cands, k);
+                }
             } else {
                 self.store.prefetch_guess(self.layer + self.ahead, &rank(&scores), self.prefetch_k);
             }
@@ -2114,6 +2287,53 @@ impl StreamedMoe {
                 (Some(a), Some(b)) => (a + b)?,
                 (Some(a), None) | (None, Some(a)) => a,
                 (None, None) => xs.zeros_like()?,
+            }
+        } else if let (Some(slot_of), true) = (&slot_of, n == 1 && use_sharp() && self.store.requant.is_some()) {
+            // Use sharp, then squeeze: fresh misses compute from their stagings, the rest from the bank.
+            let row = &ids[0];
+            let fresh: HashMap<u32, [Arc<QMetalStorage>; 3]> = {
+                let f = self.store.fresh.lock().unwrap();
+                row.iter().filter_map(|e| f.get(&(self.layer, *e)).map(|p| (*e, p.clone()))).collect()
+            };
+            let mut out: Option<Tensor> = None;
+            let mut add = |t: Tensor| -> Result<()> {
+                out = Some(match out.take() {
+                    Some(a) => (a + t)?,
+                    None => t,
+                });
+                Ok(())
+            };
+            // the bank part
+            let bank_pos: Vec<usize> = (0..row.len()).filter(|&p| !fresh.contains_key(&row[p])).collect();
+            if !bank_pos.is_empty() {
+                let k = bank_pos.len();
+                let slots: Vec<u32> = bank_pos.iter().map(|&p| (slot_of[&row[p]] & !SHARP_FLAG) as u32).collect();
+                let slots = Tensor::from_vec(slots, (1, k), device)?;
+                let idx = Tensor::new(bank_pos.iter().map(|&p| p as u32).collect::<Vec<_>>(), device)?;
+                let w = top_w.index_select(&idx, 1)?;
+                let gate = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 0, k, false))?;
+                let up = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 1, k, false))?;
+                let inter = gate.dim(2)?;
+                let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((k, inter))?;
+                let down = hidden.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 2, k, true))?;
+                add(down.broadcast_mul(&w.unsqueeze(2)?)?.sum(1)?)?;
+            }
+            // each fresh miss, one slot wide, from its sharp staging
+            for p in 0..row.len() {
+                let Some(parts) = fresh.get(&row[p]) else { continue };
+                let slots = Tensor::from_vec(vec![0u32], (1, 1), device)?;
+                let idx = Tensor::new(vec![p as u32], device)?;
+                let w = top_w.index_select(&idx, 1)?;
+                let gate = xs.apply_op2_no_bwd(&slots, &self.store.fresh_op(&parts[0], self.layer, 0, 1, false))?;
+                let up = xs.apply_op2_no_bwd(&slots, &self.store.fresh_op(&parts[1], self.layer, 1, 1, false))?;
+                let inter = gate.dim(2)?;
+                let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((1, inter))?;
+                let down = hidden.apply_op2_no_bwd(&slots, &self.store.fresh_op(&parts[2], self.layer, 2, 1, true))?;
+                add(down.broadcast_mul(&w.unsqueeze(2)?)?.sum(1)?)?;
+            }
+            match out {
+                Some(t) => t,
+                None => xs.zeros_like()?,
             }
         } else if let (Some(slot_of), true) = (&slot_of, n == 1 && self.store.sharp_n > 0) {
             // Two kinds of slot: the sharp experts and the small ones each get their dispatches; the sums add.
