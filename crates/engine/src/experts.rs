@@ -442,6 +442,30 @@ fn admit_w() -> Option<f32> {
     *V.get_or_init(|| std::env::var("COACHWHIP_ADMIT_W").ok().and_then(|v| v.parse().ok()))
 }
 
+/// Mechanics test (`COACHWHIP_Q2_NONE=1`): with the GPU shrink on, nothing is actually shrunk —
+/// the bank holds the file's own bytes and the "squeeze" is a plain copy. The text must then be
+/// identical to the plain engine's; if it is not, the flow has a bug.
+fn q2_none() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_Q2_NONE").map(|v| v == "1").unwrap_or(false))
+}
+
+/// Heavy reuse re-read (`COACHWHIP_REREAD_W=<w>`): with use-sharp on, a hit whose router weight for
+/// this token is at least `w` is re-read sharp and computed from the fresh bytes; the Q2 copy
+/// stays in the bank for the light reuses. Heavy words exact, light ones pay the Q2.
+fn reread_w() -> Option<f32> {
+    static V: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("COACHWHIP_REREAD_W").ok().and_then(|v| v.parse().ok()))
+}
+
+/// Register repair (`COACHWHIP_REPAIR=1`, Captain's board): at the squeeze, the engine measures
+/// what the squeeze did to that expert's output on the input it was used for (sharp minus Q2),
+/// keeps the difference per expert, and adds it back whenever the Q2 copy is reused.
+fn repair_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_REPAIR").map(|v| v == "1").unwrap_or(false))
+}
+
 /// Use sharp, then squeeze (`COACHWHIP_USE_SHARP=1`): misses compute from their fresh bytes
 /// and are squeezed into the bank afterwards.
 pub fn use_sharp() -> bool {
@@ -500,8 +524,12 @@ pub struct ExpertStore {
     /// GPU has drained at the next layer it is squeezed into its Q2 slot. The stagings, pooled by
     /// (dtype, elements); the misses waiting for their squeeze; and this forward's fresh experts.
     sharp_pool: Mutex<HashMap<(GgmlDType, usize), Vec<Arc<QMetalStorage>>>>,
-    pending_squeeze: Mutex<Vec<(usize, u32, usize, [Arc<QMetalStorage>; 3], f32)>>,
+    pending_squeeze: Mutex<Vec<(usize, u32, usize, [Arc<QMetalStorage>; 3], f32, bool)>>,
     fresh: Mutex<HashMap<(usize, u32), [Arc<QMetalStorage>; 3]>>,
+    /// Register repair: the input each layer last saw (1, h), and per (layer, expert) the
+    /// measured difference sharp minus Q2 of that expert's output (h,).
+    last_x: Mutex<HashMap<usize, Tensor>>,
+    repair: Mutex<HashMap<(usize, u32), Tensor>>,
     /// Sharp slots per layer (0 = one kind of slot) and the hot experts per layer that get them,
     /// from the route logs at load: the most-used experts of each layer.
     sharp_n: usize,
@@ -640,11 +668,13 @@ impl ExpertStore {
             sharp_pool: Mutex::new(HashMap::new()),
             pending_squeeze: Mutex::new(Vec::new()),
             fresh: Mutex::new(HashMap::new()),
+            last_x: Mutex::new(HashMap::new()),
+            repair: Mutex::new(HashMap::new()),
             sharp_n,
             hot,
         });
         if gpuq2() {
-            let q2_mb = store.slices[0][0].iter().enumerate().map(|(i, s)| if i < 2 || shrink_down() { s.dims.iter().product::<usize>() / crate::requant::QK_K * crate::requant::Q2K_BLOCK_BYTES } else { s.bytes }).sum::<usize>() as f64 / 1e6;
+            let q2_mb = store.slices[0][0].iter().enumerate().map(|(i, s)| if !q2_none() && (i < 2 || shrink_down()) { s.dims.iter().product::<usize>() / crate::requant::QK_K * crate::requant::Q2K_BLOCK_BYTES } else { s.bytes }).sum::<usize>() as f64 / 1e6;
             eprintln!("coachwhip: GPU shrink on: experts are shrunk to Q2_K on arrival, {q2_mb:.1} MB each in the bank ({:.2} GB)", per_layer as f64 * layers as f64 * q2_mb / 1e3);
         }
         if let Some(s4) = &store.s4 {
@@ -972,7 +1002,7 @@ impl ExpertStore {
 
     /// Read one miss into three sharp stagings (the file's bytes as they are) and remember it as
     /// this forward's fresh expert; its Q2 slot stays not-ready until the squeeze.
-    fn stage_sharp(&self, layer: usize, e: u32, slot: usize, weight: f32) -> Result<()> {
+    fn stage_sharp(&self, layer: usize, e: u32, slot: usize, weight: f32, squeeze: bool) -> Result<()> {
         let mut parts: Vec<Arc<QMetalStorage>> = Vec::with_capacity(3);
         for sl in self.slices[layer][e as usize].iter() {
             let elems: usize = sl.dims.iter().product();
@@ -986,19 +1016,28 @@ impl ExpertStore {
             Err(_) => candle::bail!("an expert has three matrices"),
         };
         self.fresh.lock().unwrap().insert((layer, e), parts.clone());
-        self.pending_squeeze.lock().unwrap().push((layer, e, slot, parts, weight));
+        self.pending_squeeze.lock().unwrap().push((layer, e, slot, parts, weight, squeeze));
         Ok(())
     }
 
     /// After the GPU has drained: squeeze every pending miss from its sharp staging into its Q2
     /// slot, mark the slot ready, return the stagings to the pool.
     fn squeeze_pending(&self) -> Result<()> {
-        let pending: Vec<(usize, u32, usize, [Arc<QMetalStorage>; 3], f32)> = std::mem::take(&mut *self.pending_squeeze.lock().unwrap());
+        let pending: Vec<(usize, u32, usize, [Arc<QMetalStorage>; 3], f32, bool)> = std::mem::take(&mut *self.pending_squeeze.lock().unwrap());
         if pending.is_empty() {
             return Ok(());
         }
         let Some(rq) = self.requant.as_ref() else { return Ok(()) };
-        for (layer, e, slot, parts, weight) in pending {
+        for (layer, e, slot, parts, weight, squeeze) in pending {
+            // A heavy re-read: the bank already holds its copy; just give the stagings back.
+            if !squeeze {
+                for (i, sl) in self.slices[layer][e as usize].iter().enumerate() {
+                    self.put_sharp(sl.dtype, sl.dims.iter().product(), parts[i].clone());
+                }
+                self.fresh.lock().unwrap().remove(&(layer, e));
+                let _ = slot;
+                continue;
+            }
             // Below the admission line: used, done, let go. No squeeze, no slot.
             if admit_w().map_or(false, |line| weight < line) {
                 for (i, sl) in self.slices[layer][e as usize].iter().enumerate() {
@@ -1022,7 +1061,7 @@ impl ExpertStore {
             };
             for (i, sl) in self.slices[layer][e as usize].iter().enumerate() {
                 let elems: usize = sl.dims.iter().product();
-                if i == 2 && !shrink_down() {
+                if q2_none() || (i == 2 && !shrink_down()) {
                     let dst = unsafe { std::slice::from_raw_parts_mut((mats[i].0.buffer().contents() as usize + slot * mats[i].1) as *mut u8, sl.bytes) };
                     let src = unsafe { std::slice::from_raw_parts(parts[i].buffer().contents() as *const u8, sl.bytes) };
                     dst.copy_from_slice(src);
@@ -1031,7 +1070,12 @@ impl ExpertStore {
                     let n_blocks = elems / crate::requant::QK_K;
                     rq.run(kind, parts[i].buffer(), 0, mats[i].0.buffer(), slot * mats[i].1, n_blocks)?;
                 }
-                self.put_sharp(sl.dtype, elems, parts[i].clone());
+            }
+            if repair_on() {
+                self.measure_repair(layer, e, slot, &parts)?;
+            }
+            for (i, sl) in self.slices[layer][e as usize].iter().enumerate() {
+                self.put_sharp(sl.dtype, sl.dims.iter().product(), parts[i].clone());
             }
             self.fresh.lock().unwrap().remove(&(layer, e));
             let banks = self.banks.lock().unwrap();
@@ -1040,6 +1084,33 @@ impl ExpertStore {
                 bank.gpu.set_ready(slot, true);
             }
         }
+        Ok(())
+    }
+
+    /// One expert's output y = down(silu(gate x) * up x) for input x (1, h), from three storages
+    /// at `slot` (the sharp stagings at slot 0, or the bank at the expert's slot).
+    fn expert_out(&self, x: &Tensor, layer: usize, ops: [MoeMatvec; 3], slot: u32) -> Result<Tensor> {
+        let device = x.device();
+        let slots = Tensor::from_vec(vec![slot], (1, 1), device)?;
+        let [g, u, d] = ops;
+        let gate = x.apply_op2_no_bwd(&slots, &g)?;
+        let up = x.apply_op2_no_bwd(&slots, &u)?;
+        let inter = gate.dim(2)?;
+        let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((1, inter))?;
+        let down = hidden.apply_op2_no_bwd(&slots, &d)?; // (1, 1, h)
+        down.flatten_all()?.to_dtype(DType::F32)
+    }
+
+    /// Measure the squeeze's damage to one expert on the input it was used for, and keep it.
+    fn measure_repair(&self, layer: usize, e: u32, slot: usize, parts: &[Arc<QMetalStorage>; 3]) -> Result<()> {
+        let x = { self.last_x.lock().unwrap().get(&layer).cloned() };
+        let Some(x) = x else { return Ok(()) };
+        let sharp = [0, 1, 2].map(|i| self.fresh_op(&parts[i], layer, i, 1, i == 2));
+        let y_sharp = self.expert_out(&x, layer, sharp, 0)?;
+        let q2 = [0, 1, 2].map(|i| self.bank_op(layer, i, 1, i == 2));
+        let y_q2 = self.expert_out(&x, layer, q2, slot as u32)?;
+        let d = (y_sharp - y_q2)?;
+        self.repair.lock().unwrap().insert((layer, e), d);
         Ok(())
     }
 
@@ -1055,7 +1126,7 @@ impl ExpertStore {
     fn shrink_into(&self, layer: usize, e: u32, slot: usize, mats: &[(Arc<QMetalStorage>, usize); 3]) -> Result<()> {
         let Some(rq) = self.requant.as_ref() else { candle::bail!("shrink_into without the GPU shrink") };
         for (i, sl) in self.slices[layer][e as usize].iter().enumerate() {
-            if i == 2 && !shrink_down() {
+            if q2_none() || (i == 2 && !shrink_down()) {
                 // The down matrix keeps the file's bytes: read it straight into its slot.
                 let dst = unsafe { std::slice::from_raw_parts_mut((mats[i].0.buffer().contents() as usize + slot * mats[i].1) as *mut u8, sl.bytes) };
                 self.file.read_exact_at(dst, sl.offset)?;
@@ -1131,7 +1202,7 @@ impl ExpertStore {
         let mut mats = Vec::with_capacity(3);
         for (i, s) in self.slices[layer][0].iter().enumerate() {
             let elems: usize = s.dims.iter().product();
-            let (dtype, bytes) = if self.requant.is_some() && (i < 2 || shrink_down()) {
+            let (dtype, bytes) = if self.requant.is_some() && !q2_none() && (i < 2 || shrink_down()) {
                 (GgmlDType::Q2K, elems / crate::requant::QK_K * crate::requant::Q2K_BLOCK_BYTES)
             } else {
                 (s.dtype, s.bytes)
@@ -1368,6 +1439,19 @@ impl ExpertStore {
             st.prefetch_wait_seconds += waited;
         }
         let misses = plan.misses;
+        // Heavy reuse: a hit this token leans on is re-read sharp; its Q2 copy stays for the light ones.
+        if self.requant.is_some() && use_sharp() {
+            if let (Some(line), Some(w)) = (reread_w(), weights) {
+                let heavy: Vec<(u32, usize)> = plan.hits.iter().copied().filter(|(e, _)| w.get(e).map_or(false, |&x| x >= line)).collect();
+                if !heavy.is_empty() {
+                    let started = Instant::now();
+                    heavy.par_iter().try_for_each(|&(e, slot)| self.stage_sharp(layer, e, slot, w[&e], false))?;
+                    let mut st = self.stats.lock().unwrap();
+                    st.loads += heavy.len() as u64;
+                    st.load_seconds += started.elapsed().as_secs_f64();
+                }
+            }
+        }
         // The GPU's table follows: misses are placed but not ready until their bytes land.
         for &(_, slot) in &misses {
             bank.gpu.set_ready(slot, false);
@@ -1378,7 +1462,7 @@ impl ExpertStore {
             for &(_, slot) in &misses {
                 bank.ready[slot].store(false, Ordering::Release);
             }
-            misses.par_iter().try_for_each(|&(e, slot)| self.stage_sharp(layer, e, slot, weights.and_then(|m| m.get(&e).copied()).unwrap_or(1.0)))?;
+            misses.par_iter().try_for_each(|&(e, slot)| self.stage_sharp(layer, e, slot, weights.and_then(|m| m.get(&e).copied()).unwrap_or(1.0), true))?;
             let mut st = self.stats.lock().unwrap();
             st.loads += misses.len() as u64;
             st.bytes_loaded += misses.len() as u64 * self.slices[layer][0].iter().map(|s| s.bytes as u64).sum::<u64>();
@@ -2108,6 +2192,9 @@ impl StreamedMoe {
 
         let logits = self.gate.forward(&xs)?;
         let (top_ids, top_w) = route(&logits, self.top_k, self.norm_topk_prob)?;
+        if n == 1 && repair_on() {
+            self.store.last_x.lock().unwrap().insert(self.layer, xs.clone());
+        }
 
         // S4, the parallel path: nothing here waits for the GPU. The picks stay on the GPU; a tiny
         // kernel publishes them for the service thread, the maths is queued behind a wait on the
@@ -2219,7 +2306,7 @@ impl StreamedMoe {
                 }
                 None => None,
             }
-        } else if n == 1 && ((self.store.sharp_n > 0 && sharp_weight().is_some()) || (use_sharp() && admit_w().is_some())) {
+        } else if n == 1 && ((self.store.sharp_n > 0 && sharp_weight().is_some()) || (use_sharp() && (admit_w().is_some() || reread_w().is_some()))) {
             let w: Vec<f32> = top_w.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
             let weights: HashMap<u32, f32> = ids[0].iter().copied().zip(w.into_iter()).collect();
             self.store.ensure_weighted(self.layer, &needed, Some(&weights))?
@@ -2356,7 +2443,20 @@ impl StreamedMoe {
                 let up = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 1, k, false))?;
                 let inter = gate.dim(2)?;
                 let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((k, inter))?;
-                let down = hidden.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 2, k, true))?;
+                let mut down = hidden.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 2, k, true))?; // (1, k, h)
+                if repair_on() {
+                    let h = down.dim(2)?;
+                    let rep = self.store.repair.lock().unwrap();
+                    let rows: Vec<Tensor> = bank_pos
+                        .iter()
+                        .map(|&p| rep.get(&(self.layer, row[p])).cloned().map(|t| t.to_dtype(down.dtype())).transpose())
+                        .collect::<Result<Vec<Option<Tensor>>>>()?
+                        .into_iter()
+                        .map(|t| t.map_or_else(|| Tensor::zeros(h, down.dtype(), device), Ok))
+                        .collect::<Result<Vec<Tensor>>>()?;
+                    let corr = Tensor::stack(&rows, 0)?.unsqueeze(0)?; // (1, k, h)
+                    down = (down + corr)?;
+                }
                 add(down.broadcast_mul(&w.unsqueeze(2)?)?.sum(1)?)?;
             }
             // each fresh miss, one slot wide, from its sharp staging
