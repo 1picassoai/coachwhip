@@ -8,6 +8,7 @@ use byteorder::{LittleEndian, WriteBytesExt};
 use candle::quantized::gguf_file::{Content, Value, ValueType};
 use candle::quantized::{GgmlDType, QStorage, QTensor};
 use candle::Device;
+use coachwhip_engine::requant::{Requant, SrcKind, Q2K_BLOCK_BYTES, QK_K};
 use std::borrow::Cow;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::time::Instant;
@@ -138,6 +139,20 @@ fn main() -> Result<()> {
     }
     eprintln!("coachwhip-prepare: {} tensors, {changed} to rewrite, {:.1} GB out", infos.len(), offset as f64 / 1e9);
 
+    // The GPU shrink for gate and up (Q3_K/Q4_K/Q5_K -> Q2_K); down goes the CPU way to Q3_K.
+    let gpu = match Device::new_metal(0) {
+        Ok(Device::Metal(m)) => match Requant::new(&m) {
+            Ok(rq) => {
+                eprintln!("coachwhip-prepare: squeezing gate and up on the GPU");
+                Some((m, rq))
+            }
+            Err(e) => {
+                eprintln!("coachwhip-prepare: GPU shrink unavailable ({e}); using the CPU");
+                None
+            }
+        },
+        _ => None,
+    };
     let out = std::fs::File::create(dst_path).with_context(|| format!("creating {dst_path}"))?;
     let mut w = BufWriter::with_capacity(16 << 20, out);
     // Header.
@@ -185,6 +200,17 @@ fn main() -> Result<()> {
         if to == info.ggml_dtype {
             w.write_all(&buf)?;
             written += src_len as u64;
+        } else if let (GgmlDType::Q2K, Some((metal, rq)), Some(kind)) = (to, gpu.as_ref(), SrcKind::of(info.ggml_dtype)) {
+            // On the GPU: the whole tensor in one dispatch, one thread per 256-weight block.
+            let n_blocks = elems / QK_K;
+            let src_buf = metal.new_buffer_builder().with_size(src_len).with_label("prepare_src").build()?;
+            unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), src_buf.contents() as *mut u8, src_len) };
+            let out_len = n_blocks * Q2K_BLOCK_BYTES;
+            let dst_buf = metal.new_buffer_builder().with_size(out_len).with_label("prepare_dst").build()?;
+            rq.run(kind, &src_buf, 0, &dst_buf, 0, n_blocks)?;
+            let data = unsafe { std::slice::from_raw_parts(dst_buf.contents() as *const u8, out_len) };
+            w.write_all(data)?;
+            written += out_len as u64;
         } else {
             let storage = QStorage::from_data(Cow::Owned(buf), &Device::Cpu, info.ggml_dtype)?;
             let q = QTensor::new(storage, info.shape.clone())?;

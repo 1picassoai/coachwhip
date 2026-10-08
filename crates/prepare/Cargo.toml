@@ -11,6 +11,7 @@ name = "coachwhip-prepare"
 path = "src/main.rs"
 
 [dependencies]
+coachwhip-engine = { path = "../engine" }
 candle.workspace = true
 anyhow.workspace = true
 byteorder = "1"
