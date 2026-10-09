@@ -124,7 +124,7 @@ Qwen3.5-122B-A10B is the biggest model Coachwhip runs on 16 GB, and it needs one
 
    The squeeze takes each expert's gate and up matrices to Q2_K on the GPU and its down matrix to Q3_K; everything else in the file is copied as it is. Nothing is downloaded from us, and you can delete the original afterwards if you want the disk back.
 
-3. Start it in one of two modes, bank 40. If your Mac cannot hold a full 16K chat at that size, Coachwhip says so and uses less:
+3. Start it in one of two modes, bank 40. If your Mac cannot hold a long chat at that size, Coachwhip says so and uses less:
 
 ```sh
 # exact: the model's own 8 experts per word
@@ -163,7 +163,7 @@ The last number is the bank (44 if you leave it out). The chat opens in your bro
 | API key | anything; it is ignored |
 | Model | the model's file name, as listed at `/v1/models` |
 
-A conversation holds up to 16K tokens: the history, the question and the answer together. That limit is sized to fit a 16 GB Mac; the models themselves support longer.
+A conversation holds up to 16K tokens: the history, the question and the answer together. That limit is sized to fit a 16 GB Mac; the models themselves support longer. The 122B is tested to a 12,000-token prompt; longer is untested.
 
 Only programs on this Mac can reach it. Follow-ups that resend the whole conversation read only the new part. The chat page and your tools share one model, one request at a time; when a tool has used it, the page's next question starts a new chat.
 
