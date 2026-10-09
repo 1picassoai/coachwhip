@@ -9,6 +9,23 @@ What each model file does on a 16 GB Mac, measured the same way every time. Thes
 - **Speed:** the five coding prompts in [`bench/speed/prompts.json`](../bench/speed/prompts.json), each a fresh conversation capped at 300 tokens, run by [`bench/speed/run.py`](../bench/speed/run.py). "Writing" is answer tokens per second from the first token to the last, the same thing the chat shows under each answer; the table gives the mean over the five prompts, with the slowest and fastest in brackets.
 - **Quality:** 8 small coding tasks in [`bench/quality/tasks.json`](../bench/quality/tasks.json). Each answer's code is run against tests the model never sees ([`bench/quality/tests.py`](../bench/quality/tests.py)); a task passes only if every test does. Quality depends on the model file, not on Coachwhip's settings: the bank and the prefetch change how fast an answer comes, never what it says.
 
+## Qwen3.5-122B-A10B
+
+The biggest model Coachwhip runs on 16 GB (architecture `qwen35moe`): 48 layers, 256 experts of which 8 are used per word. It runs from a **squeezed file** that `coachwhip-prepare` makes on your Mac from the publisher's Q3_K_M (59 GB): each expert's gate and up matrices to Q2_K on the GPU, its down matrix to Q3_K, the rest untouched; 45 GB written in 5 to 9 minutes on an M4, and about 105 GB free needed while both files exist. See the README, The 122B.
+
+Fast mode (`--experts 4 --parallel`), Mac mini M4, 16 GB, bank 40:
+
+| Tokens | Speed | Coachwhip uses | Left for macOS and your apps |
+|---|---|---|---|
+| 6,000-token answer | 4.2 tok/s | 11.2 GB | 2.3 GB at its tightest |
+| 12,000-token prompt | 4.3 tok/s | 12.8 GB | 1.5 GB at its tightest |
+
+Measured 9 Oct 2026 on Coachwhip 0.4.0 by the tester, greedy. Exact mode (the model's own 8 experts, no `--experts`) wrote at 2.2 tok/s after the same 12,000-token prompt. Agent tasks through Aider, six of them in Python, TypeScript and Rust with hidden tests: fast mode passed 5 of 6, and exact mode passed the sixth.
+
+- **Why the squeeze:** at the file's own 4.9 MB per expert, 8 experts a word, the SSD cannot feed a 16 GB Mac faster than about 2 tok/s. At 3.4 MB per expert the same bank holds more and each read lands sooner.
+- **Why fast mode changes answers:** the model was trained to combine 8 experts per word; asking for 4 drops the four lightest. The one agent task fast mode failed had a built-in contradiction: it argued with itself until it ran out of room, where exact mode solved it in one go.
+- Tokenizer: [tokenizer.json](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) from the model's own page.
+
 ## Qwen3-Coder-Next (80B)
 
 | GGUF file | Size | `--bank` on 16 GB | Bank memory | Writing, 0.3.0 | Writing, 0.2.0 | Quality |
@@ -39,23 +56,6 @@ Measured 6 Oct 2026: one person, one run per bank, on the same Mac with a backgr
 - **Quality:** all eight tasks passed, including the duration parser that both 80B files got wrong. Eight tasks is a small sample.
 - Tokenizer: [tokenizer.json](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) from the model's own page.
 - **On 0.4.0:** not re-measured. Its code path is unchanged, but nobody has run it on the release build.
-
-## Qwen3.5-122B-A10B
-
-The biggest model Coachwhip runs on 16 GB (architecture `qwen35moe`): 48 layers, 256 experts of which 8 are used per word. It runs from a **squeezed file** that `coachwhip-prepare` makes on your Mac from the publisher's Q3_K_M (59 GB): each expert's gate and up matrices to Q2_K on the GPU, its down matrix to Q3_K, the rest untouched; 45 GB written in 5 to 9 minutes on an M4, and about 105 GB free needed while both files exist. See the README, The 122B.
-
-Fast mode (`--experts 4 --parallel`), Mac mini M4, 16 GB, bank 40:
-
-| Tokens | Speed | Coachwhip uses | Left for macOS and your apps |
-|---|---|---|---|
-| 6,000-token answer | 4.2 tok/s | 11.2 GB | 2.3 GB at its tightest |
-| 12,000-token prompt | 4.3 tok/s | 12.8 GB | 1.5 GB at its tightest |
-
-Measured 9 Oct 2026 on Coachwhip 0.4.0 by the tester, greedy. Exact mode (the model's own 8 experts, no `--experts`) wrote at 2.2 tok/s after the same 12,000-token prompt. Agent tasks through Aider, six of them in Python, TypeScript and Rust with hidden tests: fast mode passed 5 of 6, and exact mode passed the sixth.
-
-- **Why the squeeze:** at the file's own 4.9 MB per expert, 8 experts a word, the SSD cannot feed a 16 GB Mac faster than about 2 tok/s. At 3.4 MB per expert the same bank holds more and each read lands sooner.
-- **Why fast mode changes answers:** the model was trained to combine 8 experts per word; asking for 4 drops the four lightest. The one agent task fast mode failed had a built-in contradiction: it argued with itself until it ran out of room, where exact mode solved it in one go.
-- Tokenizer: [tokenizer.json](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) from the model's own page.
 
 ## Not measured yet
 
