@@ -49,7 +49,7 @@ Fast mode (`--experts 4 --parallel`), Mac mini M4, 16 GB, bank 40:
 | 6,000-token answer | 4.2 tok/s | 11.2 GB | 2.3 GB at its tightest |
 | 12,000-token prompt | 4.3 tok/s | 12.8 GB | 1.5 GB at its tightest |
 
-Exact mode (the model's own 8 experts) writes at about half that speed; the tester's figure goes here before the tag. If these cells still say "tester's run", the release was not signed.
+Agent tasks through Aider, six of them in Python, TypeScript and Rust with hidden tests: fast mode passed 5 of 6, and exact mode passed the sixth. Exact mode (the model's own 8 experts) writes at about half that speed; the tester's figure goes here before the tag. If these cells still say "tester's run", the release was not signed.
 
 - **Why the squeeze:** at the file's own 4.9 MB per expert, 8 experts a word, the SSD cannot feed a 16 GB Mac faster than about 2 tok/s. At 3.4 MB per expert the same bank holds more and each read lands sooner.
 - **Why fast mode changes answers:** the model was trained to combine 8 experts per word; asking for 4 drops the four lightest. On the 8 coding tasks it passed 8 of 8 on 7 Oct 2026 (a different file, same recipe); the tester's run on this file is the figure that counts.
