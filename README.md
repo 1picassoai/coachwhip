@@ -116,7 +116,7 @@ The Q3_K_M file writes faster than Q4_K_M on a 16 GB Mac, and the two scored the
 Qwen3.5-122B-A10B is the biggest model Coachwhip runs on 16 GB, and it needs one extra step: its experts are too big to stream fast as they come, so Coachwhip squeezes the file once, on your Mac.
 
 1. Download the publisher's [Q3_K_M GGUF](https://huggingface.co/mradermacher/Qwen3.5-122B-A10B-GGUF) (59 GB) and the model's [tokenizer.json](https://huggingface.co/Qwen/Qwen3.5-122B-A10B).
-2. Squeeze it. About five minutes on an M4; it writes a second file beside the first and leaves the download untouched:
+2. Squeeze it. About 5 to 9 minutes on an M4. It writes a second file beside the first and leaves the download untouched, so you need about **105 GB free** before you start: the 59 GB download and the 46 GB squeezed file both exist until you delete the original:
 
 ```sh
 ~/coachwhip/target/release/coachwhip-prepare ~/Downloads/Qwen3.5-122B-A10B.Q3_K_M.gguf ~/Downloads/Qwen3.5-122B-A10B.Q2X.gguf

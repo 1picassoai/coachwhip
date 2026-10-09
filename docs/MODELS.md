@@ -40,7 +40,7 @@ Measured 6 Oct 2026: one person, one run per bank, on the same Mac with a backgr
 
 ## Qwen3.5-122B-A10B
 
-The biggest model Coachwhip runs on 16 GB (architecture `qwen35moe`): 48 layers, 256 experts of which 8 are used per word. It runs from a **squeezed file** that `coachwhip-prepare` makes on your Mac from the publisher's Q3_K_M (59 GB): each expert's gate and up matrices to Q2_K on the GPU, its down matrix to Q3_K, the rest untouched; 45 GB written in 5 min 7 s on an M4. See the README, The 122B.
+The biggest model Coachwhip runs on 16 GB (architecture `qwen35moe`): 48 layers, 256 experts of which 8 are used per word. It runs from a **squeezed file** that `coachwhip-prepare` makes on your Mac from the publisher's Q3_K_M (59 GB): each expert's gate and up matrices to Q2_K on the GPU, its down matrix to Q3_K, the rest untouched; 45 GB written in 5 to 9 minutes on an M4, and about 105 GB free needed while both files exist. See the README, The 122B.
 
 Fast mode (`--experts 4 --parallel`), Mac mini M4, 16 GB, bank 40:
 
