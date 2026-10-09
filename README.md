@@ -4,15 +4,15 @@
 
 **Run mixture-of-experts models that are bigger than your memory.**
 
-An 80B model, running comfortably on a 16 GB Mac; a 122B model too, after a five-minute squeeze. Coachwhip never needs the whole model in memory, because a mixture-of-experts model never needs the whole model for one word.
+An 80B model, running comfortably on a 16 GB Mac; a 122B model too, after a squeeze of a few minutes on your own Mac. Coachwhip never needs the whole model in memory, because a mixture-of-experts model never needs the whole model for one word.
 
 One Rust binary. Everything on the GPU. Nothing leaves your machine.
 
-**New in 0.3.0** ([release notes](https://github.com/1picassoai/coachwhip/releases/tag/v0.3.0)): the 80B writes about a quarter faster, from the early guess and a recommended Q3_K_M file; Qwen3.6-35B-A3B, Qwen's newest MoE generation, runs, with a thinking switch; a models page with measured speed and a quality check per file: [docs/MODELS.md](docs/MODELS.md).
+**New in 0.4.0** ([release notes](docs/releases/0.4.0.md)): **Qwen3.5-122B-A10B on a 16 GB Mac**, squeezed once on your own Mac from the publisher's file; its speed and memory are in [The 122B](#the-122b). Coachwhip now keeps itself inside your Mac's memory: it picks the bank that fits and warns you when macOS is short. Every model's numbers, how they were measured and a quality check per file: [docs/MODELS.md](docs/MODELS.md).
 
 **Tried it? Tell us how it ran**, good or bad, especially if it was slow, the fan worked hard, or it ran hot. [Open an issue](https://github.com/1picassoai/coachwhip/issues) with your Mac (chip and memory), macOS version, the model file, the `--bank` you used, and the speed line the chat page shows under each answer. Questions and ideas are welcome there too.
 
-<p align="center"><img src="docs/coachwhip-demo.gif" alt="Qwen3-Coder-Next (80B) writing TypeScript in the Coachwhip chat on a 16 GB Mac" width="720"></p>
+<p align="center"><img src="docs/coachwhip-demo.gif" alt="Qwen3.6-35B-A3B writing TypeScript in the Coachwhip chat on a 16 GB Mac, at 6 tok/s" width="720"></p>
 
 ## Why it works
 

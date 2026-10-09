@@ -4,13 +4,15 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/1picassoai/coachwhip/main/install.sh | bash
 #
-# COACHWHIP_DIR picks the install folder (default ~/coachwhip).
+# COACHWHIP_DIR picks the install folder (default ~/coachwhip). COACHWHIP_VERSION picks the release
+# tag (default: the latest signed release, below; it moves with every release).
 set -euo pipefail
 
 # Everything runs inside main, so a download cut off half way through runs nothing.
 main() {
 DIR="${COACHWHIP_DIR:-$HOME/coachwhip}"
 REPO="${COACHWHIP_REPO:-https://github.com/1picassoai/coachwhip}"
+VERSION="${COACHWHIP_VERSION:-v0.4.0}"
 
 say() { printf "\033[1;32m==>\033[0m %s\n" "$*"; }
 die() { printf "\033[1;31merror:\033[0m %s\n" "$*" >&2; exit 1; }
@@ -42,14 +44,15 @@ fi
 
 # 4. Coachwhip
 if [ -d "$DIR/.git" ]; then
-  say "Updating Coachwhip"
-  git -C "$DIR" pull --ff-only
+  say "Updating Coachwhip to $VERSION"
+  git -C "$DIR" fetch -q --depth 1 origin "refs/tags/$VERSION:refs/tags/$VERSION"
+  git -C "$DIR" checkout -q "$VERSION"
 elif [ -f "$DIR/Cargo.toml" ]; then
   say "Using the Coachwhip source already in $DIR"
 else
-  say "Downloading Coachwhip"
+  say "Downloading Coachwhip $VERSION"
   tmp="$(mktemp -d)"
-  git clone --depth 1 "$REPO" "$tmp/coachwhip"
+  git clone -q --depth 1 --branch "$VERSION" "$REPO" "$tmp/coachwhip"
   cp -R "$tmp/coachwhip/." "$DIR/"
   rm -rf "$tmp"
 fi
