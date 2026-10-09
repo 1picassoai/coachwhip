@@ -94,7 +94,7 @@ impl KvBuf {
         self.len = 0;
     }
 }
-use candle_nn::{Embedding, Linear};
+use candle_nn::Linear;
 use candle_transformers::models::quantized_qwen3::Gguf;
 use candle_transformers::models::with_tracing::QMatMul;
 use candle_transformers::quantized_nn::RmsNorm;
@@ -577,8 +577,36 @@ struct Layer {
     shared: SharedExpert,
 }
 
+/// The word table, packed as the file stores it; rows are unpacked when a forward asks for them.
+struct PackedTable {
+    bytes: Vec<u8>,
+    dtype: GgmlDType,
+    row_bytes: usize,
+    hidden: usize,
+}
+
+impl PackedTable {
+    /// `ids` (any shape) -> (..., hidden) f32 on the CPU, rounded through f16 like the old table.
+    fn rows(&self, ids: &Tensor) -> Result<Tensor> {
+        let flat: Vec<u32> = ids.flatten_all()?.to_vec1()?;
+        let mut buf = Vec::with_capacity(flat.len() * self.row_bytes);
+        for &id in &flat {
+            let at = id as usize * self.row_bytes;
+            if at + self.row_bytes > self.bytes.len() {
+                candle::bail!("word {id} is outside the word table")
+            }
+            buf.extend_from_slice(&self.bytes[at..at + self.row_bytes]);
+        }
+        let q = qtensor_from_ggml(self.dtype, &buf, vec![flat.len(), self.hidden], &Device::Cpu)?;
+        let t = q.dequantize(&Device::Cpu)?.to_dtype(DType::F16)?.to_dtype(DType::F32)?;
+        let mut dims = ids.dims().to_vec();
+        dims.push(self.hidden);
+        t.reshape(dims)
+    }
+}
+
 pub struct Qwen3Next {
-    embeddings: Embedding,
+    embeddings: PackedTable,
     layers: Vec<Layer>,
     norm: RmsNorm,
     output: QMatMul,
@@ -628,6 +656,16 @@ impl Qwen3Next {
         let think = crate::model::ThinkOpen::from_template(template.as_deref());
 
         let store = ExpertStore::new(&ct, device, block_count, path, settings)?;
+        // Wrangler: the word table is read packed, onto the CPU only, before the rest loads.
+        let table = {
+            let q = ct.tensor(&mut file, "token_embd.weight", &Device::Cpu)?;
+            let dims = q.shape().dims().to_vec();
+            let hidden = *dims.last().unwrap();
+            let dtype = q.dtype();
+            let row_bytes = hidden / dtype.block_size() * dtype.type_size();
+            let bytes = q.data()?.into_owned();
+            PackedTable { bytes, dtype, row_bytes, hidden }
+        };
         let mut gg = Gguf::new(ct, &mut file, device.clone());
         let dense = |gg: &mut Gguf<&mut std::fs::File>, name: &str| -> Result<Tensor> { gg.tensor(name)?.dequantize(device)?.to_dtype(DType::F32) };
         // Lab (`COACHWHIP_DENSE=q2k|q3k|q4k`): the dense weights are shrunk once at load, so the
@@ -661,7 +699,6 @@ impl Qwen3Next {
             QMatMul::from_weights(Arc::new(on_device))
         };
 
-        let embeddings = gg.tensor("token_embd.weight")?.dequantize(device)?.to_dtype(DType::F16)?.to_device(&Device::Cpu)?;
         let norm = gg.rms_norm("output_norm.weight", eps)?;
         // The output head goes through the shrink in slices (conveyor belt): dequantise 8,192 rows,
         // shrink them, stack the bytes, so the load never holds more than one slice in f32 on the CPU.
@@ -790,7 +827,7 @@ impl Qwen3Next {
         if let Ok(path) = std::env::var("COACHWHIP_PREDICTOR") {
             load_predictor(&mut layers, &path, settings.ahead.max(1), device)?;
         }
-        Ok(Self { embeddings: Embedding::new(embeddings, embedding_length), layers, norm, output, store, device: device.clone(), think, progress: None })
+        Ok(Self { embeddings: table, layers, norm, output, store, device: device.clone(), think, progress: None })
     }
 
     pub fn report(&self) {
@@ -1011,7 +1048,7 @@ impl Qwen3Next {
         if !self.store.drafting() {
             self.store.note_tokens(x.flatten_all()?.to_vec1()?);
         }
-        let mut xs = self.embeddings.forward(&x.to_device(&Device::Cpu)?)?.to_device(&self.device)?.to_dtype(DType::F32)?;
+        let mut xs = self.embeddings.rows(&x.to_device(&Device::Cpu)?)?.to_device(&self.device)?;
         let (_b, l) = x.dims2()?;
         let mask = if l == 1 {
             None
