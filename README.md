@@ -124,17 +124,24 @@ Qwen3.5-122B-A10B is the biggest model Coachwhip runs on 16 GB, and it needs one
 
    The squeeze takes each expert's gate and up matrices to Q2_K on the GPU and its down matrix to Q3_K; everything else in the file is copied as it is. Nothing is downloaded from us, and you can delete the original afterwards if you want the disk back.
 
-3. Start it in one of two modes, bank 32:
+3. Start it in one of two modes, bank 40. If your Mac cannot hold a full 16K chat at that size, Coachwhip says so and uses less:
 
 ```sh
 # exact: the model's own 8 experts per word
-~/coachwhip/coachwhip.sh ~/Downloads/Qwen3.5-122B-A10B.Q2X.gguf ~/Downloads/tokenizer.json 32
+~/coachwhip/coachwhip.sh ~/Downloads/Qwen3.5-122B-A10B.Q2X.gguf ~/Downloads/tokenizer.json 40
 
 # fast: the router's top 4 experts per word, and the GPU runs ahead of the CPU
-~/coachwhip/coachwhip.sh ~/Downloads/Qwen3.5-122B-A10B.Q2X.gguf ~/Downloads/tokenizer.json 32 8090 --experts 4 --parallel
+~/coachwhip/coachwhip.sh ~/Downloads/Qwen3.5-122B-A10B.Q2X.gguf ~/Downloads/tokenizer.json 40 8090 --experts 4 --parallel
 ```
 
 **Fast mode changes the answers.** The model was trained to use 8 experts for every word; asking for 4 makes it write about twice as fast, and its answers can differ from what the full model would say. It is a choice, never the default. Both modes' speed and quality on our checks are in [docs/MODELS.md](docs/MODELS.md).
+
+Fast mode on a 16 GB Mac mini M4, bank 40:
+
+| Tokens | Speed | Coachwhip uses | Left for macOS and your apps |
+|---|---|---|---|
+| 6,000-token answer | _tester's run_ | _tester's run_ | _tester's run_ |
+| 12,000-token prompt | _tester's run_ | _tester's run_ | _tester's run_ |
 
 ## Use
 

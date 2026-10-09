@@ -42,12 +42,14 @@ Measured 6 Oct 2026: one person, one run per bank, on the same Mac with a backgr
 
 The biggest model Coachwhip runs on 16 GB (architecture `qwen35moe`): 48 layers, 256 experts of which 8 are used per word. It runs from a **squeezed file** that `coachwhip-prepare` makes on your Mac from the publisher's Q3_K_M (59 GB): each expert's gate and up matrices to Q2_K on the GPU, its down matrix to Q3_K, the rest untouched; 45 GB written in 5 min 7 s on an M4. See the README, The 122B.
 
-| Mode | `--bank` on 16 GB | Writing | Quality |
-|---|---|---|---|
-| exact, the model's own 8 experts | 32 | **2.7 tok/s** sampled over 300 words, one run; 2.9 greedy over 120 | _tester's run before the tag_ |
-| fast, `--experts 4 --parallel` | 32 | **4.9 tok/s**, one short run (120 tokens) | _tester's run before the tag_ |
+Fast mode (`--experts 4 --parallel`), Mac mini M4, 16 GB, bank 40:
 
-Measured 8 Oct 2026 by the builder, single runs on one prompt each, Mac mini M4 with a background load of about 1.5: a first measurement, not a settled range. The tester's five-prompt run and the 8-task quality check replace these figures before the release is tagged; if they are missing here, the release was not signed.
+| Tokens | Speed | Coachwhip uses | Left for macOS and your apps |
+|---|---|---|---|
+| 6,000-token answer | _tester's run_ | _tester's run_ | _tester's run_ |
+| 12,000-token prompt | _tester's run_ | _tester's run_ | _tester's run_ |
+
+Exact mode (the model's own 8 experts) writes at about half that speed; the tester's figure goes here before the tag. If these cells still say "tester's run", the release was not signed.
 
 - **Why the squeeze:** at the file's own 4.9 MB per expert, 8 experts a word, the SSD cannot feed a 16 GB Mac faster than about 2 tok/s. At 3.4 MB per expert the same bank holds more and each read lands sooner.
 - **Why fast mode changes answers:** the model was trained to combine 8 experts per word; asking for 4 drops the four lightest. On the 8 coding tasks it passed 8 of 8 on 7 Oct 2026 (a different file, same recipe); the tester's run on this file is the figure that counts.
