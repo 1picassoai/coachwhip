@@ -46,8 +46,8 @@ Fast mode (`--experts 4 --parallel`), Mac mini M4, 16 GB, bank 40:
 
 | Tokens | Speed | Coachwhip uses | Left for macOS and your apps |
 |---|---|---|---|
-| 6,000-token answer | _tester's run_ | _tester's run_ | _tester's run_ |
-| 12,000-token prompt | _tester's run_ | _tester's run_ | _tester's run_ |
+| 6,000-token answer | 4.2 tok/s | 11.2 GB | 2.3 GB at its tightest |
+| 12,000-token prompt | 4.3 tok/s | 12.8 GB | 1.5 GB at its tightest |
 
 Exact mode (the model's own 8 experts) writes at about half that speed; the tester's figure goes here before the tag. If these cells still say "tester's run", the release was not signed.
 

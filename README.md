@@ -140,8 +140,8 @@ Fast mode on a 16 GB Mac mini M4, bank 40:
 
 | Tokens | Speed | Coachwhip uses | Left for macOS and your apps |
 |---|---|---|---|
-| 6,000-token answer | _tester's run_ | _tester's run_ | _tester's run_ |
-| 12,000-token prompt | _tester's run_ | _tester's run_ | _tester's run_ |
+| 6,000-token answer | 4.2 tok/s | 11.2 GB | 2.3 GB at its tightest |
+| 12,000-token prompt | 4.3 tok/s | 12.8 GB | 1.5 GB at its tightest |
 
 ## Use
 
