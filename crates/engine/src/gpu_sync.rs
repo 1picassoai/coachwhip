@@ -31,17 +31,17 @@ kernel void coachwhip_publish(
     device uint* out            [[buffer(4)]],
     constant uint& n_ids        [[buffer(5)]],
     constant uint& n_guess      [[buffer(6)]],
+    constant uint& tag          [[buffer(7)]],
     uint tid [[thread_position_in_grid]],
     uint tgs [[threads_per_threadgroup]])
 {
-    for (uint i = tid; i < n_ids; i += tgs) picks[i] = ids[i];
-    for (uint i = tid; i < n_guess; i += tgs) picks[n_ids + i] = guess[i];
+    // Each pick carries its job's stamp in the top half of the same word, so a reader can never
+    // take a mix of this word's picks and the last word's left in the buffer.
+    for (uint i = tid; i < n_ids; i += tgs) picks[i] = (tag << 16) | ids[i];
+    for (uint i = tid; i < n_guess; i += tgs) picks[n_ids + i] = (tag << 16) | guess[i];
     threadgroup_barrier(mem_flags::mem_device);
     if (tid == 0) {
-        // The flag is 1 + the sum of the picks: the CPU reads picks until they add up to it.
-        uint sum = 0;
-        for (uint i = 0; i < n_ids + n_guess; ++i) sum += picks[i];
-        atomic_store_explicit(flag, 1u + sum, memory_order_relaxed);
+        atomic_store_explicit(flag, 1u + tag, memory_order_relaxed);
         out[0] = 1u;
     }
 }
@@ -132,11 +132,13 @@ impl GpuBank {
         (0..n).map(|i| atom(&self.picks, i).load(Ordering::SeqCst)).collect()
     }
 
-    /// The picks once they are complete: read until they add up to the flag's checksum.
-    pub fn picks_checked(&self, n: usize, flag: u32) -> Option<Vec<u32>> {
+    /// The picks of job `tag`, once every one of them carries that stamp; None until then.
+    pub fn picks_tagged(&self, n: usize, tag: u32) -> Option<Vec<u32>> {
+        if self.flag() != 1 + tag {
+            return None;
+        }
         let picks = self.picks(n);
-        let sum = picks.iter().fold(0u32, |a, &b| a.wrapping_add(b));
-        if sum.wrapping_add(1) == flag { Some(picks) } else { None }
+        if picks.iter().all(|&p| p >> 16 == tag) { Some(picks.iter().map(|&p| p & 0xFFFF).collect()) } else { None }
     }
 
     /// Picks the resolve kernel found no slot for so far.
@@ -201,6 +203,8 @@ pub struct Publish {
     pub bank: Arc<GpuBank>,
     pub pipeline: Arc<ComputePipeline>,
     pub n_guess: usize,
+    /// This job's stamp, the low 16 bits of its sequence number.
+    pub tag: u32,
 }
 
 impl CustomOp2 for Publish {
@@ -237,7 +241,8 @@ impl CustomOp2 for Publish {
                     self.bank.flag.as_ref(),
                     Output::with_offset(&dst, 0),
                     n_ids_u,
-                    n_guess_u
+                    n_guess_u,
+                    self.tag
                 )
             );
             encoder.dispatch_thread_groups(MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 64, height: 1, depth: 1 });

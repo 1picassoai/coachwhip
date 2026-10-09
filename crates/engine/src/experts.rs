@@ -1638,10 +1638,7 @@ impl ExpertStore {
         }
         let mut picks: Option<Vec<u32>> = None;
         while picks.is_none() {
-            let flag = gpu.flag();
-            if flag != 0 {
-                picks = gpu.picks_checked(job.n_ids + job.n_guess, flag);
-            }
+            picks = gpu.picks_tagged(job.n_ids + job.n_guess, (job.seq & 0xFFFF) as u32);
             if picks.is_none() && started.elapsed().as_secs() > 15 {
                 eprintln!("coachwhip: parallel: layer {} never published its picks; releasing the GPU", job.layer);
                 break;
@@ -2243,10 +2240,10 @@ impl StreamedMoe {
             if std::env::var("COACHWHIP_S4_DEBUG").is_ok() {
                 eprintln!("s4: encode layer {}", self.layer);
             }
-            let publish = crate::gpu_sync::Publish { bank: gpu.clone(), pipeline: s4.pipes.publish.clone(), n_guess };
+            let seq = s4.seq.fetch_add(1, Ordering::AcqRel) + 1;
+            let publish = crate::gpu_sync::Publish { bank: gpu.clone(), pipeline: s4.pipes.publish.clone(), n_guess, tag: (seq & 0xFFFF) as u32 };
             let _published = top_ids.apply_op2_no_bwd(&guess, &publish)?;
             crate::gpu_sync::flush()?;
-            let seq = s4.seq.fetch_add(1, Ordering::AcqRel) + 1;
             s4.event.gpu_wait(seq)?;
             let resolve = crate::gpu_sync::Resolve { bank: gpu.clone(), pipeline: s4.pipes.resolve.clone() };
             let slots = top_ids.apply_op1_no_bwd(&resolve)?;
