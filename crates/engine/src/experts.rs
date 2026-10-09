@@ -115,6 +115,54 @@ fn exact_zeros(metal: &MetalDevice, elems: usize, dtype: GgmlDType) -> Result<QM
     }
 }
 
+/// The chat's longest conversation, in tokens (the server's limit); the governor keeps room for it.
+const WRANGLER_CONTEXT: f64 = 16384.0;
+/// Kept free under macOS's GPU working-set limit, and the working memory a forward needs on top of
+/// the weights, banks and keys. Measured 9 Oct 2026 on the squeezed 122B, 16 GB Mac mini: bank 40
+/// with a 15.7K prompt peaked at 11.34 GB of 12.71 GB and ran; bank 44 stalled.
+const WRANGLER_MARGIN: f64 = 1.3e9;
+const WRANGLER_WORKING: f64 = 1.0e9;
+
+/// Wrangler: the most bank slots per layer that fit a full chat under the GPU limit, or None when
+/// switched off (`COACHWHIP_WRANGLER=0`) or not measurable.
+fn wrangler_fit(ct: &gguf_file::Content, metal: &MetalDevice, layers: usize, expert_bytes: f64) -> Option<usize> {
+    use objc2_metal::MTLDevice as _;
+    if std::env::var("COACHWHIP_WRANGLER").map(|v| v == "0").unwrap_or(false) {
+        return None;
+    }
+    let limit = metal.device().as_ref().recommendedMaxWorkingSetSize() as f64;
+    let md_u = |k: &str| ct.metadata.get(k).and_then(|v| v.to_u32().ok()).map(|v| v as f64);
+    let arch = ct.metadata.get("general.architecture").and_then(|v| v.to_string().ok().cloned()).unwrap_or_default();
+    // The weights that live on the GPU: everything but the experts and the packed word table.
+    let dense: f64 = ct
+        .tensor_infos
+        .iter()
+        .filter(|(n, _)| !n.contains("_exps") && n.as_str() != "token_embd.weight")
+        .map(|(_, i)| (i.shape.elem_count() / i.ggml_dtype.block_size() * i.ggml_dtype.type_size()) as f64)
+        .sum();
+    // Keys and values for a full chat, f32, on the layers that keep them.
+    let interval = md_u(&format!("{arch}.full_attention_interval")).unwrap_or(1.0).max(1.0);
+    let n_kv = md_u(&format!("{arch}.attention.head_count_kv")).unwrap_or(1.0);
+    let hd = md_u(&format!("{arch}.attention.key_length")).unwrap_or(128.0);
+    let kv = (layers as f64 / interval).floor() * 2.0 * n_kv * hd * 4.0 * WRANGLER_CONTEXT;
+    let room = limit - WRANGLER_MARGIN - WRANGLER_WORKING - dense - kv;
+    let fit = (room / (layers as f64 * expert_bytes)).floor().max(8.0) as usize;
+    eprintln!(
+        "coachwhip: wrangler: GPU limit {:.2} GB; weights {:.2} GB, keys for a {}-token chat {:.2} GB, working {:.1} GB, margin {:.1} GB; room for {fit} slots per layer",
+        limit / 1e9, dense / 1e9, WRANGLER_CONTEXT as usize, kv / 1e9, WRANGLER_WORKING / 1e9, WRANGLER_MARGIN / 1e9
+    );
+    Some(fit)
+}
+
+/// macOS memory pressure: 1 normal, 2 warning, 4 critical (0 when it cannot be read).
+fn memory_pressure() -> i32 {
+    let mut level: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let name = b"kern.memorystatus_vm_pressure_level\0";
+    let r = unsafe { libc::sysctlbyname(name.as_ptr() as *const libc::c_char, &mut level as *mut _ as *mut libc::c_void, &mut size, std::ptr::null_mut(), 0) };
+    if r == 0 { level } else { 0 }
+}
+
 /// What one forward needs from a layer's bank: the experts already there and the ones to read in.
 #[derive(Debug, Default, PartialEq)]
 pub struct Plan {
@@ -602,7 +650,7 @@ impl ExpertStore {
             candle::bail!("Coachwhip needs a Metal device (Apple silicon)")
         };
         PROFILE.store(settings.profile, Ordering::Relaxed);
-        let per_layer = settings.bank.max(1);
+        let mut per_layer = settings.bank.max(1);
 
         let mut slices = Vec::with_capacity(layers);
         for layer in 0..layers {
@@ -636,6 +684,12 @@ impl ExpertStore {
         }
         let experts = slices[0].len();
         let per_expert_mb = slices[0][0].iter().map(|s| s.bytes).sum::<usize>() as f64 / 1e6;
+        if let Some(fit) = wrangler_fit(ct, metal, layers, per_expert_mb * 1e6) {
+            if fit < per_layer {
+                eprintln!("coachwhip: wrangler: bank {per_layer} would not leave room for a full chat on this Mac; using {fit}");
+                per_layer = fit;
+            }
+        }
         eprintln!(
             "coachwhip: {layers} layers x {experts} experts, {per_expert_mb:.1} MB each; bank {per_layer} slots per layer ({:.2} GB)",
             per_layer as f64 * layers as f64 * per_expert_mb / 1e3
@@ -1951,8 +2005,13 @@ impl ExpertStore {
             s.prefetch_hits
         );
         eprintln!(
-            "coachwhip: waited {:.2} s on guesses still landing; dropped {} stale guessed reads; {} layers read fresh because the bank was crowded",
-            s.prefetch_wait_seconds, s.stale_dropped, s.crowded
+            "coachwhip: waited {:.2} s on guesses still landing; dropped {} stale guessed reads; {} layers read fresh because the bank was crowded{}",
+            s.prefetch_wait_seconds, s.stale_dropped, s.crowded,
+            match memory_pressure() {
+                2 => "; wrangler: macOS memory pressure is at WARNING, close other apps or start with a smaller --bank",
+                4 => "; wrangler: macOS memory pressure is CRITICAL, start with a smaller --bank",
+                _ => "",
+            }
         );
         if s.fresh > 0 {
             eprintln!(
