@@ -4,7 +4,7 @@
 
 **Run mixture-of-experts models that are bigger than your memory.**
 
-An 80B model, running comfortably on a 16 GB Mac. Coachwhip never needs the whole model in memory, because a mixture-of-experts model never needs the whole model for one word.
+An 80B model, running comfortably on a 16 GB Mac; a 122B model too, after a five-minute squeeze. Coachwhip never needs the whole model in memory, because a mixture-of-experts model never needs the whole model for one word.
 
 One Rust binary. Everything on the GPU. Nothing leaves your machine.
 
@@ -61,6 +61,7 @@ Coachwhip is an engine for MoE models, in GGUF format.
 | [Qwen3-Coder-Next](https://huggingface.co/Qwen/Qwen3-Coder-Next) (80B) | qwen3next | Tested. See below for the file to use. |
 | [Qwen3-Next-80B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct) | qwen3next | Tested. |
 | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | qwen35moe | Tested. Thinks when asked to. |
+| [Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) | qwen35moe | Tested, after `prepare` (see The 122B). |
 | Qwen3-30B-A3B, other Qwen3 MoE | qwen3moe | Supported. |
 | Qwen3.5 MoE, Qwen3.6-14B-A3B (community) | qwen35moe | Supported. The 14B fits in 16 GB on its own; Coachwhip does not make it faster. |
 | Mixtral, Qwen2-MoE, OLMoE, DeepSeek, gpt-oss, GLM | | Coming next. |
@@ -73,12 +74,12 @@ Try other MoE models and tell us what happens. If a model's architecture is not 
 
 ## What you need
 
-| | 30B | 80B |
-|---|---|---|
-| Mac | Apple silicon (M1 or later). Tested on a Mac mini M4. | the same |
-| Memory | 16 GB | 16 GB; 24 GB has room to spare |
-| Disk | 19 GB for the model, 3 GB for the build | 39 GB (Q3_K_M) or 49 GB (Q4_K_M) for the model, 3 GB for the build |
-| macOS | Tested on macOS 26 | the same |
+| | 30B | 80B | 122B |
+|---|---|---|---|
+| Mac | Apple silicon, M4 or later recommended; M1 to M3 run it slower. Tested on a Mac mini M4. | the same | the same |
+| Memory | 16 GB | 16 GB; 24 GB has room to spare | 16 GB |
+| Disk | 19 GB for the model, 3 GB for the build | 39 GB (Q3_K_M) or 49 GB (Q4_K_M) for the model, 3 GB for the build | 59 GB for the download plus 46 GB for the squeezed file, 3 GB for the build |
+| macOS | Tested on macOS 26 | the same | the same |
 
 ## Install
 
@@ -109,6 +110,31 @@ The Q3_K_M file writes faster than Q4_K_M on a 16 GB Mac, and the two scored the
 | Qwen3-Coder-Next (80B), recommended | [MaziyarPanahi Q3_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next) | 70 |
 | Qwen3-Coder-Next (80B), the 4-bit file | [MaziyarPanahi Q4_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next) | 56 |
 | Qwen3-Coder-30B-A3B, a smaller download | [unsloth Q4_K_M](https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) | 44 |
+
+## The 122B
+
+Qwen3.5-122B-A10B is the biggest model Coachwhip runs on 16 GB, and it needs one extra step: its experts are too big to stream fast as they come, so Coachwhip squeezes the file once, on your Mac.
+
+1. Download the publisher's [Q3_K_M GGUF](https://huggingface.co/mradermacher/Qwen3.5-122B-A10B-GGUF) (59 GB) and the model's [tokenizer.json](https://huggingface.co/Qwen/Qwen3.5-122B-A10B).
+2. Squeeze it. About five minutes on an M4; it writes a second file beside the first and leaves the download untouched:
+
+```sh
+~/coachwhip/target/release/coachwhip-prepare ~/Downloads/Qwen3.5-122B-A10B.Q3_K_M.gguf ~/Downloads/Qwen3.5-122B-A10B.Q2X.gguf
+```
+
+   The squeeze takes each expert's gate and up matrices to Q2_K on the GPU and its down matrix to Q3_K; everything else in the file is copied as it is. Nothing is downloaded from us, and you can delete the original afterwards if you want the disk back.
+
+3. Start it in one of two modes, bank 32:
+
+```sh
+# exact: the model's own 8 experts per word
+~/coachwhip/coachwhip.sh ~/Downloads/Qwen3.5-122B-A10B.Q2X.gguf ~/Downloads/tokenizer.json 32
+
+# fast: the router's top 4 experts per word, and the GPU runs ahead of the CPU
+~/coachwhip/coachwhip.sh ~/Downloads/Qwen3.5-122B-A10B.Q2X.gguf ~/Downloads/tokenizer.json 32 8090 --experts 4 --parallel
+```
+
+**Fast mode changes the answers.** The model was trained to use 8 experts for every word; asking for 4 makes it write about twice as fast, and its answers can differ from what the full model would say. It is a choice, never the default. Both modes' speed and quality on our checks are in [docs/MODELS.md](docs/MODELS.md).
 
 ## Use
 
