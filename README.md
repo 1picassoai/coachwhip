@@ -64,11 +64,11 @@ Coachwhip is an engine for MoE models, in GGUF format.
 
 | Model | Architecture | Status |
 |---|---|---|
+| [Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) | qwen35moe | Tested, after `prepare` (see The 122B). |
 | [Qwen3-Coder-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) | qwen3moe | Tested. |
 | [Qwen3-Coder-Next](https://huggingface.co/Qwen/Qwen3-Coder-Next) (80B) | qwen3next | Tested. See below for the file to use. |
 | [Qwen3-Next-80B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct) | qwen3next | Tested. |
 | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | qwen35moe | Tested. Thinks when asked to. |
-| [Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) | qwen35moe | Tested, after `prepare` (see The 122B). |
 | Qwen3-30B-A3B, other Qwen3 MoE | qwen3moe | Supported. |
 | Qwen3.5 MoE, Qwen3.6-14B-A3B (community) | qwen35moe | Supported. The 14B fits in 16 GB on its own; Coachwhip does not make it faster. |
 
@@ -80,11 +80,11 @@ Try other MoE models and tell us what happens. If a model's architecture is not 
 
 ## What you need
 
-| | 30B | 80B | 122B |
+| | 122B | 80B | 30B |
 |---|---|---|---|
 | Mac | Apple silicon, M4 or later recommended; M1 to M3 run it slower. Tested on a Mac mini M4. | the same | the same |
 | Memory | 16 GB | 16 GB; 24 GB has room to spare | 16 GB |
-| Disk | 19 GB for the model, 3 GB for the build | 39 GB (Q3_K_M) or 49 GB (Q4_K_M) for the model, 3 GB for the build | 59 GB for the download plus 46 GB for the squeezed file, 3 GB for the build |
+| Disk | 59 GB for the download plus 46 GB for the squeezed file, 3 GB for the build | 39 GB (Q3_K_M) or 49 GB (Q4_K_M) for the model, 3 GB for the build | 19 GB for the model, 3 GB for the build |
 | macOS | Tested on macOS 26 | the same | the same |
 
 ## Install
@@ -103,7 +103,9 @@ If a window asks to install Apple's command line tools, finish it and run the li
 
 Coachwhip is the engine; the model is yours. Any GGUF of a supported model works (see Models).
 
-**Recommended: Qwen3-Coder-Next, the 80B coder, in its Q3_K_M file.** Download the [Q3_K_M GGUF](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) (38 GB) and its [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next), then start it with a bank of 70:
+**Qwen3.5-122B-A10B:** download the publisher's file and squeeze it once on your Mac, as in [The 122B](#the-122b).
+
+**Qwen3-Coder-Next, the 80B coder, in its Q3_K_M file:** download the [Q3_K_M GGUF](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) (38 GB) and its [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next), then start it with a bank of 70:
 
 ```sh
 ~/coachwhip/coachwhip.sh ~/Downloads/Qwen3-Coder-Next.Q3_K_M.gguf ~/Downloads/tokenizer.json 70
@@ -113,7 +115,8 @@ The Q3_K_M file writes faster than Q4_K_M on a 16 GB Mac, and the two scored the
 
 | Model | GGUF file | Tokenizer | Bank on 16 GB |
 |---|---|---|---|
-| Qwen3-Coder-Next (80B), recommended | [MaziyarPanahi Q3_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next) | 70 |
+| Qwen3.5-122B-A10B, after `prepare` | [mradermacher Q3_K_M](https://huggingface.co/mradermacher/Qwen3.5-122B-A10B-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) | 40 |
+| Qwen3-Coder-Next (80B) | [MaziyarPanahi Q3_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next) | 70 |
 | Qwen3-Coder-Next (80B), the 4-bit file | [MaziyarPanahi Q4_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next) | 56 |
 | Qwen3-Coder-30B-A3B, a smaller download | [unsloth Q4_K_M](https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) | 44 |
 
