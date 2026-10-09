@@ -606,11 +606,11 @@ impl Qwen3Next {
         let rot = md_u("rope.dimension_count")?;
         let block_count = md_u("block_count")?;
         let top_k = md_u("expert_used_count")?;
-        // Lab (`COACHWHIP_TOPK=n`): ask fewer experts per word than the model was trained with.
+        // Fast mode (`--experts n`, `COACHWHIP_TOPK=n`): fewer experts per word than the model was trained with.
         // Fewer experts = fewer bytes per word; the text changes, so quality is measured alongside.
         let top_k = match std::env::var("COACHWHIP_TOPK").ok().and_then(|v| v.parse::<usize>().ok()) {
             Some(k) if k >= 1 && k < top_k => {
-                eprintln!("coachwhip: lab top-k {k} (model uses {top_k})");
+                eprintln!("coachwhip: fast mode: {k} experts per word (the model uses {top_k}); answers can differ from the model's own");
                 k
             }
             _ => top_k,
