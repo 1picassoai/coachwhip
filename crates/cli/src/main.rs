@@ -52,13 +52,15 @@ struct Args {
     #[arg(long, default_value_t = 44)]
     bank: usize,
 
-    /// Experts guessed and fetched ahead per layer; 0 turns prefetch off.
-    #[arg(long, default_value_t = 10)]
-    prefetch: usize,
+    /// Experts guessed and fetched ahead per layer; 0 turns prefetch off. Default 10, or 6 for
+    /// the 122B, the settings each model's numbers were measured with.
+    #[arg(long)]
+    prefetch: Option<usize>,
 
     /// How many layers ahead the guess looks (each layer is about 2 ms of GPU work to read in).
-    #[arg(long, default_value_t = 4)]
-    ahead: usize,
+    /// Default 4, or 2 for the 122B.
+    #[arg(long)]
+    ahead: Option<usize>,
 
     /// Reader threads for the prefetch.
     #[arg(long, default_value_t = 3)]
@@ -117,10 +119,24 @@ fn main() -> Result<()> {
     let routes = args.routes.join(&model_name);
     let learned = args.learned.join(&model_name);
     std::fs::create_dir_all(&learned)?;
+    // The 122B (48-layer qwen35moe) guesses best at 6 ahead by 2; the others at 10 by 4.
+    let big = {
+        let mut f = std::fs::File::open(&args.model)?;
+        let ct = candle::quantized::gguf_file::Content::read(&mut f)?;
+        let arch = ct.metadata.get("general.architecture").and_then(|v| v.to_string().ok().cloned()).unwrap_or_default();
+        let layers = ct.metadata.get(&format!("{arch}.block_count")).and_then(|v| v.to_u32().ok()).unwrap_or(0);
+        arch == "qwen35moe" && layers >= 48
+    };
+    let (prefetch, ahead) = match (args.prefetch, args.ahead) {
+        (Some(p), Some(a)) => (p, a),
+        (Some(p), None) => (p, if big { 2 } else { 4 }),
+        (None, Some(a)) => (if big { 6 } else { 10 }, a),
+        (None, None) => if big { (6, 2) } else { (10, 4) },
+    };
     let settings = experts::Settings {
         bank: args.bank,
-        prefetch: args.prefetch,
-        ahead: args.ahead.max(1),
+        prefetch,
+        ahead: ahead.max(1),
         readers: args.readers,
         routes: routes.is_dir().then_some(routes),
         learned: Some(learned.clone()),
