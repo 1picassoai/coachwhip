@@ -4,15 +4,22 @@
 
 **Run mixture-of-experts models that are bigger than your memory.**
 
-An 80B model, running comfortably on a 16 GB Mac; a 122B model too, after a squeeze of a few minutes on your own Mac. Coachwhip never needs the whole model in memory, because a mixture-of-experts model never needs the whole model for one word.
+**A 122B model on a 16 GB Mac.** Qwen3.5-122B-A10B, squeezed once on your own Mac from the publisher's file; the 80B and the 35B run too. Coachwhip never needs the whole model in memory, because a mixture-of-experts model never needs the whole model for one word.
+
+Fast mode on a 16 GB Mac mini M4, bank 40:
+
+| Tokens | Speed | Coachwhip uses | Left for macOS and your apps |
+|---|---|---|---|
+| 6,000-token answer | 4.2 tok/s | 11.2 GB | 2.3 GB at its tightest |
+| 12,000-token prompt | 4.3 tok/s | 12.8 GB | 1.5 GB at its tightest |
 
 One Rust binary. Everything on the GPU. Nothing leaves your machine.
 
-**New in 0.4.0** ([release notes](docs/releases/0.4.0.md)): **Qwen3.5-122B-A10B on a 16 GB Mac**, squeezed once on your own Mac from the publisher's file; its speed and memory are in [The 122B](#the-122b). Coachwhip now keeps itself inside your Mac's memory: it picks the bank that fits and warns you when macOS is short. Every model's numbers, how they were measured and a quality check per file: [docs/MODELS.md](docs/MODELS.md).
+**New in 0.4.0** ([release notes](docs/releases/0.4.0.md)): **Qwen3.5-122B-A10B on a 16 GB Mac**, squeezed once on your own Mac from the publisher's file; how to set it up is in [The 122B](#the-122b). Coachwhip now keeps itself inside your Mac's memory: it picks the bank that fits and warns you when macOS is short. Every model's numbers, how they were measured and a quality check per file: [docs/MODELS.md](docs/MODELS.md).
 
 **Tried it? Tell us how it ran**, good or bad, especially if it was slow, the fan worked hard, or it ran hot. [Open an issue](https://github.com/1picassoai/coachwhip/issues) with your Mac (chip and memory), macOS version, the model file, the `--bank` you used, and the speed line the chat page shows under each answer. Questions and ideas are welcome there too.
 
-<p align="center"><img src="docs/coachwhip-demo.gif" alt="Qwen3.6-35B-A3B writing TypeScript in the Coachwhip chat on a 16 GB Mac, at 6 tok/s" width="720"></p>
+<p align="center"><img src="docs/coachwhip-demo.gif" alt="Qwen3.5-122B-A10B writing TypeScript in the Coachwhip chat on a 16 GB Mac mini, in real time" width="720"></p>
 
 ## Why it works
 
@@ -64,7 +71,6 @@ Coachwhip is an engine for MoE models, in GGUF format.
 | [Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) | qwen35moe | Tested, after `prepare` (see The 122B). |
 | Qwen3-30B-A3B, other Qwen3 MoE | qwen3moe | Supported. |
 | Qwen3.5 MoE, Qwen3.6-14B-A3B (community) | qwen35moe | Supported. The 14B fits in 16 GB on its own; Coachwhip does not make it faster. |
-| Mixtral, Qwen2-MoE, OLMoE, DeepSeek, gpt-oss, GLM | | Coming next. |
 
 Speed and a quality check for each model file, measured on a 16 GB Mac: [docs/MODELS.md](docs/MODELS.md).
 
@@ -136,12 +142,7 @@ Qwen3.5-122B-A10B is the biggest model Coachwhip runs on 16 GB, and it needs one
 
 **Fast mode changes the answers.** The model was trained to use 8 experts for every word; asking for 4 makes it write about twice as fast, and its answers can differ from what the full model would say. It is a choice, never the default. Both modes' speed and quality on our checks are in [docs/MODELS.md](docs/MODELS.md).
 
-Fast mode on a 16 GB Mac mini M4, bank 40:
-
-| Tokens | Speed | Coachwhip uses | Left for macOS and your apps |
-|---|---|---|---|
-| 6,000-token answer | 4.2 tok/s | 11.2 GB | 2.3 GB at its tightest |
-| 12,000-token prompt | 4.3 tok/s | 12.8 GB | 1.5 GB at its tightest |
+Its speed and memory are in the table at the top.
 
 ## Use
 

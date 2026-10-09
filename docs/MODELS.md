@@ -5,7 +5,7 @@ What each model file does on a 16 GB Mac, measured the same way every time. Thes
 ## How we measure
 
 - **Machine:** Mac mini M4, 16 GB, macOS 26.
-- **Engine:** Coachwhip 0.3.0 with its default settings (`--prefetch 10 --ahead 4`), temperature 0.
+- **Engine:** the version named in each section, with its default settings, temperature 0. The 80B and the 35B were measured on 0.3.0 (`--prefetch 10 --ahead 4`); the 122B on 0.4.0 (`--prefetch 6 --ahead 2`, its own default).
 - **Speed:** the five coding prompts in [`bench/speed/prompts.json`](../bench/speed/prompts.json), each a fresh conversation capped at 300 tokens, run by [`bench/speed/run.py`](../bench/speed/run.py). "Writing" is answer tokens per second from the first token to the last, the same thing the chat shows under each answer; the table gives the mean over the five prompts, with the slowest and fastest in brackets.
 - **Quality:** 8 small coding tasks in [`bench/quality/tasks.json`](../bench/quality/tasks.json). Each answer's code is run against tests the model never sees ([`bench/quality/tests.py`](../bench/quality/tests.py)); a task passes only if every test does. Quality depends on the model file, not on Coachwhip's settings: the bank and the prefetch change how fast an answer comes, never what it says.
 
@@ -22,6 +22,7 @@ What each model file does on a 16 GB Mac, measured the same way every time. Thes
 - **Why Q3_K_M is faster:** its experts are 1.6 MB instead of 2.0 MB, so each one read from the SSD arrives sooner, and the same bank memory holds 70 of them per layer instead of 56.
 - **Quality:** both files failed one task, a different one each. Q4_K_M's word wrap counted a space before the first word of each line; Q3_K_M's duration parser accepted a repeated unit (`1h1h`). Eight tasks is a small sample: treat it as "no difference found", not "no difference".
 - Both use the same [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next).
+- **On 0.4.0:** the Q3_K_M file was run again on the release build at bank 70 and answered correctly; the full speed and quality checks above were not repeated.
 
 ## Qwen3.6-35B-A3B
 
@@ -37,6 +38,7 @@ Measured 6 Oct 2026: one person, one run per bank, on the same Mac with a backgr
 - **Why bank 44, not 56:** the two banks write at the same speed (a 2,500-token thinking answer ran at 6.1 tok/s on both), but this model's non-expert part is heavier than the 80B's, and at bank 56 Coachwhip held about 7 GB against 5 GB at 44. On a 16 GB Mac, 56 ran the GPU out of memory once, on a long thinking answer that followed an earlier answer in the same chat. 44 leaves that room.
 - **Quality:** all eight tasks passed, including the duration parser that both 80B files got wrong. Eight tasks is a small sample.
 - Tokenizer: [tokenizer.json](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) from the model's own page.
+- **On 0.4.0:** not re-measured. Its code path is unchanged, but nobody has run it on the release build.
 
 ## Qwen3.5-122B-A10B
 
@@ -49,10 +51,10 @@ Fast mode (`--experts 4 --parallel`), Mac mini M4, 16 GB, bank 40:
 | 6,000-token answer | 4.2 tok/s | 11.2 GB | 2.3 GB at its tightest |
 | 12,000-token prompt | 4.3 tok/s | 12.8 GB | 1.5 GB at its tightest |
 
-Agent tasks through Aider, six of them in Python, TypeScript and Rust with hidden tests: fast mode passed 5 of 6, and exact mode passed the sixth. Exact mode (the model's own 8 experts) writes at about half that speed; the tester's figure goes here before the tag. If these cells still say "tester's run", the release was not signed.
+Measured 9 Oct 2026 on Coachwhip 0.4.0 by the tester, greedy. Exact mode (the model's own 8 experts, no `--experts`) wrote at 2.2 tok/s after the same 12,000-token prompt. Agent tasks through Aider, six of them in Python, TypeScript and Rust with hidden tests: fast mode passed 5 of 6, and exact mode passed the sixth.
 
 - **Why the squeeze:** at the file's own 4.9 MB per expert, 8 experts a word, the SSD cannot feed a 16 GB Mac faster than about 2 tok/s. At 3.4 MB per expert the same bank holds more and each read lands sooner.
-- **Why fast mode changes answers:** the model was trained to combine 8 experts per word; asking for 4 drops the four lightest. On the 8 coding tasks it passed 8 of 8 on 7 Oct 2026 (a different file, same recipe); the tester's run on this file is the figure that counts.
+- **Why fast mode changes answers:** the model was trained to combine 8 experts per word; asking for 4 drops the four lightest. The one agent task fast mode failed had a built-in contradiction: it argued with itself until it ran out of room, where exact mode solved it in one go.
 - Tokenizer: [tokenizer.json](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) from the model's own page.
 
 ## Not measured yet
