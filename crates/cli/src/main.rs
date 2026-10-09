@@ -146,6 +146,9 @@ fn main() -> Result<()> {
 
     let started = std::time::Instant::now();
     let mut model = model::Model::load(&args.model, &device, &settings)?;
+    if let Some((used, max)) = coachwhip_engine::gpu_sync::gpu_memory(&device) {
+        eprintln!("coachwhip: memlog after load: {:.2} GB of {:.2} GB", used as f64 / 1e9, max as f64 / 1e9);
+    }
     eprintln!("coachwhip: model ready in {:.1} s", started.elapsed().as_secs_f64());
     let tokenizer = Tokenizer::from_file(&args.tokenizer).map_err(anyhow::Error::msg)?;
     let sampling = if args.temperature <= 0.0 {
@@ -167,6 +170,9 @@ fn main() -> Result<()> {
         Ok(())
     };
     let a = chat::generate(&mut model, &tokenizer, &device, &mut chat::Session::default(), true, &prompt, args.think, args.max_tokens, &sampling, None, &mut emit)?;
+    if let Some((used, max)) = coachwhip_engine::gpu_sync::gpu_memory(&device) {
+        eprintln!("coachwhip: memlog after answer: {:.2} GB of {:.2} GB", used as f64 / 1e9, max as f64 / 1e9);
+    }
     eprintln!(
         "\n\ncoachwhip: read {} tokens at {:.1} tok/s, wrote {} at {:.1} tok/s",
         a.prompt_tokens, a.read_tps, a.written, a.write_tps

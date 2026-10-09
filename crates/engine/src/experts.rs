@@ -93,6 +93,28 @@ pub struct Slots {
     pub prefetched: HashSet<u32>,
 }
 
+/// A zeroed quantised buffer of exactly `elems` weights, outside candle's power-of-two rounding.
+fn exact_zeros(metal: &MetalDevice, elems: usize, dtype: GgmlDType) -> Result<QMetalStorage> {
+    use candle::quantized::k_quants::{BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K, GgmlType};
+    use candle::quantized::metal::load_quantized;
+    if std::env::var("COACHWHIP_POOLED_BANK").map(|v| v == "1").unwrap_or(false) {
+        return QMetalStorage::zeros(metal, elems, dtype);
+    }
+    let n = elems / dtype.block_size();
+    let q = match dtype {
+        GgmlDType::Q2K => load_quantized(metal, &vec![BlockQ2K::zeros(); n])?,
+        GgmlDType::Q3K => load_quantized(metal, &vec![BlockQ3K::zeros(); n])?,
+        GgmlDType::Q4K => load_quantized(metal, &vec![BlockQ4K::zeros(); n])?,
+        GgmlDType::Q5K => load_quantized(metal, &vec![BlockQ5K::zeros(); n])?,
+        GgmlDType::Q6K => load_quantized(metal, &vec![BlockQ6K::zeros(); n])?,
+        _ => return QMetalStorage::zeros(metal, elems, dtype),
+    };
+    match q {
+        candle::quantized::QStorage::Metal(s) => Ok(s),
+        _ => candle::bail!("exact bank: not a Metal buffer"),
+    }
+}
+
 /// What one forward needs from a layer's bank: the experts already there and the ones to read in.
 #[derive(Debug, Default, PartialEq)]
 pub struct Plan {
@@ -1207,7 +1229,7 @@ impl ExpertStore {
             } else {
                 (s.dtype, s.bytes)
             };
-            let storage = QMetalStorage::zeros(&self.metal, elems * self.per_layer, dtype)?;
+            let storage = exact_zeros(&self.metal, elems * self.per_layer, dtype)?;
             let base = storage.buffer().contents() as usize;
             if base == 0 {
                 candle::bail!("Metal gave a buffer the CPU cannot write to");

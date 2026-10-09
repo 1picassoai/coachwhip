@@ -190,6 +190,13 @@ impl GpuEvent {
     }
 }
 
+/// GPU memory in use and the working-set limit macOS recommends, in bytes.
+pub fn gpu_memory(device: &candle::Device) -> Option<(u64, u64)> {
+    let candle::Device::Metal(m) = device else { return None };
+    let d = m.device().as_ref();
+    Some((d.currentAllocatedSize() as u64, d.recommendedMaxWorkingSetSize()))
+}
+
 /// Commit the work encoded so far, so it runs and completes without waiting for anything later.
 pub fn flush() -> Result<()> {
     let commands = Commands::current().ok_or_else(|| candle::Error::Msg("no Metal command queue in use yet".into()))?;
