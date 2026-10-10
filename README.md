@@ -84,7 +84,7 @@ Try other MoE models and tell us what happens. If a model's architecture is not 
 |---|---|---|---|
 | Mac | Apple silicon, M4 or later recommended; M1 to M3 run it slower. Tested on a Mac mini M4. | the same | the same |
 | Memory | 16 GB | 16 GB; 24 GB has room to spare | 16 GB |
-| Disk | 59 GB for the download plus 46 GB for the squeezed file, 3 GB for the build | 39 GB (Q3_K_M) or 49 GB (Q4_K_M) for the model, 3 GB for the build | 19 GB for the model, 3 GB for the build |
+| Disk | 105 GB free while squeezing, 46 GB once you delete the download; 3 GB for the build | 39 GB (Q3_K_M) or 49 GB (Q4_K_M) for the model, 3 GB for the build | 19 GB for the model, 3 GB for the build |
 | macOS | Tested on macOS 26 | the same | the same |
 
 ## Install
@@ -125,15 +125,21 @@ The Q3_K_M file writes faster than Q4_K_M on a 16 GB Mac, and the two scored the
 Qwen3.5-122B-A10B is the biggest model Coachwhip runs on 16 GB, and it needs one extra step: its experts are too big to stream fast as they come, so Coachwhip squeezes the file once, on your Mac.
 
 1. Download the publisher's [Q3_K_M GGUF](https://huggingface.co/mradermacher/Qwen3.5-122B-A10B-GGUF) (59 GB) and the model's [tokenizer.json](https://huggingface.co/Qwen/Qwen3.5-122B-A10B).
-2. Squeeze it. About 5 to 9 minutes on an M4. It writes a second file beside the first and leaves the download untouched, so you need about **105 GB free** before you start: the 59 GB download and the 46 GB squeezed file both exist until you delete the original:
+2. Squeeze it. About 5 to 9 minutes on an M4. You need about **105 GB free** while it runs: the 59 GB download and the 46 GB squeezed file sit side by side.
 
 ```sh
 ~/coachwhip/target/release/coachwhip-prepare ~/Downloads/Qwen3.5-122B-A10B.Q3_K_M.gguf ~/Downloads/Qwen3.5-122B-A10B.Q2X.gguf
 ```
 
-   The squeeze takes each expert's gate and up matrices to Q2_K on the GPU and its down matrix to Q3_K; everything else in the file is copied as it is. Nothing is downloaded from us, and you can delete the original afterwards if you want the disk back.
+   The squeeze takes each expert's gate and up matrices to Q2_K on the GPU and its down matrix to Q3_K; everything else in the file is copied as it is. Nothing is downloaded from us.
 
-3. Start it in one of two modes, bank 40. If your Mac cannot hold a long chat at that size, Coachwhip says so and uses less:
+3. Delete the download. Coachwhip only uses the squeezed file, and keeping both takes about 105 GB:
+
+```sh
+rm ~/Downloads/Qwen3.5-122B-A10B.Q3_K_M.gguf
+```
+
+4. Start it in one of two modes, bank 40. If your Mac cannot hold a long chat at that size, Coachwhip says so and uses less:
 
 ```sh
 # exact: the model's own 8 experts per word
