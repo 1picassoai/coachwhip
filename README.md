@@ -1,5 +1,10 @@
 <p align="center"><img src="docs/coachwhip.png" alt="A coachwhip snake on sand" width="720"></p>
 
+<p align="center">
+  <a href="https://github.com/1picassoai/coachwhip/releases/latest"><img src="https://img.shields.io/github/v/release/1picassoai/coachwhip" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/1picassoai/coachwhip" alt="License: Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/macOS-Apple%20silicon-black?logo=apple" alt="macOS on Apple silicon"></p>
+
 # Coachwhip
 
 **Run mixture-of-experts models that are bigger than your memory.**
