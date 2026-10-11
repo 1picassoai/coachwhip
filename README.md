@@ -20,6 +20,8 @@ Fast mode on a 16 GB Mac mini M4, bank 40:
 
 One Rust binary. Everything on the GPU. Nothing leaves your machine.
 
+**New in 0.4.1** ([release notes](docs/releases/0.4.1.md)): **install in under a minute.** The installer downloads a ready-built Coachwhip; nothing to compile.
+
 **New in 0.4.0** ([release notes](docs/releases/0.4.0.md)): **Qwen3.5-122B-A10B on a 16 GB Mac**, squeezed once on your own Mac from the publisher's file; how to set it up is in [The 122B](#the-122b). Coachwhip now keeps itself inside your Mac's memory: it picks the bank that fits and warns you when macOS is short. Every model's numbers, how they were measured and a quality check per file: [docs/MODELS.md](docs/MODELS.md).
 
 **Tried it? Tell us how it ran**, good or bad, especially if it was slow, the fan worked hard, or it ran hot. [Open an issue](https://github.com/1picassoai/coachwhip/issues) with your Mac (chip and memory), macOS version, the model file, the `--bank` you used, and the speed line the chat page shows under each answer. Questions and ideas are welcome there too.
@@ -89,7 +91,7 @@ Try other MoE models and tell us what happens. If a model's architecture is not 
 |---|---|---|---|
 | Mac | Apple silicon, M4 or later recommended; M1 to M3 run it slower. Tested on a Mac mini M4. | the same | the same |
 | Memory | 16 GB | 16 GB; 24 GB has room to spare | 16 GB |
-| Disk | 105 GB free while squeezing, 46 GB once you delete the download; 3 GB for the build | 39 GB (Q3_K_M) or 49 GB (Q4_K_M) for the model, 3 GB for the build | 19 GB for the model, 3 GB for the build |
+| Disk | 105 GB free while squeezing, 46 GB once you delete the download; 15 MB for Coachwhip | 39 GB (Q3_K_M) or 49 GB (Q4_K_M) for the model, 15 MB for Coachwhip | 19 GB for the model, 15 MB for Coachwhip |
 | macOS | Tested on macOS 26 | the same | the same |
 
 ## Install
@@ -100,9 +102,9 @@ One line in Terminal:
 curl -fsSL https://raw.githubusercontent.com/1picassoai/coachwhip/main/install.sh | bash
 ```
 
-It checks your Mac, installs what is missing (Apple's command line tools, Rust) and builds Coachwhip into `~/coachwhip`, in about 10 minutes. Run it again at any time: it skips whatever is already done.
+It checks your Mac and downloads the ready-built Coachwhip into `~/coachwhip`, in under a minute. Nothing to compile, no Rust. Run it again at any time to update to the latest release.
 
-If a window asks to install Apple's command line tools, finish it and run the line again.
+To build from source instead, run it with `COACHWHIP_FROM_SOURCE=1` in front of `bash`: it installs Apple's command line tools and Rust if they are missing, and the build takes about 10 minutes.
 
 ## Bring a model
 
