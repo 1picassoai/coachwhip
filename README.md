@@ -147,7 +147,7 @@ The Q3_K_M file writes faster than Q4_K_M on a 16 GB Mac, and the two scored the
 OpenAI's gpt-oss-120b: 117 billion parameters, 4 of its 128 experts for each word in each of its 36 layers. It thinks before it answers, and the chat page shows the thinking.
 
 1. Download the official [MXFP4 GGUF](https://huggingface.co/ggml-org/gpt-oss-120b-GGUF) (63.4 GB) and the model's [tokenizer.json](https://huggingface.co/openai/gpt-oss-120b).
-2. Squeeze it. You need about **106 GB free** while it runs: the 63 GB download and the 43 GB squeezed file sit side by side.
+2. Squeeze it. About 13 minutes on an M4. You need about **106 GB free** while it runs: the 63 GB download and the 43 GB squeezed file sit side by side.
 
 ```sh
 ~/coachwhip/target/release/coachwhip-prepare ~/Downloads/gpt-oss-120b-MXFP4.gguf ~/Downloads/gpt-oss-120b.Q2A.gguf

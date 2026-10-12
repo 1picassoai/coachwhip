@@ -11,7 +11,7 @@ What each model file does on a 16 GB Mac, measured the same way every time. Thes
 
 ## gpt-oss-120b
 
-OpenAI's open model (architecture `gpt-oss`): 36 layers, 128 experts of which 4 are used per word; it thinks before it answers. It runs from a **squeezed file** that `coachwhip-prepare` makes on your Mac from the official [MXFP4 GGUF](https://huggingface.co/ggml-org/gpt-oss-120b-GGUF) (63.4 GB): every expert matrix to Q2_K, rows padded to whole 256-weight blocks, the rest untouched; 42.6 GB written, about 106 GB free needed while both files exist. See the README, gpt-oss-120b.
+OpenAI's open model (architecture `gpt-oss`): 36 layers, 128 experts of which 4 are used per word; it thinks before it answers. It runs from a **squeezed file** that `coachwhip-prepare` makes on your Mac from the official [MXFP4 GGUF](https://huggingface.co/ggml-org/gpt-oss-120b-GGUF) (63.4 GB): every expert matrix to Q2_K, rows padded to whole 256-weight blocks, the rest untouched; 42.6 GB written in about 13 minutes on an M4, about 106 GB free needed while both files exist. See the README, gpt-oss-120b.
 
 Mac mini M4, 16 GB, `--parallel --flash-reads`, bank 25 (the Wrangler's pick), temperature 0. Measured on one coding task, a cancellable async task pool in TypeScript (about 4,000 words of thinking and code), against 20 hidden checks:
 
