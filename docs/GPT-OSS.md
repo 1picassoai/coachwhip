@@ -29,6 +29,64 @@ Speed on a 16 GB Mac is set by one thing: how many bytes each word reads from th
 - **Stand-ins (`--stand-ins`).** A word's first pick is always read for real, and so is the second whenever the router gives it at least 0.3 of the weight. A lighter pick that is not in the bank is replaced by the best expert that is, by the router's own scores, and the weights are recomputed over the experts actually used. The substitute is used only when its router score is within 1.0 of the real pick's (logits); a pick that far ahead of every expert in the bank is read for real. Bank hits go from about 78% to about 97%, and the bytes read per word fall by about seven-eighths.
 - **Lean attention.** gpt-oss looks back only 128 words on every other layer; those layers keep only that window, and the shared keys are never copied out per head.
 
+## The task, and what it wrote
+
+This is the prompt every score on this page comes from. It asks for a piece of production code with several things that have to be right at once: a dependency graph with cycle checks, a concurrency limit, cancellation through `AbortSignal`, and failures that cascade without running the dependants.
+
+> Implement a generic, cancellable asynchronous task execution pool in TypeScript with dependency resolution.
+> 
+> ### Requirements:
+> 
+> 1. **Task Definition & Dependencies:**
+>    - Each task has an `id: string`, optional `dependencies: string[]` (task IDs that must successfully complete first), and an `execute: (signal: AbortSignal) => Promise<T>`.
+>    - Before running any task, validate the dependency graph. Throw an `Error` if circular dependencies or references to non-existent tasks exist.
+> 
+> 2. **Concurrency & Execution:**
+>    - Accept a `concurrency: number` limit. At no point should more than `concurrency` tasks run in parallel.
+>    - Tasks must run as soon as a concurrency slot is available and all their dependencies have completed with `fulfilled` status.
+> 
+> 3. **Cancellation & Cascade Failures:**
+>    - Provide a `cancel(reason?: string)` method that aborts all actively executing tasks via their `AbortSignal` and cancels all pending tasks.
+>    - If any task fails (`rejected`) or is aborted (`cancelled`), any downstream dependent tasks must automatically be marked as `cancelled` without calling their `execute` function.
+> 
+> 4. **Return Value:**
+>    - `run()` must resolve to a `Map<string, TaskResult<unknown>>`, where:
+>      ```typescript
+>      type TaskStatus = 'fulfilled' | 'rejected' | 'cancelled';
+> 
+>      interface TaskResult<T unknown> {
+>        id: string;
+>        status: TaskStatus;
+>        value?: T;
+>        error?: unknown;
+>      }
+>      ```
+
+**What gpt-oss-120b wrote in fast mode, at 9.8 tok/s:** [gpt-oss-task-pool.ts](gpt-oss-task-pool.ts), 338 lines, taken from one of the three runs. The whole answer was 7,319 words, thinking included, and took 747 s on the Mac mini. That answer passed all 20 hidden checks; the other two runs passed 15 and 19.
+
+The 20 checks the code is run against (4 to a point), none of which the model sees:
+
+1. missing dependency throws
+2. cycle throws
+3. chain runs in order with values
+4. no task runs twice
+5. concurrency limit holds
+6. diamond completes
+7. failure cancels dependants without running them
+8. rejected keeps its error
+9. cancel aborts running and skips pending
+10. every id in the result map
+11. cancel before run: nothing runs, all cancelled
+12. cancel with a task that ignores its signal: run still resolves, task cancelled
+13. a synchronous throw is rejected and the pool carries on
+14. an empty task list resolves to an empty map
+15. a bad graph runs nothing
+16. a deep cascade cancels every level, the independent branch finishes
+17. 30 tasks at concurrency 3 use every slot and never more
+18. a diamond at concurrency 1 runs in a valid order
+19. cancel twice and after the end is harmless
+20. one late failure cancels a task that waits on two
+
 ## Its chat format
 
 gpt-oss speaks OpenAI's harmony format, with an analysis channel for its thinking and a final channel for the answer. The chat page shows the thinking in a box above the answer; the OpenAI-compatible API returns only the final answer.
