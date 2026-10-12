@@ -15,7 +15,7 @@ gpt-oss-120b on a 16 GB Mac mini M4, writing a TypeScript task (about 4,000 word
 
 | Mode | Speed | Score |
 |---|---|---|
-| Fast mode, `--stand-ins` | about 10 tok/s | 4.0 of 5 |
+| Fast mode, `--stand-ins` | about 10 tok/s | 4.5 of 5, three runs (5.0, 3.8, 4.8) |
 | The model's own 4 experts | about 4.2 tok/s | 4.8 of 5 |
 
 How to set it up is in [gpt-oss-120b](#gpt-oss-120b).
@@ -165,13 +165,13 @@ rm ~/Downloads/gpt-oss-120b-MXFP4.gguf
 
 ```sh
 # the model's own 4 experts per word, every one read for real
-~/coachwhip/coachwhip.sh ~/Downloads/gpt-oss-120b.Q2A.gguf ~/Downloads/tokenizer.json 25 8090 --parallel --flash-reads
+~/coachwhip/coachwhip.sh ~/Downloads/gpt-oss-120b.Q2A.gguf ~/Downloads/tokenizer.json 25 8090 --parallel --flash-reads --max-tokens 8000
 
 # fast: stand-ins for the light picks that are not in the bank
-~/coachwhip/coachwhip.sh ~/Downloads/gpt-oss-120b.Q2A.gguf ~/Downloads/tokenizer.json 25 8090 --parallel --flash-reads --stand-ins
+~/coachwhip/coachwhip.sh ~/Downloads/gpt-oss-120b.Q2A.gguf ~/Downloads/tokenizer.json 25 8090 --parallel --flash-reads --stand-ins --max-tokens 8000
 ```
 
-**Fast mode changes the answers.** A word's first expert is always read for real, and so is its second whenever the router gives it at least 0.3 of the weight. A lighter pick that is not already in the bank is replaced by the best expert that is, by the router's own scores, instead of being read from the SSD. Measured on one coding task, it wrote about 2.4 times as fast and scored 4.0 of 5 against 4.8. It is a choice, never the default.
+**Fast mode changes the answers.** A word's first expert is always read for real, and so is its second whenever the router gives it at least 0.3 of the weight. A lighter pick that is not already in the bank is replaced by the best expert that is, by the router's own scores, instead of being read from the SSD, and only when that expert's score is close to the real pick's; otherwise the real one is read. Measured on one coding task over three runs, it wrote about 2.4 times as fast and scored 5.0, 3.8 and 4.8 of 5, against the full model's 4.8. It is a choice, never the default. `--max-tokens 8000` gives its thinking room; the default of 4,000 can cut a long answer short.
 
 Every setup we measured, what makes it fast and how the scores were taken: [docs/GPT-OSS.md](docs/GPT-OSS.md).
 

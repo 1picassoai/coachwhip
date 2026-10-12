@@ -2175,6 +2175,13 @@ fn stand_in_keep(k: usize) -> usize {
     std::env::var("COACHWHIP_STANDIN_KEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(k / 2).clamp(1, k.max(1))
 }
 
+/// Lab (`COACHWHIP_STANDIN_GAP=<g>`): a stand-in only when its router score is within g of the real
+/// pick's; a pick that far ahead of every expert in the bank is read for real.
+fn stand_in_gap() -> Option<f32> {
+    static V: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("COACHWHIP_STANDIN_GAP").ok().and_then(|v| v.parse().ok()))
+}
+
 /// Lab (`COACHWHIP_STANDIN_W=<w>`): with more than two picks, the second stays real when its weight is
 /// at least w, else only the first does. Off: `COACHWHIP_STANDIN_KEEP` rules.
 fn stand_in_w() -> Option<f32> {
@@ -2303,6 +2310,17 @@ impl StreamedMoe {
                     heavy.where_cond(&with_keep(2)?, &with_keep(1)?)?
                 }
                 None => with_keep(stand_in_keep(k))?,
+            };
+            // The gap: a substitute too far below its real pick is not used; the real one is read.
+            let ids = match stand_in_gap() {
+                Some(gap) => {
+                    let real_ids = top_ids.contiguous()?;
+                    let real = logits.gather(&real_ids, D::Minus1)?;
+                    let sub = logits.gather(&ids, D::Minus1)?;
+                    let close = (real - sub)?.to_dtype(DType::F32)?.le(gap)?;
+                    close.where_cond(&ids, &real_ids)?
+                }
+                None => ids,
             };
             let w = candle_nn::ops::softmax_last_dim(&logits.gather(&ids, D::Minus1)?)?;
             return Ok((ids, w));
@@ -2519,7 +2537,7 @@ impl StreamedMoe {
             for p in keep..row.len() {
                 if !resident.contains(&row[p]) && (row.len() > 2 || w0[p] < stand_in_limit()) {
                     let best = resident.iter().copied().filter(|e| !row.contains(e)).max_by(|a, b| scores[*a as usize].partial_cmp(&scores[*b as usize]).unwrap_or(std::cmp::Ordering::Equal));
-                    if let Some(e) = best {
+                    if let Some(e) = best.filter(|&e| stand_in_gap().map_or(true, |g| scores[row[p] as usize] - scores[e as usize] <= g)) {
                         row[p] = e;
                         self.store.stats.lock().unwrap().stand_ins += 1;
                     }

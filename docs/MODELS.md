@@ -17,13 +17,13 @@ Mac mini M4, 16 GB, `--parallel --flash-reads`, bank 25 (the Wrangler's pick), t
 
 | Mode | Writing | Score of 5 | Second version of the task |
 |---|---|---|---|
-| Fast, `--stand-ins` | 9.8 tok/s | 4.0 | 4.0 at 10.0 tok/s |
+| Fast, `--stand-ins` | 9.6 to 10.5 tok/s, three runs | 5.0, 3.8, 4.8 (mean 4.5) | not run with the shipped setting |
 | The model's own 4 experts | 4.2 tok/s | 4.8 | |
 
 This model is measured on its own task, not the five-prompt speed set above: its thinking makes 300-token answers mostly thinking. Every setup we measured, and what makes it fast: [GPT-OSS.md](GPT-OSS.md).
 
 - **Why the squeeze:** at MXFP4's 13.2 MB per expert the bank holds 15 experts a layer; at Q2_K's 8.7 MB it holds 25. On the task above the squeezed file scores the same as the original download.
-- **Why fast mode changes answers:** a light pick that is not in the bank is replaced by the best expert that is. The first pick is always read for real, and the second whenever it carries at least 0.3 of the weight.
+- **Why fast mode changes answers:** a light pick that is not in the bank is replaced by the best expert that is. The first pick is always read for real, and the second whenever it carries at least 0.3 of the weight; a substitute is used only when its router score is close to the real pick's.
 - Tokenizer: [tokenizer.json](https://huggingface.co/openai/gpt-oss-120b) from the model's own page.
 
 ## Qwen3.5-122B-A10B

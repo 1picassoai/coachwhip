@@ -101,8 +101,9 @@ struct Args {
 
     /// Stand-ins (gpt-oss): a light pick that is not in the bank is replaced by the best expert
     /// that is, by the router's own scores. The first pick is always read for real, and the second
-    /// whenever the router gives it at least 0.3 of the weight. Fewer reads; the answers change,
-    /// so check them for your use.
+    /// whenever the router gives it at least 0.3 of the weight, and a substitute is used only when its
+    /// router score is close to the real pick's. Fewer reads; the answers change, so check them for
+    /// your use.
     #[arg(long)]
     stand_ins: bool,
 
@@ -133,6 +134,11 @@ fn main() -> Result<()> {
         std::env::set_var("COACHWHIP_STANDIN", "1");
         if std::env::var("COACHWHIP_STANDIN_W").is_err() {
             std::env::set_var("COACHWHIP_STANDIN_W", "0.3");
+        }
+        // A substitute more than this far below its real pick (router logits) is not used; the
+        // real expert is read. Three exam runs at 1.0 scored 5.0, 3.8 and 4.8; without it 4.0, 4.0, 0.8.
+        if std::env::var("COACHWHIP_STANDIN_GAP").is_err() {
+            std::env::set_var("COACHWHIP_STANDIN_GAP", "1.0");
         }
     }
     if args.flash_reads {

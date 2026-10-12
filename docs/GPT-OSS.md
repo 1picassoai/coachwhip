@@ -11,11 +11,12 @@ All numbers here: Mac mini M4, 16 GB, macOS 26, the squeezed file (`prepare`, ev
 | 4 experts, all read for real | 4.2 tok/s | 4.8 | |
 | 3 experts, all read for real | 5.6 tok/s | 4.5 | |
 | 4 experts, the first 2 real, stand-ins for the rest | 7.8 tok/s | 4.5 | 3.5 (7.9 tok/s) |
-| **4 experts, stand-ins by weight (`--stand-ins`)** | **9.8 tok/s** | **4.0** | **4.0 (10.0 tok/s)** |
+| 4 experts, stand-ins by weight, no gap | 9.8 tok/s | 4.0 | 4.0 (10.0 tok/s) |
+| **4 experts, stand-ins by weight with the gap (`--stand-ins` as shipped), three runs** | **9.8, 10.5, 9.6 tok/s** | **5.0, 3.8, 4.8** | not run |
 | 4 experts, only the first real | 9.6 tok/s | 4.5 | 0.8 (10.2 tok/s) |
 | 2 experts | 7.1 tok/s | 0 (the code does not compile) | |
 
-`--stand-ins` is the only setup near 10 tok/s that held its score on both versions of the task. Reading fewer experts (3 or 2) costs more than standing in for the light ones: the model was trained to use 4.
+`--stand-ins` as shipped is the only setup near 10 tok/s whose every run compiled and scored above 3.8. Without the gap, one run in three broke its file on a one-character slip (a run scored 0.8 before the gap was added). Reading fewer experts (3 or 2) costs more than standing in for the light ones: the model was trained to use 4.
 
 ## What makes it fast
 
@@ -25,7 +26,7 @@ Speed on a 16 GB Mac is set by one thing: how many bytes each word reads from th
 - **The expert bank.** Recently used experts stay on the GPU and are reused; with every expert read for real, about 4 picks in 5 are already there.
 - **The early guess.** While the GPU works on one layer, Coachwhip runs the router of a later layer on the same input and reads the experts it will want; for gpt-oss, 2 guesses a layer, 2 layers ahead.
 - **Flash reads (`--flash-reads`).** Experts are read straight from the SSD, past macOS's page cache.
-- **Stand-ins (`--stand-ins`).** A word's first pick is always read for real, and so is the second whenever the router gives it at least 0.3 of the weight. A lighter pick that is not in the bank is replaced by the best expert that is, by the router's own scores, and the weights are recomputed over the experts actually used. Bank hits go from about 78% to about 97%, and the bytes read per word fall by about seven-eighths.
+- **Stand-ins (`--stand-ins`).** A word's first pick is always read for real, and so is the second whenever the router gives it at least 0.3 of the weight. A lighter pick that is not in the bank is replaced by the best expert that is, by the router's own scores, and the weights are recomputed over the experts actually used. The substitute is used only when its router score is within 1.0 of the real pick's (logits); a pick that far ahead of every expert in the bank is read for real. Bank hits go from about 78% to about 97%, and the bytes read per word fall by about seven-eighths.
 - **Lean attention.** gpt-oss looks back only 128 words on every other layer; those layers keep only that window, and the shared keys are never copied out per head.
 
 ## Its chat format
