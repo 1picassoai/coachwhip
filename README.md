@@ -7,11 +7,17 @@
 
 # Coachwhip
 
-**Run mixture-of-experts models that are bigger than your memory, on your own Mac.**
+**OpenAI's gpt-oss-120b on a 16 GB Mac, at about 10 tok/s. Fully offline. Nothing leaves your machine.**
 
-Coachwhip is one Rust binary. It takes a model file in GGUF format, keeps the part of the model every word needs on the GPU, and streams the rest from the SSD as each word asks for it. A 120-billion-parameter model runs on a 16 GB Mac. Which models, how fast, and how to set each one up: [docs/MODELS.md](docs/MODELS.md).
+```sh
+curl -fsSL https://raw.githubusercontent.com/1picassoai/coachwhip/main/install.sh | bash
+```
 
 <p align="center"><img src="docs/coachwhip-demo-gptoss.gif" alt="gpt-oss-120b thinking, then writing TypeScript in the Coachwhip chat on a 16 GB Mac mini, in real time" width="720"></p>
+
+That is the real chat page on a Mac mini M4 with 16 GB, in real time: the model thinks, then writes. One line installs Coachwhip in under a minute; then download the model file once and squeeze it on your own Mac, as in [gpt-oss-120b](docs/MODELS.md#gpt-oss-120b). Qwen's MoE models run too: [docs/MODELS.md](docs/MODELS.md).
+
+Coachwhip is one Rust binary. It takes a model file in GGUF format, keeps the part of the model every word needs on the GPU, and streams the rest from the SSD as each word asks for it. The model stays big; only its working set is in memory.
 
 ## Why we built it
 
