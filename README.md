@@ -9,9 +9,18 @@
 
 **Run mixture-of-experts models that are bigger than your memory.**
 
-**A 122B model on a 16 GB Mac.** Qwen3.5-122B-A10B, squeezed once on your own Mac from the publisher's file; the 80B and the 35B run too. Coachwhip never needs the whole model in memory, because a mixture-of-experts model never needs the whole model for one word.
+**OpenAI's gpt-oss-120b on a 16 GB Mac, at about 10 tok/s.** Squeezed once on your own Mac from the official file. Qwen3.5-122B-A10B, the 80B and the 35B run too. Coachwhip never needs the whole model in memory, because a mixture-of-experts model never needs the whole model for one word.
 
-Fast mode on a 16 GB Mac mini M4, bank 40:
+gpt-oss-120b on a 16 GB Mac mini M4, writing a TypeScript task (about 4,000 words of thinking and code, temperature 0), scored on 20 hidden checks:
+
+| Mode | Speed | Score |
+|---|---|---|
+| Fast mode, `--stand-ins` | about 10 tok/s | 4.0 of 5 |
+| The model's own 4 experts | about 4.2 tok/s | 4.8 of 5 |
+
+How to set it up is in [gpt-oss-120b](#gpt-oss-120b).
+
+Qwen3.5-122B-A10B, fast mode on the same Mac, bank 40:
 
 | Tokens | Speed | Coachwhip uses | Left for macOS and your apps |
 |---|---|---|---|
@@ -19,6 +28,8 @@ Fast mode on a 16 GB Mac mini M4, bank 40:
 | 12,000-token prompt | 4.3 tok/s | 12.8 GB | 1.5 GB at its tightest |
 
 One Rust binary. Everything on the GPU. Nothing leaves your machine.
+
+**New in 0.5.0** ([release notes](docs/releases/0.5.0.md)): **gpt-oss-120b**, OpenAI's open model, thinking included, at about 10 tok/s in fast mode; set up in [gpt-oss-120b](#gpt-oss-120b).
 
 **New in 0.4.1** ([release notes](docs/releases/0.4.1.md)): **install in under a minute.** The installer downloads a ready-built Coachwhip; nothing to compile.
 
@@ -71,6 +82,7 @@ Coachwhip is an engine for MoE models, in GGUF format.
 
 | Model | Architecture | Status |
 |---|---|---|
+| [gpt-oss-120b](https://huggingface.co/openai/gpt-oss-120b) | gpt-oss | Tested, after `prepare` (see gpt-oss-120b). Thinks before it answers. |
 | [Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) | qwen35moe | Tested, after `prepare` (see The 122B). |
 | [Qwen3-Coder-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) | qwen3moe | Tested. |
 | [Qwen3-Coder-Next](https://huggingface.co/Qwen/Qwen3-Coder-Next) (80B) | qwen3next | Tested. See below for the file to use. |
@@ -83,16 +95,16 @@ Speed and a quality check for each model file, measured on a 16 GB Mac: [docs/MO
 
 Try other MoE models and tell us what happens. If a model's architecture is not supported yet, Coachwhip says so, and an issue is the fastest way to move it up the list.
 
-**Which GGUF file.** Coachwhip reads the standard GGUF quantisations (Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, F16). Some newer conversions store a few tensors in MXFP4 or fuse the attention weights into one tensor; Coachwhip does not read those yet. For Qwen3-Coder-Next, [MaziyarPanahi's Q3_K_M and Q4_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) load as is.
+**Which GGUF file.** Coachwhip reads the standard GGUF quantisations (Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, F16). gpt-oss ships in MXFP4, which `prepare` reads and squeezes. Some newer Qwen conversions store a few tensors in MXFP4 or fuse the attention weights into one tensor; Coachwhip does not read those yet. For Qwen3-Coder-Next, [MaziyarPanahi's Q3_K_M and Q4_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) load as is.
 
 ## What you need
 
-| | 122B | 80B | 30B |
-|---|---|---|---|
-| Mac | Apple silicon, M4 or later recommended; M1 to M3 run it slower. Tested on a Mac mini M4. | the same | the same |
-| Memory | 16 GB | 16 GB; 24 GB has room to spare | 16 GB |
-| Disk | 105 GB free while squeezing, 46 GB once you delete the download; 15 MB for Coachwhip | 39 GB (Q3_K_M) or 49 GB (Q4_K_M) for the model, 15 MB for Coachwhip | 19 GB for the model, 15 MB for Coachwhip |
-| macOS | Tested on macOS 26 | the same | the same |
+| | gpt-oss-120b | 122B | 80B | 30B |
+|---|---|---|---|---|
+| Mac | Apple silicon, M4 or later recommended; M1 to M3 run it slower. Tested on a Mac mini M4. | the same | the same | the same |
+| Memory | 16 GB | 16 GB | 16 GB; 24 GB has room to spare | 16 GB |
+| Disk | 106 GB free while squeezing, 43 GB once you delete the download; 15 MB for Coachwhip | 105 GB free while squeezing, 46 GB once you delete the download; 15 MB for Coachwhip | 39 GB (Q3_K_M) or 49 GB (Q4_K_M) for the model, 15 MB for Coachwhip | 19 GB for the model, 15 MB for Coachwhip |
+| macOS | Tested on macOS 26 | the same | the same | the same |
 
 ## Install
 
@@ -110,6 +122,8 @@ To build from source instead, run it with `COACHWHIP_FROM_SOURCE=1` in front of 
 
 Coachwhip is the engine; the model is yours. Any GGUF of a supported model works (see Models).
 
+**gpt-oss-120b:** download the official MXFP4 file and squeeze it once on your Mac, as in [gpt-oss-120b](#gpt-oss-120b).
+
 **Qwen3.5-122B-A10B:** download the publisher's file and squeeze it once on your Mac, as in [The 122B](#the-122b).
 
 **Qwen3-Coder-Next, the 80B coder, in its Q3_K_M file:** download the [Q3_K_M GGUF](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) (38 GB) and its [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next), then start it with a bank of 70:
@@ -122,10 +136,44 @@ The Q3_K_M file writes faster than Q4_K_M on a 16 GB Mac, and the two scored the
 
 | Model | GGUF file | Tokenizer | Bank on 16 GB |
 |---|---|---|---|
+| gpt-oss-120b, after `prepare` | [ggml-org MXFP4](https://huggingface.co/ggml-org/gpt-oss-120b-GGUF) | [tokenizer.json](https://huggingface.co/openai/gpt-oss-120b) | 25 |
 | Qwen3.5-122B-A10B, after `prepare` | [mradermacher Q3_K_M](https://huggingface.co/mradermacher/Qwen3.5-122B-A10B-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) | 40 |
 | Qwen3-Coder-Next (80B) | [MaziyarPanahi Q3_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next) | 70 |
 | Qwen3-Coder-Next (80B), the 4-bit file | [MaziyarPanahi Q4_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next) | 56 |
 | Qwen3-Coder-30B-A3B, a smaller download | [unsloth Q4_K_M](https://huggingface.co/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF) | [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) | 44 |
+
+## gpt-oss-120b
+
+OpenAI's gpt-oss-120b: 117 billion parameters, 4 of its 128 experts for each word in each of its 36 layers. It thinks before it answers, and the chat page shows the thinking.
+
+1. Download the official [MXFP4 GGUF](https://huggingface.co/ggml-org/gpt-oss-120b-GGUF) (63.4 GB) and the model's [tokenizer.json](https://huggingface.co/openai/gpt-oss-120b).
+2. Squeeze it. You need about **106 GB free** while it runs: the 63 GB download and the 43 GB squeezed file sit side by side.
+
+```sh
+~/coachwhip/target/release/coachwhip-prepare ~/Downloads/gpt-oss-120b-MXFP4.gguf ~/Downloads/gpt-oss-120b.Q2A.gguf
+```
+
+   The squeeze takes every expert matrix to Q2_K; everything else in the file is copied as it is. Nothing is downloaded from us.
+
+3. Delete the download. Coachwhip only uses the squeezed file:
+
+```sh
+rm ~/Downloads/gpt-oss-120b-MXFP4.gguf
+```
+
+4. Start it in one of two modes. Coachwhip picks the bank that fits your Mac (25 on 16 GB):
+
+```sh
+# the model's own 4 experts per word, every one read for real
+~/coachwhip/coachwhip.sh ~/Downloads/gpt-oss-120b.Q2A.gguf ~/Downloads/tokenizer.json 25 8090 --parallel --flash-reads
+
+# fast: stand-ins for the light picks that are not in the bank
+~/coachwhip/coachwhip.sh ~/Downloads/gpt-oss-120b.Q2A.gguf ~/Downloads/tokenizer.json 25 8090 --parallel --flash-reads --stand-ins
+```
+
+**Fast mode changes the answers.** A word's first expert is always read for real, and so is its second whenever the router gives it at least 0.3 of the weight. A lighter pick that is not already in the bank is replaced by the best expert that is, by the router's own scores, instead of being read from the SSD. Measured on one coding task, it wrote about 2.4 times as fast and scored 4.0 of 5 against 4.8. It is a choice, never the default.
+
+Every setup we measured, what makes it fast and how the scores were taken: [docs/GPT-OSS.md](docs/GPT-OSS.md).
 
 ## The 122B
 
@@ -170,7 +218,7 @@ Its speed and memory are in the table at the top.
 
 The last number is the bank (44 if you leave it out). The chat opens in your browser. Type, press Send, and the answer streams as it is written. Follow-up questions read only your new words; press **New chat** to start again. Stop Coachwhip with Ctrl+C.
 
-**Thinking.** A model with a thinking mode (Qwen3.6) shows a **let it think first** box on the page. Off, the model answers straight away; on, it reasons first and you watch it. Either way Coachwhip only puts the model's own template text at the start of its turn, nothing else changes, and each word comes at the same speed; thinking makes the reply longer, not slower per word. In the terminal it is `--think`; through the API it is always off, so coding tools get the answer. The 80B coder has no thinking mode, and the box is not shown for it.
+**Thinking.** gpt-oss always thinks first; the page shows its thinking in a box above the answer, and the API returns only the answer. A model with a thinking mode (Qwen3.6) shows a **let it think first** box on the page. Off, the model answers straight away; on, it reasons first and you watch it. Either way Coachwhip only puts the model's own template text at the start of its turn, nothing else changes, and each word comes at the same speed; thinking makes the reply longer, not slower per word. In the terminal it is `--think`; through the API it is always off, so coding tools get the answer. The 80B coder has no thinking mode, and the box is not shown for it.
 
 **From your coding tools:** while Coachwhip runs, it also speaks the OpenAI chat API, so any tool that takes an OpenAI base URL can use the model.
 
@@ -215,19 +263,22 @@ cd ~/coachwhip
 | `--prefetch 10` | Experts guessed and read in ahead, per layer; 0 turns the guess off |
 | `--ahead 4` | How many layers ahead the guess looks |
 | `--think` | Let a thinking model reason before it answers (`--prompt` runs) |
+| `--parallel` | The GPU waits on a shared event for its experts; faster on big models, same answers |
+| `--flash-reads` | Read experts straight from the SSD, past the page cache; same answers |
+| `--stand-ins` | gpt-oss fast mode: stand-ins for the light picks not in the bank; the answers change |
 | `--profile` | Print where the time went after each answer |
 | `--help` | Everything else |
 
 ## Roadmap
 
-- More MoE families: Mixtral, Qwen2-MoE, OLMoE, DeepSeek, gpt-oss, GLM.
-- MXFP4 and fused-attention GGUF files.
+- More MoE families: Mixtral, Qwen2-MoE, OLMoE, DeepSeek, GLM, Qwen3.8.
+- Fused-attention GGUF files.
 - An adapter that reads your own repository, on your own machine.
 - More platforms.
 
 ## Credits
 
-Built on [Candle](https://github.com/huggingface/candle). `crates/engine/src/model.rs` is derived from Candle's Qwen3 model, and the fused expert kernel is ggml's `mul_mv_id`, which ships inside Candle. The block-at-a-time linear attention follows [Gated Delta Networks](https://arxiv.org/abs/2412.06464) (Yang, Kautz and Hatamizadeh, ICLR 2025).
+Built on [Candle](https://github.com/huggingface/candle); `vendor/candle-core` is its core crate with an MXFP4 kernel for Metal. gpt-oss-120b is [OpenAI's](https://huggingface.co/openai/gpt-oss-120b), under Apache-2.0. `crates/engine/src/model.rs` is derived from Candle's Qwen3 model, and the fused expert kernel is ggml's `mul_mv_id`, which ships inside Candle. The block-at-a-time linear attention follows [Gated Delta Networks](https://arxiv.org/abs/2412.06464) (Yang, Kautz and Hatamizadeh, ICLR 2025).
 
 ## Licence
 

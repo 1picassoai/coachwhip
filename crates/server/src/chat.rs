@@ -36,6 +36,66 @@ const SUMMARY_TOKENS: usize = 500;
 
 const SUMMARY_ASK: &str = "Summarise our conversation so far in at most 300 words, for someone who will continue it: what was asked, what was decided, and every name, file, function or fact the next answer will need. Plain text, no preamble.";
 
+/// The start of every gpt-oss chat: the model's own default system message from its chat
+/// template, at its default reasoning level.
+const HARMONY_SYSTEM: &str = "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|>";
+
+/// The chat format the model was trained on: ChatML (the Qwen families) or harmony (gpt-oss).
+struct Fmt {
+    harmony: bool,
+}
+
+impl Fmt {
+    fn of(model: &Model) -> Self {
+        Self { harmony: model.harmony() }
+    }
+
+    /// The words that end the assistant's turn. A stop word is never part of the answer.
+    fn stops(&self, tokenizer: &Tokenizer) -> Vec<u32> {
+        // Harmony: <|end|> only closes a message (the thinking ends with it); <|return|> ends the answer.
+        let names: &[&str] = if self.harmony { &["<|return|>", "<|call|>"] } else { &["<|im_end|>"] };
+        let vocab = tokenizer.get_vocab(true);
+        names.iter().filter_map(|n| vocab.get(*n).copied()).collect()
+    }
+
+    /// What a new chat opens with, before its first turn.
+    fn start(&self) -> &'static str {
+        if self.harmony { HARMONY_SYSTEM } else { "" }
+    }
+
+    /// What closes the last answer before the next turn (the stop word itself was never read).
+    fn close(&self) -> &'static str {
+        if self.harmony { "<|end|>" } else { "<|im_end|>\n" }
+    }
+
+    fn user(&self, text: &str) -> String {
+        if self.harmony { format!("<|start|>user<|message|>{text}<|end|>") } else { format!("<|im_start|>user\n{text}<|im_end|>\n") }
+    }
+
+    /// Opens the assistant's turn. gpt-oss with thinking on picks its own channel (analysis first);
+    /// with thinking off it goes straight to its final channel.
+    fn assistant(&self, model: &Model, think: bool) -> String {
+        match (self.harmony, think) {
+            (true, true) => "<|start|>assistant".to_string(),
+            (true, false) => "<|start|>assistant<|channel|>final<|message|>".to_string(),
+            _ => format!("<|im_start|>assistant\n{}", model.assistant_open(think)),
+        }
+    }
+}
+
+/// What the page shows of a gpt-oss answer that thinks: its analysis channel as a think block,
+/// then its final channel. Format markers never show; one still arriving holds the text back.
+fn harmony_view(raw: &str) -> String {
+    let t = raw
+        .replace("<|channel|>analysis<|message|>", "<think>\n")
+        .replace("<|end|><|start|>assistant<|channel|>final<|message|>", "\n</think>\n\n")
+        .replace("<|channel|>final<|message|>", "");
+    match t.find("<|") {
+        Some(i) => t[..i].to_string(),
+        None => t,
+    }
+}
+
 /// Separates the streamed text from the closing stats line.
 pub const STATS_MARK: &str = "\u{1}STATS:";
 
@@ -115,23 +175,24 @@ pub fn generate(
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<Answer> {
     let think = think && model.thinks();
-    // The template's way of switching thinking on or off: what opens the assistant's turn.
-    let open = model.assistant_open(think);
+    let fmt = Fmt::of(model);
+    // The template's way of switching thinking on or off is in what opens the assistant's turn.
+    let open = fmt.assistant(model, think);
     let encode = |text: String| -> Result<Vec<u32>> { Ok(tokenizer.encode(text, true).map_err(anyhow::Error::msg)?.get_ids().to_vec()) };
-    let eos = *tokenizer.get_vocab(true).get("<|im_end|>").unwrap();
+    let stops = fmt.stops(tokenizer);
     let tell = progress.map(|p| Rc::new(RefCell::new(p)));
 
     // A follow-up closes the last answer and adds the new question; nothing earlier is read again.
-    let turn = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{open}");
+    let turn = format!("{}{open}", fmt.user(prompt));
     let mut tokens = Vec::new();
     let mut fresh = new_chat || session.pos == 0 || session.by_api;
     let mut summary = None;
     if !fresh {
         tokens.extend(session.pending);
-        tokens.extend(encode(format!("<|im_end|>\n{turn}"))?);
+        tokens.extend(encode(format!("{}{turn}", fmt.close()))?);
         // Too long to go on: the model summarises the chat, and the summary opens a new one.
         if session.pos + tokens.len() + max_new > CONTEXT_LIMIT {
-            summary = Some(summarise(model, tokenizer, device, session, eos, &tell)?);
+            summary = Some(summarise(model, tokenizer, device, session, &stops, &tell)?);
             fresh = true;
         }
     }
@@ -139,8 +200,8 @@ pub fn generate(
         model.clear_kv_cache();
         *session = Session::default();
         tokens = encode(match &summary {
-            Some(s) => format!("<|im_start|>user\nSummary of our conversation so far, for context:\n{s}\n\nNow: {prompt}<|im_end|>\n<|im_start|>assistant\n{open}"),
-            None => turn,
+            Some(s) => format!("{}{}{open}", fmt.start(), fmt.user(&format!("Summary of our conversation so far, for context:\n{s}\n\nNow: {prompt}"))),
+            None => format!("{}{turn}", fmt.start()),
         })?;
     }
 
@@ -175,7 +236,8 @@ pub fn generate_full(
         session.pending = None;
     }
     let tokens = prompt[session.fed.len()..].to_vec();
-    let a = answer(model, tokenizer, device, session, tokens, fresh, false, false, max_new, sampling, &None, emit);
+    let think = model.harmony();
+    let a = answer(model, tokenizer, device, session, tokens, fresh, false, think, max_new, sampling, &None, emit);
     session.by_api = true;
     a
 }
@@ -196,7 +258,10 @@ fn answer(
     tell: &Option<Rc<RefCell<Progress>>>,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<Answer> {
-    let eos = *tokenizer.get_vocab(true).get("<|im_end|>").unwrap();
+    let fmt = Fmt::of(model);
+    let stops = fmt.stops(tokenizer);
+    // gpt-oss thinking: the channels are read from the format markers, so keep them when decoding.
+    let channels = fmt.harmony && think;
     let mut sampler = LogitsProcessor::from_sampling(42, sampling.clone());
     let t0 = std::time::Instant::now();
     let logits = read_prompt(model, device, session.pos, &tokens, tell)?;
@@ -206,10 +271,14 @@ fn answer(
     let read = t0.elapsed().as_secs_f64();
 
     // The answer so far; an end-of-turn word is never part of it.
-    let mut out = if next == eos { Vec::new() } else { vec![next] };
+    let mut out = if stops.contains(&next) { Vec::new() } else { vec![next] };
     let mut sent = 0usize;
     let mut stream_text = |out: &[u32], sent: &mut usize| -> Result<()> {
-        let full = tokenizer.decode(out, true).map_err(anyhow::Error::msg)?;
+        let full = if channels {
+            harmony_view(&tokenizer.decode(out, false).map_err(anyhow::Error::msg)?)
+        } else {
+            tokenizer.decode(out, true).map_err(anyhow::Error::msg)?
+        };
         // A token can be half of a multi-byte character; wait until the text is whole.
         if full.ends_with('\u{FFFD}') {
             return Ok(());
@@ -244,12 +313,12 @@ fn answer(
     let speculate: usize = std::env::var("COACHWHIP_SPECULATE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let measure: usize = std::env::var("COACHWHIP_SPECULATE_MEASURE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let greedy = matches!(sampling, Sampling::ArgMax);
-    while out.len() < max_new && next != eos {
+    while out.len() < max_new && !stops.contains(&next) {
         if speculate > 0 && greedy && max_new - out.len() > speculate {
             if let Some(seq) = model.speculate(next, base + out.len() - 1, speculate)? {
                 for &w in &seq {
                     next = w;
-                    if w == eos {
+                    if stops.contains(&w) {
                         break;
                     }
                     out.push(w);
@@ -262,7 +331,7 @@ fn answer(
             if let Some((plain, _accepted)) = model.speculate_measure(next, base + out.len() - 1, measure)? {
                 for &w in &plain {
                     next = w;
-                    if w == eos {
+                    if stops.contains(&w) {
                         break;
                     }
                     out.push(w);
@@ -276,7 +345,7 @@ fn answer(
         }
         let logits = model.forward(&Tensor::new(&[next], device)?.unsqueeze(0)?, base + out.len() - 1)?.squeeze(0)?;
         next = sampler.sample(&logits)?;
-        if next != eos {
+        if !stops.contains(&next) {
             out.push(next);
             stream_text(&out, &mut sent)?;
         }
@@ -284,7 +353,7 @@ fn answer(
     let write = t1.elapsed().as_secs_f64();
     let written = out.len();
     // Every word of the answer was read back, except the last one when the length limit cut it off.
-    let finished = next == eos;
+    let finished = stops.contains(&next);
     let read_back = if finished { out.len() } else { out.len() - 1 };
     session.pos = base + read_back;
     session.pending = if finished { None } else { out.last().copied() };
@@ -329,16 +398,17 @@ fn read_prompt(model: &mut Model, device: &Device, pos: usize, tokens: &[u32], t
 
 /// Asks the model, in the chat as it stands, for a summary of the chat; the chat is then thrown
 /// away and the summary opens the next one. Greedy, so it is the same every time.
-fn summarise(model: &mut Model, tokenizer: &Tokenizer, device: &Device, session: &Session, eos: u32, tell: &Option<Rc<RefCell<Progress>>>) -> Result<String> {
+fn summarise(model: &mut Model, tokenizer: &Tokenizer, device: &Device, session: &Session, stops: &[u32], tell: &Option<Rc<RefCell<Progress>>>) -> Result<String> {
     let mut tokens: Vec<u32> = session.pending.into_iter().collect();
-    let ask = format!("<|im_end|>\n<|im_start|>user\n{SUMMARY_ASK}<|im_end|>\n<|im_start|>assistant\n{}", model.assistant_open(false));
+    let fmt = Fmt::of(model);
+    let ask = format!("{}{}{}", fmt.close(), fmt.user(SUMMARY_ASK), fmt.assistant(model, false));
     tokens.extend(tokenizer.encode(ask, true).map_err(anyhow::Error::msg)?.get_ids().to_vec());
     let mut sampler = LogitsProcessor::from_sampling(42, Sampling::ArgMax);
     let logits = read_prompt(model, device, session.pos, &tokens, tell)?;
     let mut next = sampler.sample(&logits)?;
     let base = session.pos + tokens.len();
     let mut out = Vec::new();
-    while next != eos && out.len() < SUMMARY_TOKENS {
+    while !stops.contains(&next) && out.len() < SUMMARY_TOKENS {
         out.push(next);
         if let Some(t) = tell {
             if out.len() % 8 == 0 {
@@ -368,6 +438,22 @@ pub fn message_text(content: &serde_json::Value) -> String {
         serde_json::Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"),
         _ => String::new(),
     }
+}
+
+/// An OpenAI conversation in harmony (gpt-oss), ready for the assistant's turn. The client's own
+/// system message becomes harmony's developer message; the model thinks before its final answer.
+fn harmony_prompt(messages: &[serde_json::Value]) -> String {
+    let mut text = HARMONY_SYSTEM.to_string();
+    for m in messages {
+        let content = message_text(&m["content"]);
+        text.push_str(&match m["role"].as_str().unwrap_or("user") {
+            "system" | "developer" => format!("<|start|>developer<|message|># Instructions\n\n{content}<|end|>"),
+            "assistant" => format!("<|start|>assistant<|channel|>final<|message|>{content}<|end|>"),
+            _ => format!("<|start|>user<|message|>{content}<|end|>"),
+        });
+    }
+    text.push_str("<|start|>assistant");
+    text
 }
 
 /// An OpenAI conversation in the model's chat format, ready for the assistant's turn; `open` is
@@ -405,7 +491,8 @@ fn openai(mut s: TcpStream, body: &[u8], model: &mut Model, model_name: &str, to
     };
     let stream = q["stream"].as_bool().unwrap_or(false);
     let asked = q["max_completion_tokens"].as_u64().or(q["max_tokens"].as_u64());
-    let prompt = tokenizer.encode(chat_prompt(messages, model.assistant_open(false)), true).map_err(anyhow::Error::msg)?.get_ids().to_vec();
+    let text = if model.harmony() { harmony_prompt(messages) } else { chat_prompt(messages, model.assistant_open(false)) };
+    let prompt = tokenizer.encode(text, true).map_err(anyhow::Error::msg)?.get_ids().to_vec();
     let max_new = answer_budget(asked, max_new, prompt.len());
     let id = format!("chatcmpl-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
     let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
@@ -459,6 +546,11 @@ fn openai(mut s: TcpStream, body: &[u8], model: &mut Model, model_name: &str, to
     };
     println!("  api: read {} new tokens at {:.1} tok/s, wrote {} at {:.1} tok/s, chat now {} tokens", a.prompt_tokens, a.read_tps, a.written, a.write_tps, a.context);
     model.report();
+    if model.harmony() {
+        if let Some(i) = text.find("</think>") {
+            text = text[i + "</think>".len()..].trim_start().to_string();
+        }
+    }
     let finish = if a.finished { "stop" } else { "length" };
     let usage = serde_json::json!({"prompt_tokens": prompt_len, "completion_tokens": a.written, "total_tokens": prompt_len + a.written});
     if stream {
@@ -606,7 +698,14 @@ fn handle(mut s: TcpStream, model: &mut Model, model_name: &str, tokenizer: &Tok
         chunk(&mut s, format!("{STATS_MARK}{stats}").as_bytes())?;
         s.write_all(b"0\r\n\r\n")?;
     } else {
-        let page = if model.thinks() { PAGE.to_string() } else { PAGE.replace(THINK_BOX, "") };
+        // gpt-oss is a reasoning model: its thinking switch starts ticked.
+        let page = if model.harmony() {
+            PAGE.replace(r#"id="think">"#, r#"id="think" checked>"#)
+        } else if model.thinks() {
+            PAGE.to_string()
+        } else {
+            PAGE.replace(THINK_BOX, "")
+        };
         let page = page.replace("MODEL_NAME", &html_escape(model_name));
         write!(s, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n", page.len())?;
         s.write_all(page.as_bytes())?;

@@ -168,6 +168,7 @@ impl Qwen3Moe {
             let p = format!("blk.{layer}");
             let gate = gg.tensor(&format!("{p}.ffn_gate_inp.weight"))?.dequantize(device)?.to_dtype(DType::F32)?;
             let moe = StreamedMoe {
+                act: crate::experts::ExpertAct::Silu,
                 layer,
                 gate: Linear::new(gate, None),
                 next_gate: None,
@@ -249,6 +250,7 @@ impl Qwen3Moe {
 pub enum Model {
     Qwen3Moe(Qwen3Moe),
     Qwen3Next(crate::model_next::Qwen3Next),
+    GptOss(crate::model_gptoss::GptOss),
 }
 
 impl Model {
@@ -264,6 +266,7 @@ impl Model {
             // f16 for attention: bf16 garbles long answers in this model.
             "qwen3moe" => Ok(Self::Qwen3Moe(Qwen3Moe::load(path, device, DType::F16, settings)?)),
             "qwen3next" | "qwen35moe" => Ok(Self::Qwen3Next(crate::model_next::Qwen3Next::load(path, device, settings, arch.as_str())?)),
+            "gpt-oss" => Ok(Self::GptOss(crate::model_gptoss::GptOss::load(path, device, settings)?)),
             other => candle::bail!(
                 "this model's architecture is \"{other}\", which Coachwhip does not support yet (today: qwen3moe, qwen3next). \
                  Open an issue at https://github.com/1picassoai/coachwhip/issues so it moves up the list."
@@ -275,6 +278,7 @@ impl Model {
         match self {
             Self::Qwen3Moe(m) => m.forward(x, offset),
             Self::Qwen3Next(m) => m.forward(x, offset),
+            Self::GptOss(m) => m.forward(x, offset),
         }
     }
 
@@ -282,6 +286,7 @@ impl Model {
         match self {
             Self::Qwen3Moe(m) => m.clear_kv_cache(),
             Self::Qwen3Next(m) => m.clear_kv_cache(),
+            Self::GptOss(m) => m.clear_kv_cache(),
         }
     }
 
@@ -289,11 +294,17 @@ impl Model {
         match self {
             Self::Qwen3Moe(m) => m.report(),
             Self::Qwen3Next(m) => m.report(),
+            Self::GptOss(m) => m.report(),
         }
     }
 
+    /// True for a model whose chat format is OpenAI's harmony (gpt-oss) rather than ChatML.
+    pub fn harmony(&self) -> bool {
+        matches!(self, Self::GptOss(_))
+    }
+
     pub fn thinks(&self) -> bool {
-        self.think().thinks()
+        self.harmony() || self.think().thinks()
     }
 
     /// S6 measurement (Qwen3-Next family only): see `Qwen3Next::speculate_measure`.
@@ -301,6 +312,7 @@ impl Model {
         match self {
             Self::Qwen3Moe(_) => Ok(None),
             Self::Qwen3Next(m) => m.speculate_measure(last, offset, k).map(Some),
+            Self::GptOss(_) => Ok(None),
         }
     }
 
@@ -309,6 +321,7 @@ impl Model {
         match self {
             Self::Qwen3Moe(_) => Ok(false),
             Self::Qwen3Next(m) => m.foresee(last, offset, steps),
+            Self::GptOss(_) => Ok(false),
         }
     }
 
@@ -317,6 +330,7 @@ impl Model {
         match self {
             Self::Qwen3Moe(_) => Ok(None),
             Self::Qwen3Next(m) => m.speculate(last, offset, k),
+            Self::GptOss(_) => Ok(None),
         }
     }
 
@@ -330,6 +344,7 @@ impl Model {
         match self {
             Self::Qwen3Moe(m) => m.think,
             Self::Qwen3Next(m) => m.think,
+            Self::GptOss(m) => m.think,
         }
     }
 
@@ -338,6 +353,7 @@ impl Model {
         match self {
             Self::Qwen3Moe(m) => m.progress = progress,
             Self::Qwen3Next(m) => m.progress = progress,
+            Self::GptOss(m) => m.progress = progress,
         }
     }
 }

@@ -796,6 +796,7 @@ impl Qwen3Next {
             };
             let gate = dense(&mut gg, &format!("{p}.ffn_gate_inp.weight"))?;
             let moe = StreamedMoe {
+                act: crate::experts::ExpertAct::Silu,
                 layer,
                 gate: Linear::new(gate, None),
                 next_gate: None,

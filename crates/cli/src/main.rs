@@ -1,4 +1,4 @@
-//! Coachwhip: run mixture-of-experts models that are bigger than the memory, on a Mac. An 80B
+//! Coachwhip: run mixture-of-experts models that are bigger than the memory, on a Mac. A 122B
 //! model runs on 16 GB: the experts stream from the SSD into a small bank on the GPU, and the
 //! ones the next layer will probably need are fetched while the current layer computes.
 
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Run mixture-of-experts models bigger than your memory on a Mac: an 80B model on 16 GB")]
+#[command(version, about = "Run mixture-of-experts models bigger than your memory on a Mac: a 122B model on 16 GB")]
 struct Args {
     /// The model, as a GGUF file: Qwen3 MoE or Qwen3-Next (Q4_K_M tested).
     #[arg(long)]
@@ -27,6 +27,10 @@ struct Args {
     /// Serve the chat page on 127.0.0.1 at this port.
     #[arg(long, conflicts_with = "prompt")]
     chat: Option<u16>,
+
+    /// Lab: read the prompt as raw text, no chat template, and decode greedily.
+    #[arg(long, hide = true)]
+    raw: bool,
 
     /// Answer one prompt and exit.
     #[arg(long)]
@@ -94,6 +98,18 @@ struct Args {
     /// the next layers' experts from the state it predicts. Fewer reads; the answers do not change.
     #[arg(long)]
     register: bool,
+
+    /// Stand-ins (gpt-oss): a light pick that is not in the bank is replaced by the best expert
+    /// that is, by the router's own scores. The first pick is always read for real, and the second
+    /// whenever the router gives it at least 0.3 of the weight. Fewer reads; the answers change,
+    /// so check them for your use.
+    #[arg(long)]
+    stand_ins: bool,
+
+    /// Flash reads: experts are read straight from the SSD, past the page cache, which has nothing
+    /// to give back on a 16 GB Mac. The answers do not change.
+    #[arg(long)]
+    flash_reads: bool,
 }
 
 fn main() -> Result<()> {
@@ -113,25 +129,37 @@ fn main() -> Result<()> {
     if args.register {
         std::env::set_var("COACHWHIP_REGISTER", "1");
     }
+    if args.stand_ins {
+        std::env::set_var("COACHWHIP_STANDIN", "1");
+        if std::env::var("COACHWHIP_STANDIN_W").is_err() {
+            std::env::set_var("COACHWHIP_STANDIN_W", "0.3");
+        }
+    }
+    if args.flash_reads {
+        std::env::set_var("COACHWHIP_NOCACHE", "1");
+    }
     let device = Device::new_metal(0)?;
     // A hot path belongs to one model: its routes live in a folder named after the model file.
     let model_name = args.model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "model".into());
     let routes = args.routes.join(&model_name);
     let learned = args.learned.join(&model_name);
     std::fs::create_dir_all(&learned)?;
-    // The 122B (48-layer qwen35moe) guesses best at 6 ahead by 2; the others at 10 by 4.
-    let big = {
+    // The 122B (48-layer qwen35moe) guesses best at 6 ahead by 2, gpt-oss at 2 by 2 (its 13 MB
+    // experts make a wrong guess dear); the others at 10 by 4.
+    let (big, oss) = {
         let mut f = std::fs::File::open(&args.model)?;
         let ct = candle::quantized::gguf_file::Content::read(&mut f)?;
         let arch = ct.metadata.get("general.architecture").and_then(|v| v.to_string().ok().cloned()).unwrap_or_default();
         let layers = ct.metadata.get(&format!("{arch}.block_count")).and_then(|v| v.to_u32().ok()).unwrap_or(0);
-        arch == "qwen35moe" && layers >= 48
+        (arch == "qwen35moe" && layers >= 48, arch == "gpt-oss")
     };
+    // gpt-oss guesses about half the experts it uses per word (13 MB each makes a wrong guess dear).
+    let oss_guess = args.experts.map_or(2, |k| (k / 2).max(1));
     let (prefetch, ahead) = match (args.prefetch, args.ahead) {
         (Some(p), Some(a)) => (p, a),
-        (Some(p), None) => (p, if big { 2 } else { 4 }),
-        (None, Some(a)) => (if big { 6 } else { 10 }, a),
-        (None, None) => if big { (6, 2) } else { (10, 4) },
+        (Some(p), None) => (p, if big || oss { 2 } else { 4 }),
+        (None, Some(a)) => (if oss { oss_guess } else if big { 6 } else { 10 }, a),
+        (None, None) => if oss { (oss_guess, 2) } else if big { (6, 2) } else { (10, 4) },
     };
     let settings = experts::Settings {
         bank: args.bank,
@@ -163,6 +191,45 @@ fn main() -> Result<()> {
     let Some(prompt) = args.prompt else {
         anyhow::bail!("give --chat <port> or --prompt <text>")
     };
+    if args.raw {
+        let ids = tokenizer.encode(prompt.as_str(), false).map_err(anyhow::Error::msg)?.get_ids().to_vec();
+        eprintln!("coachwhip: raw prompt, {} tokens", ids.len());
+        model.clear_kv_cache();
+        // Read the prompt in 512-token pieces, as the chat does; the last piece goes through the loop.
+        let mut offset = 0usize;
+        let last = ids.len() - (ids.len() - 1) % 512 - 1;
+        for piece in ids[..last].chunks(512) {
+            model.forward(&candle::Tensor::new(piece, &device)?.unsqueeze(0)?, offset)?;
+            offset += piece.len();
+        }
+        let mut input = candle::Tensor::new(&ids[last..], &device)?.unsqueeze(0)?;
+        let mut outs = Vec::new();
+        let t0 = std::time::Instant::now();
+        for step in 0..args.max_tokens {
+            let logits: Vec<f32> = model.forward(&input, offset)?.flatten_all()?.to_dtype(candle::DType::F32)?.to_vec1()?;
+            offset += input.dim(1)?;
+            let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let lse = m + logits.iter().map(|v| (v - m).exp()).sum::<f32>().ln();
+            let mut idx: Vec<usize> = (0..logits.len()).collect();
+            idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+            if step == 0 {
+                let top: Vec<(String, f32)> = idx[..3].iter().map(|&i| (tokenizer.decode(&[i as u32], false).unwrap_or_default(), logits[i] - lse)).collect();
+                eprintln!("coachwhip: first token top-3 {top:?} after {:.1} s", t0.elapsed().as_secs_f64());
+            }
+            if std::env::var("COACHWHIP_POOLLOG").is_ok() && step % 25 == 0 {
+                if let candle::Device::Metal(m) = &device {
+                    let (pooled, in_use, count) = m.pool_stats();
+                    eprintln!("coachwhip: pool at word {step}: {:.2} GB pooled in {count} buffers, {:.2} GB in use", pooled as f64 / 1e9, in_use as f64 / 1e9);
+                }
+            }
+            let next = idx[0] as u32;
+            outs.push(next);
+            input = candle::Tensor::new(&[next], &device)?.unsqueeze(0)?;
+        }
+        println!("{:?}", tokenizer.decode(&outs, false).map_err(anyhow::Error::msg)?);
+        eprintln!("coachwhip: {} tokens in {:.1} s", outs.len(), t0.elapsed().as_secs_f64());
+        return Ok(());
+    }
     let mut out = std::io::stdout();
     let mut emit = |t: &str| -> Result<()> {
         out.write_all(t.as_bytes())?;

@@ -6,4 +6,5 @@ pub mod gpu_sync;
 pub mod requant;
 pub mod model;
 pub mod model_next;
+pub mod model_gptoss;
 mod mv_id;

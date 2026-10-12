@@ -141,10 +141,13 @@ fn wrangler_fit(ct: &gguf_file::Content, metal: &MetalDevice, layers: usize, exp
         .map(|(_, i)| (i.shape.elem_count() / i.ggml_dtype.block_size() * i.ggml_dtype.type_size()) as f64)
         .sum();
     // Keys and values for a full chat, f32, on the layers that keep them.
-    let interval = md_u(&format!("{arch}.full_attention_interval")).unwrap_or(1.0).max(1.0);
+    // gpt-oss alternates full and 128-token sliding layers; only the full ones keep a whole chat.
+    let interval = if arch == "gpt-oss" { 2.0 } else { md_u(&format!("{arch}.full_attention_interval")).unwrap_or(1.0).max(1.0) };
     let n_kv = md_u(&format!("{arch}.attention.head_count_kv")).unwrap_or(1.0);
     let hd = md_u(&format!("{arch}.attention.key_length")).unwrap_or(128.0);
-    let kv = (layers as f64 / interval).floor() * 2.0 * n_kv * hd * 4.0 * WRANGLER_CONTEXT;
+    // gpt-oss keeps its cache in f16 (2 bytes a value); the others in f32.
+    let bytes = if arch == "gpt-oss" { 2.0 } else { 4.0 };
+    let kv = (layers as f64 / interval).floor() * 2.0 * n_kv * hd * bytes * WRANGLER_CONTEXT;
     let room = limit - WRANGLER_MARGIN - WRANGLER_WORKING - dense - kv;
     let fit = (room / (layers as f64 * expert_bytes)).floor().max(8.0) as usize;
     eprintln!(
@@ -392,6 +395,8 @@ impl Default for Register {
 
 #[derive(Default)]
 struct Stats {
+    /// Lab: weaker picks swapped for a resident expert (`COACHWHIP_STANDIN`).
+    stand_ins: u64,
     hits: u64,
     loads: u64,
     load_seconds: f64,
@@ -1172,7 +1177,7 @@ impl ExpertStore {
         let gate = x.apply_op2_no_bwd(&slots, &g)?;
         let up = x.apply_op2_no_bwd(&slots, &u)?;
         let inter = gate.dim(2)?;
-        let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((1, inter))?;
+        let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((1, ()))?;
         let down = hidden.apply_op2_no_bwd(&slots, &d)?; // (1, 1, h)
         down.flatten_all()?.to_dtype(DType::F32)
     }
@@ -2004,6 +2009,9 @@ impl ExpertStore {
             s.prefetch_copies,
             s.prefetch_hits
         );
+        if s.stand_ins > 0 {
+            eprintln!("coachwhip: stand-ins: {} weaker picks swapped for a resident expert", s.stand_ins);
+        }
         eprintln!(
             "coachwhip: waited {:.2} s on guesses still landing; dropped {} stale guessed reads; {} layers read fresh because the bank was crowded{}",
             s.prefetch_wait_seconds, s.stale_dropped, s.crowded,
@@ -2126,7 +2134,7 @@ impl CustomOp2 for MoeMatvec {
                 device.device(),
                 &encoder,
                 device.kernels(),
-                self.dtype.into(),
+                candle_metal_kernels::GgmlDType::try_from(self.dtype)?,
                 (self.n, self.k, self.slots, self.bytes),
                 self.bank.buffer(),
                 x.buffer(),
@@ -2141,6 +2149,41 @@ impl CustomOp2 for MoeMatvec {
         }
         Ok((MetalStorage::new(dst, device.clone(), elems, DType::F32), Shape::from((tokens, nei0, self.n))))
     }
+}
+
+/// Lab (`COACHWHIP_GUESSLOG=file`): one line per word and layer, for racing guessers offline:
+/// `layer ahead | picks as expert:weight | the router-ahead's top 32 as expert:probability`.
+fn guess_log(path: &str, layer: usize, ahead: usize, picks: &[u32], top_w: &Tensor, scores: &[f32]) -> Result<()> {
+    use std::io::Write as _;
+    let w: Vec<f32> = top_w.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
+    let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let z: f32 = scores.iter().map(|s| (s - m).exp()).sum();
+    let mut ranked: Vec<(usize, f32)> = scores.iter().enumerate().map(|(e, s)| (e, (s - m).exp() / z)).collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let picks: Vec<String> = picks.iter().zip(w.iter()).map(|(e, w)| format!("{e}:{w:.4}")).collect();
+    let guess: Vec<String> = ranked.iter().take(32).map(|(e, p)| format!("{e}:{p:.5}")).collect();
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{layer} {ahead} | {} | {}", picks.join(" "), guess.join(" "))?;
+    Ok(())
+}
+
+/// Lab (`COACHWHIP_STANDIN_MAX`, default 0.3): a weaker pick is swapped for a stand-in only when
+/// the router gave it less than this share of the word.
+/// Lab (`COACHWHIP_STANDIN_KEEP`): how many of the top picks are always read for real; the default
+/// is half the picks (at least 1).
+fn stand_in_keep(k: usize) -> usize {
+    std::env::var("COACHWHIP_STANDIN_KEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(k / 2).clamp(1, k.max(1))
+}
+
+/// Lab (`COACHWHIP_STANDIN_W=<w>`): with more than two picks, the second stays real when its weight is
+/// at least w, else only the first does. Off: `COACHWHIP_STANDIN_KEEP` rules.
+fn stand_in_w() -> Option<f32> {
+    static V: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("COACHWHIP_STANDIN_W").ok().and_then(|v| v.parse().ok()))
+}
+
+fn stand_in_limit() -> f32 {
+    std::env::var("COACHWHIP_STANDIN_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3)
 }
 
 /// Router scores with every expert not `allowed` pushed far below the rest, so `route` picks
@@ -2164,6 +2207,57 @@ pub fn route(logits: &Tensor, top_k: usize, norm: bool) -> Result<(Tensor, Tenso
     Ok((top_ids, top_w))
 }
 
+/// What a family does between an expert's matrices: the activation, and any per-expert biases.
+/// The core runs the matrices; the family owns this.
+pub enum ExpertAct {
+    /// Qwen: down(silu(gate x) * up x).
+    Silu,
+    /// gpt-oss: gate and up get their biases, gate is capped at `limit`, up is clamped to
+    /// ±`limit`, hidden = (up + 1) * gate * sigmoid(alpha * gate), then down gets its bias.
+    /// Biases are (experts, width), looked up by the picked expert ids.
+    /// `pad`: the width down's matrix reads; a squeezed file pads rows to whole 256-weight
+    /// blocks, so the hidden state gets zeros up to it (0 = no padding).
+    ClampedSwiglu { alpha: f64, limit: f32, gate_b: Tensor, up_b: Tensor, down_b: Tensor, pad: usize },
+}
+
+impl ExpertAct {
+    /// gate, up: (n, k, inter); ids: the expert of each (n, k) position, asked for only when needed.
+    pub fn hidden(&self, gate: &Tensor, up: &Tensor, ids: impl FnOnce() -> Result<Tensor>) -> Result<Tensor> {
+        match self {
+            Self::Silu => candle_nn::ops::silu(gate)? * up,
+            Self::ClampedSwiglu { alpha, limit, gate_b, up_b, pad, .. } => {
+                let ids = ids()?;
+                let gate = (gate + Self::rows(gate_b, &ids, gate)?)?.clamp(f32::NEG_INFINITY, *limit)?;
+                let up = (up + Self::rows(up_b, &ids, up)?)?.clamp(-*limit, *limit)?;
+                let glu = (&gate * candle_nn::ops::sigmoid(&(&gate * *alpha)?)?)?;
+                let hidden = ((up + 1.0)? * glu)?;
+                let width = hidden.dim(candle::D::Minus1)?;
+                if *pad > width {
+                    hidden.pad_with_zeros(candle::D::Minus1, 0, pad - width)
+                } else {
+                    Ok(hidden)
+                }
+            }
+        }
+    }
+
+    /// down: (n, k, h), before the routing weights are applied.
+    pub fn finish(&self, down: Tensor, ids: impl FnOnce() -> Result<Tensor>) -> Result<Tensor> {
+        match self {
+            Self::Silu => Ok(down),
+            Self::ClampedSwiglu { down_b, .. } => {
+                let b = Self::rows(down_b, &ids()?, &down)?;
+                down + b
+            }
+        }
+    }
+
+    fn rows(bias: &Tensor, ids: &Tensor, like: &Tensor) -> Result<Tensor> {
+        let flat = ids.flatten_all()?.to_device(bias.device())?;
+        bias.index_select(&flat, 0)?.reshape(like.shape())?.to_dtype(like.dtype())?.to_device(like.device())
+    }
+}
+
 /// A MoE layer whose experts live in the ExpertStore instead of on the device.
 pub struct StreamedMoe {
     pub layer: usize,
@@ -2178,9 +2272,55 @@ pub struct StreamedMoe {
     pub top_k: usize,
     pub norm_topk_prob: bool,
     pub prefetch_k: usize,
+    pub act: ExpertAct,
 }
 
 impl StreamedMoe {
+    /// Stand-ins on the parallel path, all on the GPU (2 experts a word): the first pick stays the
+    /// router's best; the second is the best-scoring expert in the bank other than the first,
+    /// which is the router's own second whenever that one is in the bank. Weights = the softmax
+    /// over the two picks. The bank's map goes up as a small mask; nothing is read back.
+    fn stand_in_gpu(&self, logits: &Tensor, top_ids: &Tensor, top_w: &Tensor) -> Result<(Tensor, Tensor)> {
+        let e = logits.dim(D::Minus1)?;
+        let resident: HashSet<u32> = self.store.resident_ready(self.layer).map(|m| m.into_keys().collect()).unwrap_or_default();
+        let mask: Vec<f32> = (0..e as u32).map(|x| if resident.contains(&x) { 0.0 } else { -1e30 }).collect();
+        let mask = Tensor::from_vec(mask, (1, e), logits.device())?.to_dtype(logits.dtype())?;
+        if self.top_k > 2 {
+            let k = self.top_k;
+            let with_keep = |keep: usize| -> Result<Tensor> {
+                let kept = top_ids.narrow(D::Minus1, 0, keep)?.contiguous()?;
+                let cand = logits.broadcast_add(&mask)?.arg_sort_last_dim(false)?.narrow(D::Minus1, 0, k)?.contiguous()?;
+                // Candidates already kept are pushed to the back, then the best k - keep of the rest are taken.
+                let taken = cand.reshape((k, 1))?.broadcast_eq(&kept.reshape((1, keep))?)?.to_dtype(DType::F32)?.max_keepdim(1)?.reshape((1, k))?;
+                let rank = (Tensor::arange(0f32, k as f32, logits.device())?.reshape((1, k))? + (taken * 1000.0)?)?;
+                let pick = rank.arg_sort_last_dim(true)?.narrow(D::Minus1, 0, k - keep)?.contiguous()?;
+                let ids = Tensor::cat(&[&kept, &cand.gather(&pick, D::Minus1)?], D::Minus1)?.contiguous()?;
+                Ok(ids)
+            };
+            let ids = match stand_in_w() {
+                Some(line) => {
+                    let heavy = top_w.narrow(D::Minus1, 1, 1)?.to_dtype(DType::F32)?.ge(line)?.broadcast_as((1, k))?.contiguous()?;
+                    heavy.where_cond(&with_keep(2)?, &with_keep(1)?)?
+                }
+                None => with_keep(stand_in_keep(k))?,
+            };
+            let w = candle_nn::ops::softmax_last_dim(&logits.gather(&ids, D::Minus1)?)?;
+            return Ok((ids, w));
+        }
+        let ranked = logits.broadcast_add(&mask)?.arg_sort_last_dim(false)?.narrow(D::Minus1, 0, 2)?.contiguous()?;
+        let first = top_ids.narrow(D::Minus1, 0, 1)?.contiguous()?;
+        let m0 = ranked.narrow(D::Minus1, 0, 1)?.contiguous()?;
+        let m1 = ranked.narrow(D::Minus1, 1, 1)?.contiguous()?;
+        let stand_in = m0.eq(&first)?.where_cond(&m1, &m0)?;
+        // Only a light second pick is swapped; a second pick that carries real weight is read for real.
+        let own = top_ids.narrow(D::Minus1, 1, 1)?.contiguous()?;
+        let light = top_w.narrow(D::Minus1, 1, 1)?.to_dtype(DType::F32)?.lt(stand_in_limit())?;
+        let second = light.where_cond(&stand_in, &own)?;
+        let ids = Tensor::cat(&[&first, &second], D::Minus1)?.contiguous()?;
+        let w = candle_nn::ops::softmax_last_dim(&logits.gather(&ids, D::Minus1)?)?;
+        Ok((ids, w))
+    }
+
     /// The plain path: one quantised matmul per expert, experts read fresh from the file.
     fn reference(&self, xs: &Tensor, ids: &[Vec<u32>], top_w: &Tensor) -> Result<Tensor> {
         let device = xs.device();
@@ -2203,8 +2343,9 @@ impl StreamedMoe {
             let (gate, up, down) = (QMatMul::from_arc(g)?, QMatMul::from_arc(u)?, QMatMul::from_arc(d)?);
             let idx = Tensor::new(tokens.as_slice(), device)?;
             let x = xs.index_select(&idx, 0)?;
-            let hidden = (candle_nn::ops::silu(&gate.forward(&x)?)? * up.forward(&x)?)?;
-            let y = down.forward(&hidden)?;
+            let picked = || Tensor::new(vec![experts[j]; tokens.len()], device);
+            let hidden = self.act.hidden(&gate.forward(&x)?, &up.forward(&x)?, picked)?;
+            let y = self.act.finish(down.forward(&hidden)?, picked)?;
             let w = Tensor::new(w.as_slice(), device)?.unsqueeze(1)?;
             parts[j] = Some((idx, y.broadcast_mul(&w)?));
             Ok(())
@@ -2215,7 +2356,9 @@ impl StreamedMoe {
         if idx.is_empty() {
             return xs.zeros_like();
         }
-        xs.zeros_like()?.index_add(&Tensor::cat(&idx, 0)?, &Tensor::cat(&ys, 0)?, 0)
+        // The output is as wide as down's rows, which a padded input can exceed.
+        let ys = Tensor::cat(&ys, 0)?;
+        Tensor::zeros((xs.dim(0)?, ys.dim(1)?), ys.dtype(), xs.device())?.index_add(&Tensor::cat(&idx, 0)?, &ys, 0)
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
@@ -2262,10 +2405,11 @@ impl StreamedMoe {
             let gate = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 0, self.top_k, false))?;
             let up = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 1, self.top_k, false))?;
             let inter = gate.dim(2)?;
-            let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((n * self.top_k, inter))?;
+            let hidden = self.act.hidden(&gate, &up, || Ok(top_ids.clone()))?.reshape((n * self.top_k, ()))?;
             let down = hidden.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 2, self.top_k, true))?;
+            let down = self.act.finish(down, || Ok(top_ids.clone()))?;
             let out = down.broadcast_mul(&top_w.unsqueeze(2)?)?.sum(1)?;
-            return out.reshape((b, s, h))?.to_dtype(dtype);
+            return out.reshape((b, s, ()))?.to_dtype(dtype);
         }
 
         let logits = self.gate.forward(&xs)?;
@@ -2280,6 +2424,8 @@ impl StreamedMoe {
         // the experts and signalled. The CPU moves straight on to the next layer.
         if n == 1 && self.store.s4.is_some() {
             let s4 = self.store.s4.as_ref().unwrap();
+            // Lab (`COACHWHIP_STANDIN=1`, 2 experts a word): stand-ins chosen on the GPU.
+            let (top_ids, top_w) = if self.top_k >= 2 && std::env::var("COACHWHIP_STANDIN").is_ok() { self.stand_in_gpu(&logits, &top_ids, &top_w)? } else { (top_ids, top_w) };
             if self.layer == 0 {
                 self.store.ensure_all_banks()?;
             }
@@ -2331,13 +2477,14 @@ impl StreamedMoe {
             let gate = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 0, self.top_k, false))?;
             let up = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 1, self.top_k, false))?;
             let inter = gate.dim(2)?;
-            let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((n * self.top_k, inter))?;
+            let hidden = self.act.hidden(&gate, &up, || Ok(top_ids.clone()))?.reshape((n * self.top_k, ()))?;
             let down = hidden.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 2, self.top_k, true))?;
+            let down = self.act.finish(down, || Ok(top_ids.clone()))?;
             let out = down.broadcast_mul(&top_w.unsqueeze(2)?)?.sum(1)?;
             if let Some(tx) = s4.tx.lock().unwrap().as_ref() {
                 let _ = tx.send(S4Job { layer: self.layer, seq, n_ids: self.top_k, n_guess, prefetch_k: self.prefetch_k, ahead: self.ahead });
             }
-            return out.reshape((b, s, h))?.to_dtype(dtype);
+            return out.reshape((b, s, ()))?.to_dtype(dtype);
         }
         // S6 measurement (profile mode, one word at a time): what a bank-only draft would pick.
         let draft_scores: Option<Vec<f32>> = if prof { Some(logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?) } else { None };
@@ -2357,6 +2504,37 @@ impl StreamedMoe {
         // Keep this wait if this code ever changes.
         let t_rb = Instant::now();
         let ids: Vec<Vec<u32>> = top_ids.to_vec2()?;
+        // Lab (`COACHWHIP_STANDIN=1`): a word keeps its strongest pick (read from the SSD if it must
+        // be), and each weaker pick that is not in the bank is swapped for the resident expert the
+        // router scores highest for this word. The weights are the softmax over the final picks.
+        let (ids, top_ids, top_w) = if n == 1 && std::env::var("COACHWHIP_STANDIN").is_ok() {
+            let scores: Vec<f32> = logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
+            let resident: HashSet<u32> = self.store.resident(self.layer).into_iter().collect();
+            let w0: Vec<f32> = top_w.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
+            let mut row = ids[0].clone();
+            let keep = match (stand_in_w(), row.len() > 2) {
+                (Some(line), true) => if w0[1] >= line { 2 } else { 1 },
+                _ => stand_in_keep(row.len()),
+            };
+            for p in keep..row.len() {
+                if !resident.contains(&row[p]) && (row.len() > 2 || w0[p] < stand_in_limit()) {
+                    let best = resident.iter().copied().filter(|e| !row.contains(e)).max_by(|a, b| scores[*a as usize].partial_cmp(&scores[*b as usize]).unwrap_or(std::cmp::Ordering::Equal));
+                    if let Some(e) = best {
+                        row[p] = e;
+                        self.store.stats.lock().unwrap().stand_ins += 1;
+                    }
+                }
+            }
+            let m = row.iter().map(|&e| scores[e as usize]).fold(f32::NEG_INFINITY, f32::max);
+            let ex: Vec<f32> = row.iter().map(|&e| (scores[e as usize] - m).exp()).collect();
+            let z: f32 = ex.iter().sum();
+            let k = row.len();
+            let new_ids = Tensor::from_vec(row.clone(), (1, k), xs.device())?;
+            let new_w = Tensor::from_vec(ex.iter().map(|v| v / z).collect::<Vec<f32>>(), (1, k), xs.device())?.to_dtype(top_w.dtype())?;
+            (vec![row], new_ids, new_w)
+        } else {
+            (ids, top_ids, top_w)
+        };
         let t_rb = t_rb.elapsed().as_secs_f64();
         // The GPU has drained: the misses the layer before used sharp can be squeezed now.
         if use_sharp() {
@@ -2410,6 +2588,9 @@ impl StreamedMoe {
         };
         if let Some(logits) = early {
             let scores: Vec<f32> = logits.flatten_all()?.to_dtype(DType::F32)?.to_vec1()?;
+            if let Ok(path) = std::env::var("COACHWHIP_GUESSLOG") {
+                guess_log(&path, self.layer, self.ahead, &ids[0], &top_w, &scores)?;
+            }
             if let Some(p_min) = q_rule() {
                 // The probability rule: a candidate is read iff its router probability, calibrated
                 // on the route dumps, says it is more likely needed than its bytes cost. On the
@@ -2477,8 +2658,10 @@ impl StreamedMoe {
                 let gate = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 0, k, false))?;
                 let up = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 1, k, false))?;
                 let inter = gate.dim(2)?;
-                let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((k, inter))?;
+                let picked = || top_ids.index_select(&idx, 1);
+                let hidden = self.act.hidden(&gate, &up, picked)?.reshape((k, ()))?;
                 let down = hidden.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 2, k, true))?;
+                let down = self.act.finish(down, picked)?;
                 Ok(Some(down.broadcast_mul(&w.unsqueeze(2)?)?.sum(1)?))
             };
             let hit_pos: Vec<usize> = (0..row.len()).filter(|&p| !miss_set.contains(&row[p])).collect();
@@ -2520,8 +2703,10 @@ impl StreamedMoe {
                 let gate = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 0, k, false))?;
                 let up = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 1, k, false))?;
                 let inter = gate.dim(2)?;
-                let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((k, inter))?;
-                let mut down = hidden.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 2, k, true))?; // (1, k, h)
+                let picked = || top_ids.index_select(&idx, 1);
+                let hidden = self.act.hidden(&gate, &up, picked)?.reshape((k, ()))?;
+                let down = hidden.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 2, k, true))?; // (1, k, h)
+                let mut down = self.act.finish(down, picked)?;
                 if repair_on() {
                     let h = down.dim(2)?;
                     let rep = self.store.repair.lock().unwrap();
@@ -2546,8 +2731,10 @@ impl StreamedMoe {
                 let gate = xs.apply_op2_no_bwd(&slots, &self.store.fresh_op(&parts[0], self.layer, 0, 1, false))?;
                 let up = xs.apply_op2_no_bwd(&slots, &self.store.fresh_op(&parts[1], self.layer, 1, 1, false))?;
                 let inter = gate.dim(2)?;
-                let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((1, inter))?;
+                let picked = || top_ids.index_select(&idx, 1);
+                let hidden = self.act.hidden(&gate, &up, picked)?.reshape((1, ()))?;
                 let down = hidden.apply_op2_no_bwd(&slots, &self.store.fresh_op(&parts[2], self.layer, 2, 1, true))?;
+                let down = self.act.finish(down, picked)?;
                 add(down.broadcast_mul(&w.unsqueeze(2)?)?.sum(1)?)?;
             }
             match out {
@@ -2570,8 +2757,10 @@ impl StreamedMoe {
                 let gate = xs.apply_op2_no_bwd(&slots, &op(0, k, false))?;
                 let up = xs.apply_op2_no_bwd(&slots, &op(1, k, false))?;
                 let inter = gate.dim(2)?;
-                let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((k, inter))?;
+                let picked = || top_ids.index_select(&idx, 1);
+                let hidden = self.act.hidden(&gate, &up, picked)?.reshape((k, ()))?;
                 let down = hidden.apply_op2_no_bwd(&slots, &op(2, k, true))?;
+                let down = self.act.finish(down, picked)?;
                 Ok(Some(down.broadcast_mul(&w.unsqueeze(2)?)?.sum(1)?))
             };
             let sharp_pos: Vec<usize> = (0..row.len()).filter(|&p| slot_of[&row[p]] & SHARP_FLAG != 0).collect();
@@ -2587,8 +2776,9 @@ impl StreamedMoe {
             let gate = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 0, self.top_k, false))?; // (n, k, inter)
             let up = xs.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 1, self.top_k, false))?;
             let inter = gate.dim(2)?;
-            let hidden = (candle_nn::ops::silu(&gate)? * &up)?.reshape((n * self.top_k, inter))?;
+            let hidden = self.act.hidden(&gate, &up, || Ok(top_ids.clone()))?.reshape((n * self.top_k, ()))?;
             let down = hidden.apply_op2_no_bwd(&slots, &self.store.bank_op(self.layer, 2, self.top_k, true))?; // (n, k, h)
+            let down = self.act.finish(down, || Ok(top_ids.clone()))?;
             if n == 1 && shaped() && self.store.requant.is_some() {
                 self.store.note_shape(self.layer, &xs, &hidden)?;
             }
@@ -2607,6 +2797,6 @@ impl StreamedMoe {
                 st.maths_seconds += maths_started.elapsed().as_secs_f64();
             }
         }
-        out.reshape((b, s, h))?.to_dtype(dtype)
+        out.reshape((b, s, ()))?.to_dtype(dtype)
     }
 }

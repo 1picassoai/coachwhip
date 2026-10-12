@@ -158,7 +158,6 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle?rev=5ba5d5b468b5b1df40e82dd3d556987bedeea041#5ba5d5b468b5b1df40e82dd3d556987bedeea041"
 dependencies = [
  "byteorder",
  "candle-metal-kernels",
@@ -290,7 +289,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "coachwhip"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -303,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "coachwhip-engine"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -317,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "coachwhip-prepare"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -327,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "coachwhip-server"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "candle-core",

@@ -9,6 +9,23 @@ What each model file does on a 16 GB Mac, measured the same way every time. Thes
 - **Speed:** the five coding prompts in [`bench/speed/prompts.json`](../bench/speed/prompts.json), each a fresh conversation capped at 300 tokens, run by [`bench/speed/run.py`](../bench/speed/run.py). "Writing" is answer tokens per second from the first token to the last, the same thing the chat shows under each answer; the table gives the mean over the five prompts, with the slowest and fastest in brackets.
 - **Quality:** 8 small coding tasks in [`bench/quality/tasks.json`](../bench/quality/tasks.json). Each answer's code is run against tests the model never sees ([`bench/quality/tests.py`](../bench/quality/tests.py)); a task passes only if every test does. Quality depends on the model file, not on Coachwhip's settings: the bank and the prefetch change how fast an answer comes, never what it says.
 
+## gpt-oss-120b
+
+OpenAI's open model (architecture `gpt-oss`): 36 layers, 128 experts of which 4 are used per word; it thinks before it answers. It runs from a **squeezed file** that `coachwhip-prepare` makes on your Mac from the official [MXFP4 GGUF](https://huggingface.co/ggml-org/gpt-oss-120b-GGUF) (63.4 GB): every expert matrix to Q2_K, rows padded to whole 256-weight blocks, the rest untouched; 42.6 GB written, about 106 GB free needed while both files exist. See the README, gpt-oss-120b.
+
+Mac mini M4, 16 GB, `--parallel --flash-reads`, bank 25 (the Wrangler's pick), temperature 0. Measured on one coding task, a cancellable async task pool in TypeScript (about 4,000 words of thinking and code), against 20 hidden checks:
+
+| Mode | Writing | Score of 5 | Second version of the task |
+|---|---|---|---|
+| Fast, `--stand-ins` | 9.8 tok/s | 4.0 | 4.0 at 10.0 tok/s |
+| The model's own 4 experts | 4.2 tok/s | 4.8 | |
+
+This model is measured on its own task, not the five-prompt speed set above: its thinking makes 300-token answers mostly thinking. Every setup we measured, and what makes it fast: [GPT-OSS.md](GPT-OSS.md).
+
+- **Why the squeeze:** at MXFP4's 13.2 MB per expert the bank holds 15 experts a layer; at Q2_K's 8.7 MB it holds 25. On the task above the squeezed file scores the same as the original download.
+- **Why fast mode changes answers:** a light pick that is not in the bank is replaced by the best expert that is. The first pick is always read for real, and the second whenever it carries at least 0.3 of the weight.
+- Tokenizer: [tokenizer.json](https://huggingface.co/openai/gpt-oss-120b) from the model's own page.
+
 ## Qwen3.5-122B-A10B
 
 The biggest model Coachwhip runs on 16 GB (architecture `qwen35moe`): 48 layers, 256 experts of which 8 are used per word. It runs from a **squeezed file** that `coachwhip-prepare` makes on your Mac from the publisher's Q3_K_M (59 GB): each expert's gate and up matrices to Q2_K on the GPU, its down matrix to Q3_K, the rest untouched; 45 GB written in 5 to 9 minutes on an M4, and about 105 GB free needed while both files exist. See the README, The 122B.

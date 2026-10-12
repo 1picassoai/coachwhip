@@ -22,6 +22,7 @@ pub enum GgmlDType {
     F16,
     F32,
     BF16,
+    Mxfp4,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -67,6 +68,7 @@ pub fn call_quantized_matmul_mv_t(
         | GgmlDType::Q5_0
         | GgmlDType::Q5_1
         | GgmlDType::Q8_0
+        | GgmlDType::Mxfp4
         | GgmlDType::Q8_1 => {
             let nth0 = 8;
             let nth1 = 8;
@@ -129,6 +131,7 @@ pub fn call_quantized_matmul_mv_t(
         GgmlDType::Q5_0 => "kernel_mul_mv_q5_0_f32",
         GgmlDType::Q5_1 => "kernel_mul_mv_q5_1_f32",
         GgmlDType::Q8_0 => "kernel_mul_mv_q8_0_f32",
+        GgmlDType::Mxfp4 => "kernel_mul_mv_mxfp4_f32",
         GgmlDType::Q8_1 => "kernel_mul_mv_q8_1_f32",
         GgmlDType::Q2K => "kernel_mul_mv_q2_K_f32",
         GgmlDType::Q3K => "kernel_mul_mv_q3_K_f32",
@@ -245,6 +248,7 @@ pub fn call_quantized_matmul_mm_t(
         GgmlDType::F32 => "kernel_mul_mm_f32_f32",
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
+        GgmlDType::Mxfp4 => Err(MetalKernelError::UnsupportedDTypeForOp("Mxfp4", "qmatmul mm"))?,
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
@@ -313,6 +317,7 @@ pub fn call_quantized_get_rows(
         GgmlDType::Q6K => "kernel_get_rows_q6_K",
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "get_rows"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "get_rows"))?,
+        GgmlDType::Mxfp4 => Err(MetalKernelError::UnsupportedDTypeForOp("Mxfp4", "get_rows"))?,
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;

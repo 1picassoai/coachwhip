@@ -30,7 +30,7 @@ pub fn matvec_id(
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
     let (nth0, nth1, align) = match dtype {
-        GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1 | GgmlDType::Q8_0 | GgmlDType::Q8_1 => (8, 8, 8),
+        GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1 | GgmlDType::Q8_0 | GgmlDType::Q8_1 | GgmlDType::Mxfp4 => (8, 8, 8),
         GgmlDType::Q2K => (2, 32, 8),
         GgmlDType::Q4K => (4, 8, 4),
         GgmlDType::Q3K | GgmlDType::Q5K => (2, 32, 4),
@@ -43,6 +43,7 @@ pub fn matvec_id(
         GgmlDType::Q5_0 => "kernel_mul_mv_id_q5_0_f32",
         GgmlDType::Q5_1 => "kernel_mul_mv_id_q5_1_f32",
         GgmlDType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
+        GgmlDType::Mxfp4 => "kernel_mul_mv_id_mxfp4_f32",
         GgmlDType::Q2K => "kernel_mul_mv_id_q2_K_f32",
         GgmlDType::Q3K => "kernel_mul_mv_id_q3_K_f32",
         GgmlDType::Q4K => "kernel_mul_mv_id_q4_K_f32",

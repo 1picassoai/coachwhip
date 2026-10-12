@@ -1,0 +1,47 @@
+[package]
+name = "candle-core"
+version = "0.11.0"
+edition = "2021"
+description = "Minimalist ML framework. Vendored at rev 5ba5d5b for Coachwhip with MXFP4 (candle PR #3899)."
+repository = "https://github.com/huggingface/candle"
+keywords = ["blas", "tensor", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+autobenches = false
+autoexamples = false
+
+[dependencies]
+byteorder = "1.4.3"
+candle-metal-kernels = { path = "../candle-metal-kernels", version = "0.11.0", optional = true }
+objc2-metal = { version = "0.3.1", optional = true }
+objc2-foundation = { version = "0.3.1", optional = true }
+gemm = { version = "0.19.0", features = ["wasm-simd128-enable"] }
+half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr", "zerocopy"] }
+float8 = { version = "0.7.0", features = ["num-traits", "rand_distr"] }
+libc = { version = "0.2.147" }
+libm = { version = "0.2.15" }
+memmap2 = { version = "0.9.3", features = ["stable_deref_trait"] }
+num-traits = "0.2.15"
+num_cpus = "1.15.0"
+rand = "0.9.0"
+rand_distr = "0.5.1"
+rayon = "1.7.0"
+safetensors = "0.8.0"
+thiserror = "2"
+yoke = { version = "0.8.1", features = ["derive"] }
+zerocopy = "0.8"
+zip = { version = "8.6.0", default-features = false }
+parking_lot = "0.12.5"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+
+[features]
+default = []
+metal = [
+    "dep:objc2-metal",
+    "dep:objc2-foundation",
+    "dep:candle-metal-kernels",
+]
+metal-debug-labels = ["metal", "candle-metal-kernels/debug-labels"]

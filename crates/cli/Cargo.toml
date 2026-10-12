@@ -1,6 +1,6 @@
 [package]
 name = "coachwhip"
-description = "Run mixture-of-experts models bigger than your memory on a Mac: an 80B model on 16 GB. The experts stream from the SSD into a small GPU bank."
+description = "Run mixture-of-experts models bigger than your memory on a Mac: a 122B model on 16 GB. The experts stream from the SSD into a small GPU bank."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

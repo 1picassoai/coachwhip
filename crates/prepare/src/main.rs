@@ -18,7 +18,9 @@ fn target(name: &str, dtype: GgmlDType) -> GgmlDType {
     if name.ends_with(".ffn_gate_exps.weight") || name.ends_with(".ffn_up_exps.weight") {
         GgmlDType::Q2K
     } else if name.ends_with(".ffn_down_exps.weight") {
-        GgmlDType::Q3K
+        // MXFP4 experts (gpt-oss) take down to Q2_K too: measured on the task-pool exam, the 120b
+        // squeezed this way scores as the original. K-quant experts (Qwen) keep down at Q3_K.
+        if dtype == GgmlDType::Mxfp4 || std::env::var("COACHWHIP_DOWN_Q2K").is_ok() { GgmlDType::Q2K } else { GgmlDType::Q3K }
     } else {
         dtype
     }
@@ -92,7 +94,19 @@ fn dtype_code(d: GgmlDType) -> u32 {
         GgmlDType::Q6K => 14,
         GgmlDType::Q8K => 15,
         GgmlDType::BF16 => 30,
+        GgmlDType::Mxfp4 => 39,
     }
+}
+
+/// A K-quant reads rows in whole 256-weight blocks; a row that is not a multiple of 256 (gpt-oss:
+/// 2880) is padded with zeros to the next one. The engine pads its input to match.
+fn out_dims(dims: &[usize], from: GgmlDType, to: GgmlDType) -> Vec<usize> {
+    let mut d = dims.to_vec();
+    if to != from {
+        let last = d.len() - 1;
+        d[last] = d[last].div_ceil(to.block_size()) * to.block_size();
+    }
+    d
 }
 
 fn bytes_for(dtype: GgmlDType, elems: usize) -> usize {
@@ -134,7 +148,7 @@ fn main() -> Result<()> {
             changed += 1;
         }
         new_offsets.push(offset);
-        offset += bytes_for(to, info.shape.elem_count()) as u64;
+        offset += bytes_for(to, out_dims(info.shape.dims(), info.ggml_dtype, to).iter().product()) as u64;
         offset = (offset + align - 1) / align * align;
     }
     eprintln!("coachwhip-prepare: {} tensors, {changed} to rewrite, {:.1} GB out", infos.len(), offset as f64 / 1e9);
@@ -170,7 +184,7 @@ fn main() -> Result<()> {
     }
     for ((name, info), new_off) in infos.iter().zip(&new_offsets) {
         write_string(&mut w, name)?;
-        let dims = info.shape.dims();
+        let dims = out_dims(info.shape.dims(), info.ggml_dtype, target(name, info.ggml_dtype));
         w.write_u32::<LittleEndian>(dims.len() as u32)?;
         for &d in dims.iter().rev() {
             w.write_u64::<LittleEndian>(d as u64)?;
@@ -211,6 +225,21 @@ fn main() -> Result<()> {
             let data = unsafe { std::slice::from_raw_parts(dst_buf.contents() as *const u8, out_len) };
             w.write_all(data)?;
             written += out_len as u64;
+        } else if out_dims(info.shape.dims(), info.ggml_dtype, to) != info.shape.dims() {
+            // Padded rows: one expert at a time, so a big tensor never sits in memory as f32.
+            let dims = info.shape.dims();
+            let (n, rows, cols) = (dims[0], dims[1], dims[2]);
+            let padded = out_dims(dims, info.ggml_dtype, to)[2];
+            let per = bytes_for(info.ggml_dtype, rows * cols);
+            for e in 0..n {
+                let storage = QStorage::from_data(Cow::Owned(buf[e * per..(e + 1) * per].to_vec()), &Device::Cpu, info.ggml_dtype)?;
+                let f = QTensor::new(storage, (rows, cols))?.dequantize(&Device::Cpu)?;
+                let f = f.pad_with_zeros(1, 0, padded - cols)?;
+                let q2 = QTensor::quantize(&f, to)?;
+                let data = q2.data()?;
+                w.write_all(&data)?;
+                written += data.len() as u64;
+            }
         } else {
             let storage = QStorage::from_data(Cow::Owned(buf), &Device::Cpu, info.ggml_dtype)?;
             let q = QTensor::new(storage, info.shape.clone())?;
