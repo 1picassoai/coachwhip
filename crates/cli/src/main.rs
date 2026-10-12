@@ -154,7 +154,9 @@ fn main() -> Result<()> {
         (arch == "qwen35moe" && layers >= 48, arch == "gpt-oss")
     };
     // gpt-oss guesses about half the experts it uses per word (13 MB each makes a wrong guess dear).
-    let oss_guess = args.experts.map_or(2, |k| (k / 2).max(1));
+    // With stand-ins most picks are already in the bank; one guess a layer keeps the guessed reads
+    // out of the way of the ones a word needs (1,000 words: 8.4 tok/s at 2 guesses, 10.9 at 1).
+    let oss_guess = if args.stand_ins { 1 } else { args.experts.map_or(2, |k| (k / 2).max(1)) };
     let (prefetch, ahead) = match (args.prefetch, args.ahead) {
         (Some(p), Some(a)) => (p, a),
         (Some(p), None) => (p, if big || oss { 2 } else { 4 }),
