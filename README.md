@@ -11,7 +11,7 @@
 
 Coachwhip is one Rust binary. It takes a model file in GGUF format, keeps the part of the model every word needs on the GPU, and streams the rest from the SSD as each word asks for it. A 120-billion-parameter model runs on a 16 GB Mac. Which models, how fast, and how to set each one up: [docs/MODELS.md](docs/MODELS.md).
 
-<p align="center"><img src="docs/coachwhip-demo.gif" alt="A 122-billion-parameter model writing TypeScript in the Coachwhip chat on a 16 GB Mac mini, in real time" width="720"></p>
+<p align="center"><img src="docs/coachwhip-demo.gif" alt="gpt-oss-120b thinking, then writing TypeScript in the Coachwhip chat on a 16 GB Mac mini, in real time" width="720"></p>
 
 ## Why we built it
 
