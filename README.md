@@ -40,9 +40,9 @@ That is fast mode: 13.4 tok/s on a short prompt, 11.5 tok/s with a 13,000-token 
 
 That is fast mode, about 10 tok/s; drop `--stand-ins` for every expert read at 4.2 tok/s. The other models, and what each needs: [docs/MODELS.md](docs/MODELS.md).
 
-<p align="center"><img src="docs/coachwhip-demo-gptoss.gif" alt="gpt-oss-120b thinking, then writing TypeScript in the Coachwhip chat on a 16 GB Mac mini, in real time" width="720"></p>
+<p align="center"><img src="docs/coachwhip-demo-coder.gif" alt="The 80B Qwen3-Coder-Next writing a TypeScript function in the Coachwhip chat on a 16 GB Mac mini, in real time, at 13 tok/s" width="720"></p>
 
-That is the real chat page on a Mac mini M4 with 16 GB, in real time: the model thinks, then writes. One line installs Coachwhip in under a minute; then download the model file once and squeeze it on your own Mac, as in [gpt-oss-120b](docs/MODELS.md#gpt-oss-120b). Qwen's MoE models run too: [docs/MODELS.md](docs/MODELS.md).
+That is the real chat page on a Mac mini M4 with 16 GB, in real time, the 80B coder on the ready-squeezed file. One line installs Coachwhip in under a minute; then download the model file once. The other models, and what each needs: [docs/MODELS.md](docs/MODELS.md).
 
 Coachwhip is one Rust binary. It takes a model file in GGUF format, keeps the part of the model every word needs on the GPU, and streams the rest from the SSD as each word asks for it. The model stays big; only its working set is in memory.
 
