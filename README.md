@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/1picassoai/coachwhip/main/install.s
 
 **Then, two steps and you are talking to the coder:**
 
-1. Download the ready-squeezed file, [`Qwen3-Coder-Next.Q2X.gguf`](HF_LINK) (29 GB, sha256 `cdc0584c1e4d30134cbb83f18e4c7607af90bd1145a64940c7a357b02a0216af`), and the model's [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next). Nothing to squeeze; it was squeezed once on our Mac with the same `coachwhip-prepare` you get in the install.
+1. Download the ready-squeezed file, [`Qwen3-Coder-Next.Q2X.gguf`](https://huggingface.co/vinnj/coachwhip-models/resolve/main/Qwen3-Coder-Next.Q2X.gguf) (29 GB, sha256 `cdc0584c1e4d30134cbb83f18e4c7607af90bd1145a64940c7a357b02a0216af`), and the model's [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next). Nothing to squeeze; it was squeezed once on our Mac with the same `coachwhip-prepare` you get in the install.
 2. Start it. The chat opens in your browser:
    ```sh
    ~/coachwhip/coachwhip.sh ~/Downloads/Qwen3-Coder-Next.Q2X.gguf ~/Downloads/tokenizer.json 109 8090 --parallel --flash-reads --stand-ins
