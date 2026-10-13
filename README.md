@@ -78,17 +78,14 @@ Two reasons, and both had to hold at once.
 ~/coachwhip/coachwhip.sh /path/to/model.gguf /path/to/tokenizer.json 56
 ```
 
-The last number is the bank, the expert slots kept on the GPU per layer (44 if you leave it out; each model's number is on the models page). The chat opens in your browser. Type, press Send, and the answer streams as it is written. Follow-up questions read only your new words; press **New chat** to start again. Stop Coachwhip with Ctrl+C.
+The last number is the bank: expert slots kept on the GPU per layer. Each model's number is on the [models page](docs/MODELS.md). Ctrl+C stops it.
 
-**Thinking.** A model that thinks before it answers shows its thinking in a box above the answer. A model with an optional thinking mode shows a **let it think first** box on the page. Either way Coachwhip only puts the model's own template text at the start of its turn; each word comes at the same speed, and thinking makes the reply longer, not slower per word. In the terminal it is `--think`; through the API it is always off, so coding tools get the answer.
+- A thinking model shows its thinking in a box above the answer. Through the API thinking is off, so coding tools get the answer.
+- A conversation holds up to 16K tokens, sized for a 16 GB Mac.
+- Only programs on this Mac can reach it. The chat page and your tools share one model, one request at a time.
+- Tested with the official `openai` Python client and with [Aider](https://aider.chat). `--map-tokens 0` turns off Aider's repository map, which adds about a thousand tokens to every request.
 
-**Through the API,** a conversation holds up to 16K tokens: the history, the question and the answer together. That limit is sized to fit a 16 GB Mac; the models themselves support longer.
-
-Only programs on this Mac can reach it. Follow-ups that resend the whole conversation read only the new part. The chat page and your tools share one model, one request at a time; when a tool has used it, the page's next question starts a new chat.
-
-Tested with the official `openai` Python client and with [Aider](https://aider.chat). `--map-tokens 0` in the Aider line turns off its repository map, which adds up to about a thousand tokens to each request by default.
-
-<p align="center"><img src="docs/coachwhip-aider.png" alt="Aider using an 80-billion-parameter coder through Coachwhip on a 16 GB Mac: it finds a sort-order bug and rewrites the file" width="720"></p>
+<p align="center"><img src="docs/coachwhip-aider.png" alt="Aider using an 80B coder through Coachwhip on a 16 GB Mac: it finds a sort-order bug and rewrites the file" width="720"></p>
 
 **One answer in the terminal:**
 
