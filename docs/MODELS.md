@@ -155,7 +155,17 @@ Measured 9 Oct 2026 on Coachwhip 0.4.0 by the tester, greedy. Exact mode (the mo
 
 ## Qwen3-Coder-Next (80B)
 
-The 80B coder has no thinking mode. Download the file below and its [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next), then start it with a bank of 70 for the Q3_K_M file or 56 for the Q4_K_M:
+The 80B coder has no thinking mode.
+
+**The fast path, from 0.5.1: the ready-squeezed file.** Download [`Qwen3-Coder-Next.Q2X.gguf`](https://huggingface.co/vinnj/coachwhip-models/resolve/main/Qwen3-Coder-Next.Q2X.gguf) (29.3 GB, sha256 `cdc0584c1e4d30134cbb83f18e4c7607af90bd1145a64940c7a357b02a0216af`; 30 GB free to keep it) and the [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next), then:
+
+```sh
+~/coachwhip/coachwhip.sh ~/Downloads/Qwen3-Coder-Next.Q2X.gguf ~/Downloads/tokenizer.json 109 8090 --parallel --flash-reads --stand-ins
+```
+
+Measured on the 0.5.0 build, Mac mini M4 16 GB, tester's hand, three runs each: 12.8 to 13.4 tok/s on short prompts, 11.5 tok/s at a 13,061-token prompt, 10.67 GB peak of the 12.71 GB GPU limit, 3.00 GB left for macOS at its tightest. `--stand-ins` changes the answers; on the retry-helper prompt it scored 4.5 of 5 against the plain file's 5. Details and what is not yet measured: [release notes 0.5.1](releases/0.5.1.md). The file was made from the Q3_K_M below by the shipped `coachwhip-prepare` (gate and up experts to Q2_K, down to Q3_K), and the squeeze is reproducible: remade from the same source, the same sha256. To make it yourself you need about 67 GB free for the 211 seconds it takes.
+
+**The plain path, every expert read:** download the file below and its [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next), then start it with a bank of 70 for the Q3_K_M file or 56 for the Q4_K_M:
 
 ```sh
 ~/coachwhip/coachwhip.sh ~/Downloads/Qwen3-Coder-Next.Q3_K_M.gguf ~/Downloads/tokenizer.json 70
