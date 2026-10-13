@@ -7,7 +7,7 @@
 
 # Coachwhip
 
-**The 80-billion-parameter Qwen3-Coder-Next on a 16 GB Mac, at about 13 tok/s. Fully offline. Nothing leaves your machine.**
+**The 80-billion-parameter Qwen3-Coder-Next on a 16 GB Mac, at about 12 tok/s. Fully offline. Nothing leaves your machine.**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/1picassoai/coachwhip/main/install.sh | bash
@@ -23,7 +23,7 @@ curl -fsSL https://raw.githubusercontent.com/1picassoai/coachwhip/main/install.s
    ~/coachwhip/coachwhip.sh ~/Downloads/Qwen3-Coder-Next.Q2X.gguf ~/Downloads/tokenizer.json 109 8090 --parallel --flash-reads --stand-ins
    ```
 
-That is fast mode, about 13 tok/s on a real answer; drop `--stand-ins` for every expert read at about 5. Measured on a Mac mini M4 with 16 GB; the numbers and the quality check are in the [release notes](docs/releases/0.5.1.md).
+That is fast mode: 13.4 tok/s on a short prompt, 11.5 tok/s with a 13,000-token prompt, three runs each, with 3 GB left for macOS at its tightest; drop `--stand-ins` for every expert read at about 5. Measured on a Mac mini M4 with 16 GB; the numbers and the quality check are in the [release notes](docs/releases/0.5.1.md).
 
 **Also on a 16 GB Mac: OpenAI's gpt-oss-120b at about 10 tok/s.** It thinks before it answers. Four steps, because its official file is squeezed on your own Mac (106 GB free while it runs, 43 GB after):
 
