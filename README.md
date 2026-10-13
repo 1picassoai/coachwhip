@@ -13,6 +13,8 @@
 curl -fsSL https://raw.githubusercontent.com/1picassoai/coachwhip/main/install.sh | bash
 ```
 
+**You need:** a Mac with Apple silicon and 16 GB, macOS 26, and about 106 GB of free disk while the model is squeezed once (43 GB after). Not a Mac, or less than 16 GB: it will not run, and we would rather say so here than after the click.
+
 <p align="center"><img src="docs/coachwhip-demo-gptoss.gif" alt="gpt-oss-120b thinking, then writing TypeScript in the Coachwhip chat on a 16 GB Mac mini, in real time" width="720"></p>
 
 That is the real chat page on a Mac mini M4 with 16 GB, in real time: the model thinks, then writes. One line installs Coachwhip in under a minute; then download the model file once and squeeze it on your own Mac, as in [gpt-oss-120b](docs/MODELS.md#gpt-oss-120b). Qwen's MoE models run too: [docs/MODELS.md](docs/MODELS.md).
