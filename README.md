@@ -7,15 +7,25 @@
 
 # Coachwhip
 
-**OpenAI's gpt-oss-120b on a 16 GB Mac, at about 10 tok/s. Fully offline. Nothing leaves your machine.**
+**The 80-billion-parameter Qwen3-Coder-Next on a 16 GB Mac, at about 13 tok/s. Fully offline. Nothing leaves your machine.**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/1picassoai/coachwhip/main/install.sh | bash
 ```
 
-**You need:** a Mac with Apple silicon and 16 GB, macOS 26, and about 106 GB of free disk while the model is squeezed once (43 GB after). Not a Mac, or less than 16 GB: it will not run, and we would rather say so here than after the click.
+**You need:** a Mac with Apple silicon and 16 GB, macOS 26, and 30 GB of free disk. Not a Mac, or less than 16 GB: it will not run, and we would rather say so here than after the click.
 
-**Then, for gpt-oss-120b, four steps and you are talking to it:**
+**Then, two steps and you are talking to the coder:**
+
+1. Download the ready-squeezed file, [`Qwen3-Coder-Next.Q2X.gguf`](HF_LINK) (29 GB, sha256 `cdc0584c1e4d30134cbb83f18e4c7607af90bd1145a64940c7a357b02a0216af`), and the model's [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next). Nothing to squeeze; it was squeezed once on our Mac with the same `coachwhip-prepare` you get in the install.
+2. Start it. The chat opens in your browser:
+   ```sh
+   ~/coachwhip/coachwhip.sh ~/Downloads/Qwen3-Coder-Next.Q2X.gguf ~/Downloads/tokenizer.json 109 8090 --parallel --flash-reads --stand-ins
+   ```
+
+That is fast mode, about 13 tok/s on a real answer; drop `--stand-ins` for every expert read at about 5. Measured on a Mac mini M4 with 16 GB; the numbers and the quality check are in the [release notes](docs/releases/0.5.1.md).
+
+**Also on a 16 GB Mac: OpenAI's gpt-oss-120b at about 10 tok/s.** It thinks before it answers. Four steps, because its official file is squeezed on your own Mac (106 GB free while it runs, 43 GB after):
 
 1. Download the official [MXFP4 file](https://huggingface.co/ggml-org/gpt-oss-120b-GGUF) (63.4 GB) and the model's [tokenizer.json](https://huggingface.co/openai/gpt-oss-120b).
 2. Squeeze it once, about 13 minutes:
