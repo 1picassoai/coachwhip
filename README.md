@@ -15,6 +15,21 @@ curl -fsSL https://raw.githubusercontent.com/1picassoai/coachwhip/main/install.s
 
 **You need:** a Mac with Apple silicon and 16 GB, macOS 26, and about 106 GB of free disk while the model is squeezed once (43 GB after). Not a Mac, or less than 16 GB: it will not run, and we would rather say so here than after the click.
 
+**Then, for gpt-oss-120b, four steps and you are talking to it:**
+
+1. Download the official [MXFP4 file](https://huggingface.co/ggml-org/gpt-oss-120b-GGUF) (63.4 GB) and the model's [tokenizer.json](https://huggingface.co/openai/gpt-oss-120b).
+2. Squeeze it once, about 13 minutes:
+   ```sh
+   ~/coachwhip/target/release/coachwhip-prepare ~/Downloads/gpt-oss-120b-MXFP4.gguf ~/Downloads/gpt-oss-120b.Q2A.gguf
+   ```
+3. Delete the download; only the squeezed file is used: `rm ~/Downloads/gpt-oss-120b-MXFP4.gguf`
+4. Start it. The chat opens in your browser:
+   ```sh
+   ~/coachwhip/coachwhip.sh ~/Downloads/gpt-oss-120b.Q2A.gguf ~/Downloads/tokenizer.json 25 8090 --parallel --flash-reads --stand-ins --max-tokens 8000
+   ```
+
+That is fast mode, about 10 tok/s; drop `--stand-ins` for every expert read at 4.2 tok/s. The other models, and what each needs: [docs/MODELS.md](docs/MODELS.md).
+
 <p align="center"><img src="docs/coachwhip-demo-gptoss.gif" alt="gpt-oss-120b thinking, then writing TypeScript in the Coachwhip chat on a 16 GB Mac mini, in real time" width="720"></p>
 
 That is the real chat page on a Mac mini M4 with 16 GB, in real time: the model thinks, then writes. One line installs Coachwhip in under a minute; then download the model file once and squeeze it on your own Mac, as in [gpt-oss-120b](docs/MODELS.md#gpt-oss-120b). Qwen's MoE models run too: [docs/MODELS.md](docs/MODELS.md).
