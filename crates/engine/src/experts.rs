@@ -94,6 +94,30 @@ pub struct Slots {
 }
 
 /// A zeroed quantised buffer of exactly `elems` weights, outside candle's power-of-two rounding.
+/// A Metal buffer of exactly these bytes, as quantised storage of `dtype` (no power-of-two rounding).
+fn exact_load(metal: &MetalDevice, dtype: GgmlDType, raw: &[u8]) -> Result<QMetalStorage> {
+    use candle::quantized::k_quants::*;
+    use candle::quantized::metal::load_quantized;
+    fn cast<T>(raw: &[u8]) -> &[T] {
+        unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const T, raw.len() / std::mem::size_of::<T>()) }
+    }
+    let q = match dtype {
+        GgmlDType::Q2K => load_quantized(metal, cast::<BlockQ2K>(raw))?,
+        GgmlDType::Q3K => load_quantized(metal, cast::<BlockQ3K>(raw))?,
+        GgmlDType::Q4K => load_quantized(metal, cast::<BlockQ4K>(raw))?,
+        GgmlDType::Q5K => load_quantized(metal, cast::<BlockQ5K>(raw))?,
+        GgmlDType::Q6K => load_quantized(metal, cast::<BlockQ6K>(raw))?,
+        GgmlDType::Iq2Xxs => load_quantized(metal, cast::<BlockIq2Xxs>(raw))?,
+        GgmlDType::Iq3Xxs => load_quantized(metal, cast::<BlockIq3Xxs>(raw))?,
+        GgmlDType::Iq4Xs => load_quantized(metal, cast::<BlockIq4Xs>(raw))?,
+        other => candle::bail!("resident: no exact load for {other:?}"),
+    };
+    match q {
+        candle::quantized::QStorage::Metal(s) => Ok(s),
+        _ => candle::bail!("resident: not a Metal buffer"),
+    }
+}
+
 fn exact_zeros(metal: &MetalDevice, elems: usize, dtype: GgmlDType) -> Result<QMetalStorage> {
     use candle::quantized::k_quants::{BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K, GgmlType};
     use candle::quantized::metal::load_quantized;
@@ -549,12 +573,19 @@ pub fn use_sharp() -> bool {
 }
 
 /// S4: the GPU never stops for the CPU (`COACHWHIP_PARALLEL=1`).
+pub fn resident_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_RESIDENT").map(|v| v == "1").unwrap_or(false))
+}
+
 pub fn parallel() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COACHWHIP_PARALLEL").is_ok())
 }
 
 pub struct ExpertStore {
+    /// Resident mode: each layer's three expert matrices, whole, loaded once.
+    resident: Mutex<HashMap<usize, [(Arc<QMetalStorage>, GgmlDType, usize, usize, usize); 3]>>,
     file: std::fs::File,
     device: Device,
     metal: MetalDevice,
@@ -716,6 +747,7 @@ impl ExpertStore {
         }
         let started = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let store = Arc::new(Self {
+            resident: Mutex::new(HashMap::new()),
             file,
             device: device.clone(),
             metal: metal.clone(),
@@ -1906,6 +1938,35 @@ impl ExpertStore {
     }
 
     /// One `mul_mv_id` dispatch over a bank matrix.
+    /// Resident mode: this layer's three expert matrices, all experts, read from the file once into
+    /// buffers of their exact size (Candle's zeros rounds up to a power of two: 230 MB would cost 400).
+    fn resident_op(&self, layer: usize, which: usize, nei0: usize, rows_per_expert: bool) -> Result<MoeMatvec> {
+        let mut res = self.resident.lock().unwrap();
+        if !res.contains_key(&layer) {
+            let experts = self.slices[layer].len();
+            let mut out = Vec::with_capacity(3);
+            for m in 0..3 {
+                let s0 = &self.slices[layer][0][m];
+                let mut raw = vec![0u8; s0.bytes * experts];
+                self.file.read_exact_at(&mut raw, s0.offset)?;
+                let storage = exact_load(&self.metal, s0.dtype, &raw)?;
+                out.push((Arc::new(storage), s0.dtype, s0.dims[0], s0.dims[1], s0.bytes));
+            }
+            let arr: [(Arc<QMetalStorage>, GgmlDType, usize, usize, usize); 3] = match out.try_into() {
+                Ok(a) => a,
+                Err(_) => candle::bail!("resident: three matrices"),
+            };
+            res.insert(layer, arr);
+            if let Some((used, limit)) = crate::gpu_sync::gpu_memory(&self.device) {
+                if layer % 10 == 0 || layer + 1 == self.layers {
+                    eprintln!("coachwhip: resident layer {layer} loaded; GPU {:.2} of {:.2} GB", used as f64 / 1e9, limit as f64 / 1e9);
+                }
+            }
+        }
+        let (st, dtype, n, k, bytes) = res[&layer][which].clone();
+        Ok(MoeMatvec { bank: st, dtype, n, k, slots: self.slices[layer].len(), bytes, nei0, rows_per_expert })
+    }
+
     fn bank_op(&self, layer: usize, which: usize, nei0: usize, rows_per_expert: bool) -> MoeMatvec {
         let banks = self.banks.lock().unwrap();
         let m = &banks[&layer].mats[which];
@@ -2400,6 +2461,20 @@ impl StreamedMoe {
             self.store.reached(self.layer);
         }
         let xs = xs.reshape((n, h))?.to_dtype(DType::F32)?.contiguous()?;
+
+        // Resident mode: every expert is on the GPU; the GPU routes and its picks are the addresses.
+        if resident_on() && !self.store.drafting() {
+            let logits = self.gate.forward(&xs)?;
+            let (top_ids, top_w) = route(&logits, self.top_k, self.norm_topk_prob)?;
+            let ids = top_ids.to_dtype(DType::U32)?.contiguous()?;
+            let gate = xs.apply_op2_no_bwd(&ids, &self.store.resident_op(self.layer, 0, self.top_k, false)?)?;
+            let up = xs.apply_op2_no_bwd(&ids, &self.store.resident_op(self.layer, 1, self.top_k, false)?)?;
+            let hidden = self.act.hidden(&gate, &up, || Ok(top_ids.clone()))?.reshape((n * self.top_k, ()))?;
+            let down = hidden.apply_op2_no_bwd(&ids, &self.store.resident_op(self.layer, 2, self.top_k, true)?)?;
+            let down = self.act.finish(down, || Ok(top_ids.clone()))?;
+            let out = down.broadcast_mul(&top_w.unsqueeze(2)?)?.sum(1)?;
+            return out.reshape((b, s, ()))?.to_dtype(dtype);
+        }
 
         // S6 draft: the bank as it stands is the whole model for this word. No reads, no learning,
         // no prefetch, no bookkeeping; the LRU order is left alone too.
