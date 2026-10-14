@@ -17,6 +17,10 @@ pub const DELTA_STEPS_MAX: usize = 8;
 pub fn delta_steps(qc: &Tensor, kc: &Tensor, vc: &Tensor, beta: &Tensor, log_decay: &Tensor, mut s: Tensor, upto: usize) -> Result<(Tensor, Tensor)> {
     let n_v = kc.dim(1)?;
     let decay = log_decay.exp()?;
+    if upto == 1 && crate::delta_kernel::on() {
+        let (o, s) = crate::delta_kernel::delta_word(&qc.get(0)?, &kc.get(0)?, &vc.get(0)?, &beta.get(0)?, &decay.get(0)?, &s)?;
+        return Ok((o.unsqueeze(0)?, s));
+    }
     let mut outs = Vec::with_capacity(upto);
     for t in 0..upto {
         let kt = kc.get(t)?.unsqueeze(1)?.contiguous()?; // (n_v, 1, dk)
@@ -267,6 +271,7 @@ mod proj_tests {
             dt_bias: g.tensor(&[n_v], 0.5),
             a: (g.tensor(&[n_v], 0.5).abs().unwrap() * -1.0).unwrap(),
             norm: RmsNorm::from_qtensor(QTensor::quantize(&Tensor::ones(dv, DType::F32, &Device::Cpu).unwrap(), GgmlDType::F32).unwrap(), 1e-6).unwrap(),
+            norm_w: Tensor::ones(dv, DType::F32, &Device::Cpu).unwrap(),
             out: qm(&g.tensor(&[h, n_v * dv], 0.3)),
             n_k,
             n_v,
@@ -352,6 +357,8 @@ struct LinearAttn {
     dt_bias: Tensor,
     a: Tensor,
     norm: RmsNorm,
+    /// The output norm's weight as a plain tensor, for the fused kernel.
+    norm_w: Tensor,
     out: QMatMul,
     n_k: usize,
     n_v: usize,
@@ -431,6 +438,32 @@ impl LinearAttn {
 
         let (qkv, z, beta, alpha) = self.project(&x2, l)?;
         let channels = qkv.dim(1)?;
+        if l == 1 && !self.record && crate::attn_kernel::on() {
+            let taps = self.conv_w.dim(1)?;
+            let conv_state = match &self.conv_state {
+                Some(s) => s.to_dtype(DType::F32)?.contiguous()?,
+                None => Tensor::zeros((taps - 1, channels), DType::F32, device)?,
+            };
+            let s = match &self.state {
+                Some(s) => s.to_dtype(DType::F32)?.contiguous()?,
+                None => Tensor::zeros((n_v, dk, dv), DType::F32, device)?,
+            };
+            let op = crate::attn_kernel::GdnWord {
+                conv_state,
+                conv_w: self.conv_w.to_dtype(DType::F32)?.contiguous()?,
+                dt_bias: self.dt_bias.to_dtype(DType::F32)?.contiguous()?,
+                a: self.a.to_dtype(DType::F32)?.contiguous()?,
+                norm_w: self.norm_w.clone(),
+                s,
+                n_k, n_v, dk, dv, taps,
+                cycle: matches!(self.proj, Proj::Split { .. }),
+                eps: self.eps as f32,
+            };
+            let (o, s_new, conv_new) = crate::attn_kernel::gdn_word(op, &qkv, &z, &beta, &alpha)?;
+            self.state = Some(s_new);
+            self.conv_state = Some(conv_new);
+            return self.out.forward(&o)?.reshape((b, l, h));
+        }
         let beta = candle_nn::ops::sigmoid(&beta)?;
         let log_decay = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?; // (l, n_v)
 
@@ -781,6 +814,7 @@ impl Qwen3Next {
                     dt_bias: dense(&mut gg, &format!("{p}.ssm_dt.bias"))?,
                     a: dense(&mut gg, &format!("{p}.ssm_a"))?,
                     norm: gg.rms_norm(&format!("{p}.ssm_norm.weight"), eps)?,
+                    norm_w: dense(&mut gg, &format!("{p}.ssm_norm.weight"))?.to_dtype(DType::F32)?,
                     out: qm(&mut gg, &format!("{p}.ssm_out.weight"))?,
                     n_k: n_group,
                     n_v: dt_rank,
