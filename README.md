@@ -7,7 +7,7 @@
 
 # Coachwhip
 
-## **Qwen3.6-35B on a 16 GB Mac. {TPS35} tok/s. Fully offline.**
+## **Qwen3.6-35B on a 16 GB Mac. 15 tok/s. Fully offline.**
 
 **Install: under a minute. Model: 14.2 GB, about five minutes on a fast line. Then it runs.**
 
