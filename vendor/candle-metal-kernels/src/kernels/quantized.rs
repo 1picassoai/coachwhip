@@ -23,6 +23,9 @@ pub enum GgmlDType {
     F32,
     BF16,
     Mxfp4,
+    Iq2Xxs,
+    Iq3Xxs,
+    Iq4Xs,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -114,6 +117,8 @@ pub fn call_quantized_matmul_mv_t(
             let align = 8;
             (nth0, nth1, align)
         }
+        GgmlDType::Iq2Xxs | GgmlDType::Iq3Xxs => (4, 16, 8),
+        GgmlDType::Iq4Xs => (4, 16, 4),
     };
     let thread_groups_count = MTLSize {
         width: divide(ne01 as usize, align),
@@ -132,6 +137,9 @@ pub fn call_quantized_matmul_mv_t(
         GgmlDType::Q5_1 => "kernel_mul_mv_q5_1_f32",
         GgmlDType::Q8_0 => "kernel_mul_mv_q8_0_f32",
         GgmlDType::Mxfp4 => "kernel_mul_mv_mxfp4_f32",
+        GgmlDType::Iq2Xxs => "kernel_mul_mv_iq2_xxs_f32",
+        GgmlDType::Iq3Xxs => "kernel_mul_mv_iq3_xxs_f32",
+        GgmlDType::Iq4Xs => "kernel_mul_mv_iq4_xs_f32",
         GgmlDType::Q8_1 => "kernel_mul_mv_q8_1_f32",
         GgmlDType::Q2K => "kernel_mul_mv_q2_K_f32",
         GgmlDType::Q3K => "kernel_mul_mv_q3_K_f32",
@@ -145,9 +153,14 @@ pub fn call_quantized_matmul_mv_t(
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    // IQ shared tables (dense): ggml's grids and signs live in threadgroup memory.
+    let iq_shmem: usize = match dtype { GgmlDType::Iq2Xxs => 256 * 8 + 128, GgmlDType::Iq3Xxs => 256 * 4 + 128, GgmlDType::Iq4Xs => 32 * 4, _ => 0 };
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    if iq_shmem > 0 {
+        encoder.set_threadgroup_memory_length(0, iq_shmem);
+    }
     debug_group!(encoder, "qmm_mv {name} B={b} M={m} K={k} N={n}");
 
     set_params!(
@@ -249,6 +262,9 @@ pub fn call_quantized_matmul_mm_t(
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
         GgmlDType::Mxfp4 => Err(MetalKernelError::UnsupportedDTypeForOp("Mxfp4", "qmatmul mm"))?,
+        GgmlDType::Iq2Xxs => "kernel_mul_mm_iq2_xxs_f32",
+        GgmlDType::Iq3Xxs => "kernel_mul_mm_iq3_xxs_f32",
+        GgmlDType::Iq4Xs => "kernel_mul_mm_iq4_xs_f32",
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
@@ -318,6 +334,7 @@ pub fn call_quantized_get_rows(
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "get_rows"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "get_rows"))?,
         GgmlDType::Mxfp4 => Err(MetalKernelError::UnsupportedDTypeForOp("Mxfp4", "get_rows"))?,
+        GgmlDType::Iq2Xxs | GgmlDType::Iq3Xxs | GgmlDType::Iq4Xs => Err(MetalKernelError::UnsupportedDTypeForOp("IQ", "get_rows"))?,
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;

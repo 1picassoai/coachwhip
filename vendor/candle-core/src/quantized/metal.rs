@@ -115,6 +115,9 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ8K::to_float(&vec, &mut out);
             }
+            GgmlDType::Iq2Xxs | GgmlDType::Iq3Xxs | GgmlDType::Iq4Xs => {
+                crate::bail!("{:?} has no CPU dequant in Coachwhip; it runs on Metal only", self.dtype)
+            }
             GgmlDType::Mxfp4 => {
                 let vec: Vec<crate::quantized::BlockMxfp4> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockMxfp4::to_float(&vec, &mut out);
@@ -504,6 +507,9 @@ impl TryFrom<GgmlDType> for candle_metal_kernels::GgmlDType {
             GgmlDType::F32 => Ok(candle_metal_kernels::GgmlDType::F32),
             GgmlDType::BF16 => Ok(candle_metal_kernels::GgmlDType::BF16),
             GgmlDType::Mxfp4 => Ok(candle_metal_kernels::GgmlDType::Mxfp4),
+            GgmlDType::Iq2Xxs => Ok(candle_metal_kernels::GgmlDType::Iq2Xxs),
+            GgmlDType::Iq3Xxs => Ok(candle_metal_kernels::GgmlDType::Iq3Xxs),
+            GgmlDType::Iq4Xs => Ok(candle_metal_kernels::GgmlDType::Iq4Xs),
         }
     }
 }

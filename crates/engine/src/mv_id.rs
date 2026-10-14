@@ -36,6 +36,8 @@ pub fn matvec_id(
         GgmlDType::Q3K | GgmlDType::Q5K => (2, 32, 4),
         GgmlDType::Q6K => (2, 32, 2),
         GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::Q8K | GgmlDType::F32 => (32, 1, 8),
+        GgmlDType::Iq2Xxs | GgmlDType::Iq3Xxs => (4, 16, 8),
+        GgmlDType::Iq4Xs => (4, 16, 4),
     };
     let name = match dtype {
         GgmlDType::Q4_0 => "kernel_mul_mv_id_q4_0_f32",
@@ -44,6 +46,9 @@ pub fn matvec_id(
         GgmlDType::Q5_1 => "kernel_mul_mv_id_q5_1_f32",
         GgmlDType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
         GgmlDType::Mxfp4 => "kernel_mul_mv_id_mxfp4_f32",
+        GgmlDType::Iq2Xxs => "kernel_mul_mv_id_iq2_xxs_f32",
+        GgmlDType::Iq3Xxs => "kernel_mul_mv_id_iq3_xxs_f32",
+        GgmlDType::Iq4Xs => "kernel_mul_mv_id_iq4_xs_f32",
         GgmlDType::Q2K => "kernel_mul_mv_id_q2_K_f32",
         GgmlDType::Q3K => "kernel_mul_mv_id_q3_K_f32",
         GgmlDType::Q4K => "kernel_mul_mv_id_q4_K_f32",
@@ -57,6 +62,11 @@ pub fn matvec_id(
     let encoder = ep.encoder();
     let encoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    // IQ kernels keep ggml's grids and signs in threadgroup memory.
+    let iq_shmem: usize = match dtype { GgmlDType::Iq2Xxs => 256 * 8 + 128, GgmlDType::Iq3Xxs => 256 * 4 + 128, GgmlDType::Iq4Xs => 32 * 4, _ => 0 };
+    if iq_shmem > 0 {
+        encoder.set_threadgroup_memory_length(0, iq_shmem);
+    }
 
     let ne00 = k as i64;
     let ne01 = n as i64;

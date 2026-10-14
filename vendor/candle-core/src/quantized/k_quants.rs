@@ -2951,3 +2951,43 @@ verify_block_sizes!(
     BlockQ4_0, BlockQ4_1, BlockQ5_0, BlockQ5_1, BlockQ8_0, BlockQ8_1, BlockQ2K, BlockQ3K, BlockQ4K,
     BlockQ5K, BlockQ6K, BlockQ8K, f32, f16, bf16
 );
+
+// IQ2_XXS / IQ3_XXS / IQ4_XS (ggml-common.h). Stored and run on Metal only: ggml's Metal kernels read
+// them; there is no CPU dequant here, so a CPU path on these types is an error, not a silent wrong answer.
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIq2Xxs { pub(crate) d: f16, pub(crate) qs: [u16; QK_K / 8] }
+const _: () = assert!(std::mem::size_of::<BlockIq2Xxs>() == 66);
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIq3Xxs { pub(crate) d: f16, pub(crate) qs: [u8; 3 * QK_K / 8] }
+const _: () = assert!(std::mem::size_of::<BlockIq3Xxs>() == 98);
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIq4Xs { pub(crate) d: f16, pub(crate) scales_h: u16, pub(crate) scales_l: [u8; QK_K / 64], pub(crate) qs: [u8; QK_K / 2] }
+const _: () = assert!(std::mem::size_of::<BlockIq4Xs>() == 136);
+
+macro_rules! metal_only_block {
+    ($t:ty, $dt:expr) => {
+        impl GgmlType for $t {
+            const DTYPE: GgmlDType = $dt;
+            const BLCK_SIZE: usize = QK_K;
+            type VecDotType = BlockQ8K;
+            fn to_float(_xs: &[Self], _ys: &mut [f32]) {
+                panic!("{:?} has no CPU dequant in Coachwhip; it runs on Metal only", Self::DTYPE)
+            }
+            fn from_float(_xs: &[f32], _ys: &mut [Self]) {
+                panic!("{:?} cannot be quantized by Coachwhip", Self::DTYPE)
+            }
+            fn vec_dot(_n: usize, _xs: &[Self], _ys: &[Self::VecDotType]) -> f32 {
+                panic!("{:?} has no CPU matmul in Coachwhip; it runs on Metal only", Self::DTYPE)
+            }
+            fn vec_dot_unopt(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+                Self::vec_dot(n, xs, ys)
+            }
+        }
+    };
+}
+metal_only_block!(BlockIq2Xxs, GgmlDType::Iq2Xxs);
+metal_only_block!(BlockIq3Xxs, GgmlDType::Iq3Xxs);
+metal_only_block!(BlockIq4Xs, GgmlDType::Iq4Xs);

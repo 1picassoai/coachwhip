@@ -95,6 +95,9 @@ fn dtype_code(d: GgmlDType) -> u32 {
         GgmlDType::Q8K => 15,
         GgmlDType::BF16 => 30,
         GgmlDType::Mxfp4 => 39,
+        GgmlDType::Iq2Xxs => 16,
+        GgmlDType::Iq3Xxs => 18,
+        GgmlDType::Iq4Xs => 23,
     }
 }
 
