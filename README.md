@@ -7,58 +7,39 @@
 
 # Coachwhip
 
-**The 80-billion-parameter Qwen3-Coder-Next on a 16 GB Mac, at 11.5 to 13.4 tok/s. Fully offline. Nothing leaves your machine.**
+## **Qwen3.6-35B on a 16 GB Mac. {TPS35} tok/s. Fully offline.**
 
-**Requirements:** Apple silicon Mac (M1 to M4; M4 measured, earlier chips slower), 16 GB unified memory, macOS 15 or later, about 35 GB of free disk.
+**Install: under a minute. Model: 14.2 GB, about five minutes on a fast line. Then it runs.**
 
-**Install the binary:**
+Apple silicon, 16 GB, macOS 15 or later, 35 GB of free disk.
+
+**1. Install**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/1picassoai/coachwhip/main/install.sh | bash
 ```
 
-**Download the pre-squeezed model (29 GB) and the tokenizer:**
+**2. Download the model** (14.2 GB, ready-squeezed)
 
 ```sh
 mkdir -p ~/coachwhip/models && cd ~/coachwhip/models
-curl -L -O https://huggingface.co/vinnj/coachwhip-models/resolve/main/Qwen3-Coder-Next.Q2X.gguf
-curl -L -O https://huggingface.co/Qwen/Qwen3-Coder-Next/resolve/main/tokenizer.json
+curl -L -O https://huggingface.co/vinnj/coachwhip-models/resolve/main/Qwen3.6-35B-A3B.Q2X.gguf
+curl -L -O https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/tokenizer.json
 ```
 
-sha256 of the model file: `cdc0584c1e4d30134cbb83f18e4c7607af90bd1145a64940c7a357b02a0216af` (`shasum -a 256 Qwen3-Coder-Next.Q2X.gguf`). It was squeezed once from [MaziyarPanahi's Q3_K_M](https://huggingface.co/MaziyarPanahi/Qwen3-Coder-Next-GGUF) with the `coachwhip-prepare` tool that ships in the install; the squeeze is reproducible, same bytes every time.
-
-**Start the chat in your browser:**
+**3. Run** (the chat opens in your browser)
 
 ```sh
-~/coachwhip/coachwhip.sh ~/coachwhip/models/Qwen3-Coder-Next.Q2X.gguf ~/coachwhip/models/tokenizer.json 109 8090 --parallel --flash-reads --stand-ins
+~/coachwhip/coachwhip.sh ~/coachwhip/models/Qwen3.6-35B-A3B.Q2X.gguf ~/coachwhip/models/tokenizer.json 68 8090 --parallel --flash-reads --stand-ins
 ```
 
-The chat opens at http://127.0.0.1:8090. Measured on a Mac mini M4 with 16 GB: 12.8 to 13.4 tok/s on short prompts, 11.5 tok/s with a 13,000-token prompt, three runs each, with 3 GB of memory left for macOS at its tightest. Drop `--stand-ins` for every expert read exactly, at about 5 tok/s. Numbers and the quality check: [release notes](docs/releases/0.5.1.md).
+**Next**
 
-<p align="center"><img src="docs/coachwhip-demo-coder.gif" alt="The 80B Qwen3-Coder-Next writing a TypeScript function in the Coachwhip chat on a 16 GB Mac mini, in real time, at 13 tok/s" width="720"></p>
+- Your tools: OpenAI API on `http://127.0.0.1:8090/v1`, any key, model `Qwen3.6-35B-A3B.Q2X`. Aider: `aider --openai-api-base http://127.0.0.1:8090/v1 --openai-api-key anything --model openai/Qwen3.6-35B-A3B.Q2X --map-tokens 0`
+- Bigger models: the 80B coder and gpt-oss-120b, on the [models page](docs/MODELS.md).
+- Numbers and how they were measured: [release notes](docs/releases/0.5.2.md).
 
-**Use it from coding tools, through the local OpenAI API:**
-
-| Setting | Value |
-|---|---|
-| Base URL | `http://127.0.0.1:8090/v1` |
-| API key | anything; it is ignored |
-| Model | `Qwen3-Coder-Next.Q2X.gguf` |
-
-Aider in the terminal:
-
-```sh
-aider --openai-api-base http://127.0.0.1:8090/v1 --openai-api-key anything --model openai/Qwen3-Coder-Next.Q2X.gguf --map-tokens 0 src/queue.ts
-```
-
-**How it works:**
-
-- Keeps the part of the model every word needs on the GPU, and streams the experts each word asks for from the SSD.
-- Guesses the next layers' experts with the model's own routers and reads them in while the GPU is busy on this one.
-- Reads experts straight from the SSD, past the page cache (`--flash-reads`), into memory the GPU reads directly; no copies.
-- Other models, gpt-oss-120b among them, and what each needs: [docs/MODELS.md](docs/MODELS.md).
-
-License: Apache-2.0 (see [LICENSE](LICENSE)).
+Measured on a Mac mini M4 with 16 GB; your Mac moves the number. Model sha256 `8b919b5eb649f74a9c1d528a4c00aef3a633017032b94848b04b1f2fb312b9ad`, squeezed once from [unsloth's UD-Q4_K_M](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) with the tool in the install.
 
 ---
 
