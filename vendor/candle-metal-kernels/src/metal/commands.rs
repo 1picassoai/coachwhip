@@ -115,6 +115,32 @@ impl EntryState {
     }
 }
 
+pub static N_BLIT: AtomicUsize = AtomicUsize::new(0);
+pub static N_ENC: AtomicUsize = AtomicUsize::new(0);
+pub static N_COMMIT: AtomicUsize = AtomicUsize::new(0);
+pub static N_DISPATCH: AtomicUsize = AtomicUsize::new(0);
+pub static N_BARRIER: AtomicUsize = AtomicUsize::new(0);
+pub static GPU_NS: AtomicUsize = AtomicUsize::new(0);
+pub static GAP_NS: AtomicUsize = AtomicUsize::new(0);
+pub static BIG_GAPS: AtomicUsize = AtomicUsize::new(0);
+pub static BIG_GAP_NS: AtomicUsize = AtomicUsize::new(0);
+static LAST_END: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static N_WAIT: AtomicUsize = AtomicUsize::new(0);
+pub static WAIT_NS: AtomicUsize = AtomicUsize::new(0);
+fn note_wait(t: std::time::Instant) {
+    N_WAIT.fetch_add(1, Ordering::Relaxed);
+    WAIT_NS.fetch_add(t.elapsed().as_nanos() as usize, Ordering::Relaxed);
+    if std::env::var("COACHWHIP_WAIT_TRACE").is_ok() {
+        static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let key: String = bt.lines().filter(|l| l.contains("coachwhip")).take(3).collect::<Vec<_>>().join(" | ");
+        let mut g = SEEN.lock().unwrap();
+        if g.get_or_insert_with(Default::default).insert(key.clone()) {
+            eprintln!("coachwhip wait site: {key}");
+        }
+    }
+}
+
 pub struct Commands {
     state: Mutex<EntryState>,
     compute_count: AtomicUsize,
@@ -170,7 +196,9 @@ impl Commands {
             self.commit_swap_locked(&mut state_guard, 1)?;
         }
 
+        N_DISPATCH.fetch_add(1, Ordering::Relaxed);
         if state_guard.current_encoder.is_none() {
+            N_ENC.fetch_add(1, Ordering::Relaxed);
             let fence = Arc::new(Fence::new(&self.device));
             let enc = state_guard.current.compute_command_encoder(&fence);
             // Wait for all prior encoder fences before the first dispatch.
@@ -194,6 +222,7 @@ impl Commands {
     }
 
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>, MetalKernelError> {
+        N_BLIT.fetch_add(1, Ordering::Relaxed);
         let mut state_guard = self.state.lock().unwrap();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
         let flush = count >= self.compute_per_buffer;
@@ -237,6 +266,13 @@ impl Commands {
     }
 
     pub fn flush_and_wait(&self) -> Result<(), MetalKernelError> {
+        let _t0 = std::time::Instant::now();
+        let r = self.flush_and_wait_inner();
+        note_wait(_t0);
+        r
+    }
+
+    fn flush_and_wait_inner(&self) -> Result<(), MetalKernelError> {
         let to_wait = {
             let mut state = self.state.lock()?;
             if self.compute_count.load(Ordering::Acquire) > 0 {
@@ -271,6 +307,13 @@ impl Commands {
     /// [`Self::wait_until_completed`] waits on the last in-flight buffer, which a concurrent
     /// `flush_and_wait` on another thread may already have taken, returning before our work ran.
     pub fn flush_and_wait_current(&self) -> Result<(), MetalKernelError> {
+        let _t0 = std::time::Instant::now();
+        let r = self.flush_and_wait_current_inner();
+        note_wait(_t0);
+        r
+    }
+
+    fn flush_and_wait_current_inner(&self) -> Result<(), MetalKernelError> {
         let cb = {
             let mut state = self.state.lock()?;
             self.commit_swap_locked(&mut state, 0)?;
@@ -325,6 +368,23 @@ impl Commands {
 
         match state.current.status() {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
+                N_COMMIT.fetch_add(1, Ordering::Relaxed);
+                {
+                    let block = RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                        let cb = unsafe { cb.as_ref() };
+                        let (a, b) = unsafe { (cb.GPUStartTime(), cb.GPUEndTime()) };
+                        if b > a {
+                            GPU_NS.fetch_add(((b - a) * 1e9) as usize, Ordering::Relaxed);
+                            let prev = f64::from_bits(LAST_END.swap(b.to_bits(), Ordering::Relaxed));
+                            if prev > 0.0 && a > prev {
+                                let g = ((a - prev) * 1e9) as usize;
+                                GAP_NS.fetch_add(g, Ordering::Relaxed);
+                                if g > 500_000 { BIG_GAPS.fetch_add(1, Ordering::Relaxed); BIG_GAP_NS.fetch_add(g, Ordering::Relaxed); }
+                            }
+                        }
+                    });
+                    unsafe { state.current.as_ref().addCompletedHandler(RcBlock::as_ptr(&block)) };
+                }
                 state.current.commit();
             }
             _ => {}
@@ -344,7 +404,19 @@ impl Commands {
                 cb.wait_until_completed();
             }
             MTLCommandBufferStatus::Committed | MTLCommandBufferStatus::Scheduled => {
-                cb.wait_until_completed();
+                // Coachwhip lab (`COACHWHIP_SPIN=1`): watch the buffer instead of sleeping on it; the
+                // wake-up of a sleeping thread costs milliseconds per word.
+                static SPIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *SPIN.get_or_init(|| std::env::var("COACHWHIP_SPIN").map(|v| v == "1").unwrap_or(false)) {
+                    loop {
+                        match cb.status() {
+                            MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error => break,
+                            _ => std::hint::spin_loop(),
+                        }
+                    }
+                } else {
+                    cb.wait_until_completed();
+                }
             }
             MTLCommandBufferStatus::Completed => {}
             MTLCommandBufferStatus::Error => return Err(Self::cb_error(cb)),

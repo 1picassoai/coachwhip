@@ -210,19 +210,55 @@ fn main() -> Result<()> {
             model.forward(&candle::Tensor::new(piece, &device)?.unsqueeze(0)?, offset)?;
             offset += piece.len();
         }
-        let mut input = candle::Tensor::new(&ids[last..], &device)?.unsqueeze(0)?;
+        let mut input = candle::Tensor::new(&ids[last..], &candle::Device::Cpu)?.unsqueeze(0)?;
         let mut outs = Vec::new();
+        // Lab (`COACHWHIP_BALLAST_MB=n`): hold n MB of GPU memory, to price running near the limit.
+        let _ballast = match std::env::var("COACHWHIP_BALLAST_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(mb) => Some(candle::Tensor::ones(mb * 1024 * 256, candle::DType::F32, &device)?),
+            None => None,
+        };
         let t0 = std::time::Instant::now();
+        if coachwhip_engine::fuse_kernel::gpupick_on() && device.is_metal() {
+            // The GPU picks each word and feeds it straight back in; the CPU reads the words back
+            // every 16, so it is never waiting for the GPU between two words.
+            let mut pending: Vec<candle::Tensor> = Vec::new();
+            for step in 0..args.max_tokens {
+                let logits = model.forward(&input, offset)?;
+                offset += input.dim(1)?;
+                let next = coachwhip_engine::fuse_kernel::argmax(&logits)?;
+                pending.push(next.clone());
+                input = next;
+                if step == 0 || pending.len() == 16 || step + 1 == args.max_tokens {
+                    for t in pending.drain(..) {
+                        outs.push(t.flatten_all()?.to_vec1::<u32>()?[0]);
+                    }
+                    if step == 0 {
+                        eprintln!("coachwhip: first token after {:.1} s", t0.elapsed().as_secs_f64());
+                    }
+                }
+            }
+            println!("{:?}", tokenizer.decode(&outs, false).map_err(anyhow::Error::msg)?);
+            eprintln!("coachwhip: {} tokens in {:.1} s", outs.len(), t0.elapsed().as_secs_f64());
+            return Ok(());
+        }
         for step in 0..args.max_tokens {
             let logits: Vec<f32> = model.forward(&input, offset)?.flatten_all()?.to_dtype(candle::DType::F32)?.to_vec1()?;
             offset += input.dim(1)?;
-            let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let lse = m + logits.iter().map(|v| (v - m).exp()).sum::<f32>().ln();
-            let mut idx: Vec<usize> = (0..logits.len()).collect();
-            idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+            // The likeliest token, first of equals (what a stable descending sort put first), in one pass.
+            let mut best = 0usize;
+            for (i, &v) in logits.iter().enumerate() {
+                if v > logits[best] {
+                    best = i;
+                }
+            }
             if step == 0 {
+                let m = logits[best];
+                let lse = m + logits.iter().map(|v| (v - m).exp()).sum::<f32>().ln();
+                let mut idx: Vec<usize> = (0..logits.len()).collect();
+                idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
                 let top: Vec<(String, f32)> = idx[..3].iter().map(|&i| (tokenizer.decode(&[i as u32], false).unwrap_or_default(), logits[i] - lse)).collect();
                 eprintln!("coachwhip: first token top-3 {top:?} after {:.1} s", t0.elapsed().as_secs_f64());
+                debug_assert_eq!(idx[0], best);
             }
             if std::env::var("COACHWHIP_POOLLOG").is_ok() && step % 25 == 0 {
                 if let candle::Device::Metal(m) = &device {
@@ -230,9 +266,10 @@ fn main() -> Result<()> {
                     eprintln!("coachwhip: pool at word {step}: {:.2} GB pooled in {count} buffers, {:.2} GB in use", pooled as f64 / 1e9, in_use as f64 / 1e9);
                 }
             }
-            let next = idx[0] as u32;
+            let next = best as u32;
             outs.push(next);
-            input = candle::Tensor::new(&[next], &device)?.unsqueeze(0)?;
+            let bk: usize = std::env::var("COACHWHIP_BATCH_TIME").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+            input = candle::Tensor::new(vec![next; bk].as_slice(), &candle::Device::Cpu)?.unsqueeze(0)?;
         }
         println!("{:?}", tokenizer.decode(&outs, false).map_err(anyhow::Error::msg)?);
         eprintln!("coachwhip: {} tokens in {:.1} s", outs.len(), t0.elapsed().as_secs_f64());

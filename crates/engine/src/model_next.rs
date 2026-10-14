@@ -423,8 +423,8 @@ impl LinearAttn {
             Proj::Split { qkv, z, beta, alpha } => Ok((
                 qkv.forward(x2)?, // already q (all heads), k (all heads), v (all heads)
                 z.forward(x2)?.reshape((l, n_v, dv))?,
-                beta.forward(x2)?,
-                alpha.forward(x2)?,
+                if l == 1 && skip("ab") { Tensor::zeros((1, n_v), DType::F32, x2.device())? } else { beta.forward(x2)? },
+                if l == 1 && skip("ab") { Tensor::zeros((1, n_v), DType::F32, x2.device())? } else { alpha.forward(x2)? },
             )),
         }
     }
@@ -436,10 +436,78 @@ impl LinearAttn {
         let per_group = n_v / n_k;
         let x2 = x.reshape((l, h))?;
 
-        let (qkv, z, beta, alpha) = self.project(&x2, l)?;
+        let mut t = std::time::Instant::now();
+        let timed = sec_l(l) && sections_on();
+        if timed { x.device().synchronize()?; t = std::time::Instant::now(); }
+        let (qkv, z, beta, alpha) = if l == 1 && skip("laproj") {
+            let c = 2 * n_k * dk + n_v * dv;
+            (Tensor::zeros((1, c), DType::F32, device)?, Tensor::zeros((1, n_v, dv), DType::F32, device)?, Tensor::zeros((1, n_v), DType::F32, device)?, Tensor::zeros((1, n_v), DType::F32, device)?)
+        } else {
+            self.project(&x2, l)?
+        };
+        if timed { split_tick(x.device(), &mut t, 9)?; }
         let channels = qkv.dim(1)?;
-        if l == 1 && !self.record && crate::attn_kernel::on() {
+        if l <= short_max() && !self.record && crate::attn_kernel::on() {
             let taps = self.conv_w.dim(1)?;
+            if l > 1 && crate::attn_kernel::piece_on() && dk == 128 && dv == 128 && l >= taps {
+                let conv_state = match &self.conv_state {
+                    Some(s) => s.to_dtype(DType::F32)?.contiguous()?,
+                    None => Tensor::zeros((taps - 1, channels), DType::F32, device)?,
+                };
+                let st = match &self.state {
+                    Some(s) => s.to_dtype(DType::F32)?.contiguous()?,
+                    None => Tensor::zeros((n_v, dk, dv), DType::F32, device)?,
+                };
+                let op = crate::attn_kernel::GdnWord {
+                    conv_state,
+                    conv_w: self.conv_w.to_dtype(DType::F32)?.contiguous()?,
+                    dt_bias: self.dt_bias.to_dtype(DType::F32)?.contiguous()?,
+                    a: self.a.to_dtype(DType::F32)?.contiguous()?,
+                    norm_w: self.norm_w.clone(),
+                    s: st,
+                    n_k, n_v, dk, dv, taps,
+                    cycle: matches!(self.proj, Proj::Split { .. }),
+                    eps: self.eps as f32,
+                };
+                let (o, s_new, conv_new) = crate::attn_kernel::gdn_piece(op, &qkv, &z, &beta, &alpha, l)?;
+                self.state = Some(s_new);
+                self.conv_state = Some(conv_new);
+                return self.out.forward(&o)?.reshape((b, l, h));
+            }
+            if l > 1 {
+                let conv_w = self.conv_w.to_dtype(DType::F32)?.contiguous()?;
+                let dt_bias = self.dt_bias.to_dtype(DType::F32)?.contiguous()?;
+                let a = self.a.to_dtype(DType::F32)?.contiguous()?;
+                let mut outs = Vec::with_capacity(l);
+                for i in 0..l {
+                    let conv_state = match &self.conv_state {
+                        Some(s) => s.to_dtype(DType::F32)?.contiguous()?,
+                        None => Tensor::zeros((taps - 1, channels), DType::F32, device)?,
+                    };
+                    let st = match &self.state {
+                        Some(s) => s.to_dtype(DType::F32)?.contiguous()?,
+                        None => Tensor::zeros((n_v, dk, dv), DType::F32, device)?,
+                    };
+                    let op = crate::attn_kernel::GdnWord {
+                        conv_state,
+                        conv_w: conv_w.clone(),
+                        dt_bias: dt_bias.clone(),
+                        a: a.clone(),
+                        norm_w: self.norm_w.clone(),
+                        s: st,
+                        n_k, n_v, dk, dv, taps,
+                        cycle: matches!(self.proj, Proj::Split { .. }),
+                        eps: self.eps as f32,
+                    };
+                    let row = |t: &Tensor| -> Result<Tensor> { t.narrow(0, i, 1)?.contiguous() };
+                    let (o, s_new, conv_new) = crate::attn_kernel::gdn_word(op, &row(&qkv)?, &row(&z)?, &row(&beta)?, &row(&alpha)?)?;
+                    self.state = Some(s_new);
+                    self.conv_state = Some(conv_new);
+                    outs.push(o);
+                }
+                let o = Tensor::cat(&outs, 0)?;
+                return self.out.forward(&o)?.reshape((b, l, h));
+            }
             let conv_state = match &self.conv_state {
                 Some(s) => s.to_dtype(DType::F32)?.contiguous()?,
                 None => Tensor::zeros((taps - 1, channels), DType::F32, device)?,
@@ -459,10 +527,17 @@ impl LinearAttn {
                 cycle: matches!(self.proj, Proj::Split { .. }),
                 eps: self.eps as f32,
             };
-            let (o, s_new, conv_new) = crate::attn_kernel::gdn_word(op, &qkv, &z, &beta, &alpha)?;
+            let (o, s_new, conv_new) = if skip("lamid") {
+                (Tensor::zeros((1, n_v * dv), DType::F32, device)?, op.s.clone(), op.conv_state.clone())
+            } else {
+                crate::attn_kernel::gdn_word(op, &qkv, &z, &beta, &alpha)?
+            };
             self.state = Some(s_new);
             self.conv_state = Some(conv_new);
-            return self.out.forward(&o)?.reshape((b, l, h));
+            if timed { split_tick(x.device(), &mut t, 10)?; }
+            let y = if skip("laout") { Tensor::zeros((b, l, h), DType::F32, device)? } else { self.out.forward(&o)?.reshape((b, l, h))? };
+            if timed { split_tick(x.device(), &mut t, 11)?; }
+            return Ok(y);
         }
         let beta = candle_nn::ops::sigmoid(&beta)?;
         let log_decay = softplus(&alpha.broadcast_add(&self.dt_bias)?)?.broadcast_mul(&self.a)?; // (l, n_v)
@@ -595,7 +670,11 @@ struct SharedExpert {
 
 impl SharedExpert {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let hidden = (candle_nn::ops::silu(&self.gate.forward(x)?)? * self.up.forward(x)?)?;
+        let hidden = if crate::fuse_kernel::on() && x.dtype() == DType::F32 {
+            crate::fuse_kernel::silu_mul(&self.gate.forward(x)?, &self.up.forward(x)?)?
+        } else {
+            (candle_nn::ops::silu(&self.gate.forward(x)?)? * self.up.forward(x)?)?
+        };
         let y = self.down.forward(&hidden)?;
         let g = candle_nn::ops::sigmoid(&x.broadcast_mul(&self.gate_inp)?.sum_keepdim(D::Minus1)?)?;
         y.broadcast_mul(&g)
@@ -606,8 +685,63 @@ struct Layer {
     mixer: Mixer,
     attn_norm: RmsNorm,
     post_norm: RmsNorm,
+    attn_norm_w: Tensor,
+    post_norm_w: Tensor,
+    norm_eps: f32,
     moe: StreamedMoe,
     shared: SharedExpert,
+}
+
+static SECTIONS: std::sync::Mutex<([f64; 12], u64)> = std::sync::Mutex::new(([0.0; 12], 0));
+const SECTION_NAMES: [&str; 12] = ["embed", "attn_norm", "linear_attn", "full_attn", "post_norm", "moe", "shared", "residual", "head", "la_proj", "la_mid", "la_out"];
+fn sections_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_SECTIONS").map(|v| v == "1").unwrap_or(false))
+}
+fn tick(dev: &Device, t: &mut std::time::Instant, which: usize) -> Result<()> {
+    if !sections_on() {
+        return Ok(());
+    }
+    dev.synchronize()?;
+    let now = std::time::Instant::now();
+    SECTIONS.lock().unwrap().0[which] += (now - *t).as_secs_f64();
+    *t = now;
+    Ok(())
+}
+fn split_tick(dev: &Device, t: &mut std::time::Instant, which: usize) -> Result<()> {
+    dev.synchronize()?;
+    let now = std::time::Instant::now();
+    SECTIONS.lock().unwrap().0[which] += (now - *t).as_secs_f64();
+    *t = now;
+    Ok(())
+}
+/// Passes up to this many words take the one-word kernels (guess-and-check); longer ones the
+/// prompt path. `COACHWHIP_SHORT=n`, default 1 (off) while in the lab.
+fn short_max() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("COACHWHIP_SHORT").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
+}
+fn skip(what: &str) -> bool {
+    static S: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::env::var("COACHWHIP_SKIP").map(|v| v.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default()).iter().any(|x| x == what)
+}
+fn prefill_sections() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("COACHWHIP_SECTIONS_PREFILL").is_ok())
+}
+fn sec_l(l: usize) -> bool { if prefill_sections() { l > 1 } else { l <= 8 } }
+fn word_done() {
+    if !sections_on() {
+        return;
+    }
+    let mut g = SECTIONS.lock().unwrap();
+    g.1 += 1;
+    if g.1 % (if prefill_sections() { 10 } else { 100 }) == 0 {
+        let w = g.1 as f64;
+        let line: Vec<String> = SECTION_NAMES.iter().zip(g.0.iter()).map(|(n, v)| format!("{n} {:.1}", 1000.0 * v / w)).collect();
+        let total: f64 = g.0[..9].iter().sum();
+        eprintln!("coachwhip sections, ms per word over {} words: {} | total {:.1}", g.1, line.join(" · "), 1000.0 * total / w);
+    }
 }
 
 /// The word table, packed as the file stores it; rows are unpacked when a forward asks for them.
@@ -640,6 +774,8 @@ impl PackedTable {
 
 pub struct Qwen3Next {
     embeddings: PackedTable,
+    /// Lab (`COACHWHIP_GPUPICK=1`): the packed word table on the GPU, for ids that never leave it.
+    gpu_table: Option<Tensor>,
     layers: Vec<Layer>,
     norm: RmsNorm,
     output: QMatMul,
@@ -851,6 +987,9 @@ impl Qwen3Next {
                 mixer,
                 attn_norm: gg.rms_norm(&format!("{p}.attn_norm.weight"), eps)?,
                 post_norm: gg.rms_norm(&format!("{p}.post_attention_norm.weight"), eps)?,
+                attn_norm_w: dense(&mut gg, &format!("{p}.attn_norm.weight"))?,
+                post_norm_w: dense(&mut gg, &format!("{p}.post_attention_norm.weight"))?,
+                norm_eps: eps as f32,
                 moe,
                 shared,
             });
@@ -862,7 +1001,14 @@ impl Qwen3Next {
         if let Ok(path) = std::env::var("COACHWHIP_PREDICTOR") {
             load_predictor(&mut layers, &path, settings.ahead.max(1), device)?;
         }
-        Ok(Self { embeddings: table, layers, norm, output, store, device: device.clone(), think, progress: None })
+        let gpu_table = if crate::fuse_kernel::gpupick_on() && device.is_metal() && table.dtype == GgmlDType::Q5K {
+            let t = Tensor::from_slice(&table.bytes, table.bytes.len(), device)?;
+            eprintln!("coachwhip: word table on the GPU too, {:.2} GB", table.bytes.len() as f64 / 1e9);
+            Some(t)
+        } else {
+            None
+        };
+        Ok(Self { embeddings: table, gpu_table, layers, norm, output, store, device: device.clone(), think, progress: None })
     }
 
     pub fn report(&self) {
@@ -1069,39 +1215,104 @@ impl Qwen3Next {
 
     /// `all`: scores for every position, not only the last.
     fn forward_inner(&mut self, x: &Tensor, offset: usize, all: bool) -> Result<Tensor> {
+        let enc_t = std::time::Instant::now();
         let (xs, l) = self.body(x, offset)?;
+        if l == 1 && std::env::var("COACHWHIP_ENCODE_TIME").is_ok() {
+            static E: std::sync::Mutex<(f64, u64)> = std::sync::Mutex::new((0.0, 0));
+            let mut g = E.lock().unwrap();
+            g.0 += enc_t.elapsed().as_secs_f64();
+            g.1 += 1;
+            if g.1 % 100 == 0 {
+                use std::sync::atomic::Ordering as O;
+                let m = candle_metal_kernels::metal::commands::N_DISPATCH.load(O::Relaxed);
+                let e = candle_metal_kernels::metal::commands::N_ENC.load(O::Relaxed);
+                let b = candle_metal_kernels::metal::commands::N_BLIT.load(O::Relaxed);
+                let br = candle_metal_kernels::metal::commands::N_BARRIER.load(O::Relaxed);
+                let c = candle_metal_kernels::metal::commands::N_COMMIT.load(O::Relaxed);
+                let gns = candle_metal_kernels::metal::commands::GPU_NS.load(O::Relaxed);
+                let nw = candle_metal_kernels::metal::commands::N_WAIT.load(O::Relaxed);
+                let wn = candle_metal_kernels::metal::commands::WAIT_NS.load(O::Relaxed);
+                let gap = candle_metal_kernels::metal::commands::GAP_NS.load(O::Relaxed);
+                let bg = candle_metal_kernels::metal::commands::BIG_GAPS.load(O::Relaxed);
+                let bgn = candle_metal_kernels::metal::commands::BIG_GAP_NS.load(O::Relaxed);
+                eprintln!("coachwhip barriers: {br} barriers, {c} commits, GPU busy {:.3} s, idle between buffers {:.3} s ({bg} gaps over 0.5 ms = {:.3} s), {nw} CPU waits taking {:.3} s, since start", gns as f64 / 1e9, gap as f64 / 1e9, bgn as f64 / 1e9, wn as f64 / 1e9);
+                eprintln!("coachwhip encode: {:.1} ms of CPU per token to queue the layers (no GPU wait), over {} tokens; since start: {m} dispatches, {e} compute encoders, {b} blit encoders", 1000.0 * g.0 / g.1 as f64, g.1);
+            }
+        }
+        if sec_l(l) && !all && sections_on() {
+            let mut t = std::time::Instant::now();
+            let xs = self.norm.forward(&xs.narrow(1, l - 1, 1)?)?;
+            let out = self.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)?;
+            tick(&self.device, &mut t, 8)?;
+            word_done();
+            return Ok(out);
+        }
         if all {
             let xs = self.norm.forward(&xs)?;
             return self.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(0);
         }
         let xs = self.norm.forward(&xs.narrow(1, l - 1, 1)?)?;
+        if l == 1 && skip("head") {
+            return Tensor::zeros((1, 248320), DType::F32, xs.device());
+        }
         self.output.forward(&xs)?.to_dtype(DType::F32)?.squeeze(1)
     }
 
     /// The layers only, no output head: the hidden state and the number of positions.
     fn body(&mut self, x: &Tensor, offset: usize) -> Result<(Tensor, usize)> {
-        if !self.store.drafting() {
+        let on_gpu = x.device().is_metal() && self.gpu_table.is_some();
+        if !self.store.drafting() && !on_gpu {
             self.store.note_tokens(x.flatten_all()?.to_vec1()?);
         }
-        let mut xs = self.embeddings.rows(&x.to_device(&Device::Cpu)?)?.to_device(&self.device)?;
+        let mut t = std::time::Instant::now();
+        let mut xs = if on_gpu {
+            let (_, l0) = x.dims2()?;
+            let h = self.embeddings.hidden;
+            crate::fuse_kernel::embed_q5k(self.gpu_table.as_ref().unwrap(), x, h, self.embeddings.row_bytes)?.reshape((1, l0, h))?
+        } else {
+            self.embeddings.rows(&x.to_device(&Device::Cpu)?)?.to_device(&self.device)?
+        };
         let (_b, l) = x.dims2()?;
+        let timed = sec_l(l) && sections_on();
+        if timed { tick(&self.device, &mut t, 0)?; }
         let mask = if l == 1 {
             None
         } else {
             Some(candle_transformers::utils::build_additive_causal_mask(l, offset, None, &self.device, DType::F32)?)
         };
         let n = self.layers.len();
+        let fuse_norm = crate::fuse_kernel::addnorm_on() && xs.dtype() == DType::F32;
+        let next_w: Vec<Tensor> = if fuse_norm { self.layers.iter().map(|l| l.attn_norm_w.clone()).collect() } else { Vec::new() };
+        let mut carried: Option<Tensor> = None;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            let normed = layer.attn_norm.forward(&xs)?;
-            let mixed = match &mut layer.mixer {
-                Mixer::Linear(a) => a.forward(&normed)?,
-                Mixer::Full(a) => a.forward(&normed, mask.as_ref(), offset)?,
+            let normed = if let Some(nm) = carried.take() { nm } else if l == 1 && skip("norms") { xs.clone() } else { layer.attn_norm.forward(&xs)? };
+            if timed { tick(&self.device, &mut t, 1)?; }
+            let (mixed, which) = match &mut layer.mixer {
+                Mixer::Linear(a) => (a.forward(&normed)?, 2),
+                Mixer::Full(_) if l == 1 && skip("fullattn") => (normed.zeros_like()?, 3),
+                Mixer::Full(a) => (a.forward(&normed, mask.as_ref(), offset)?, 3),
             };
-            let h = (mixed + &xs)?;
-            let post = layer.post_norm.forward(&h)?;
-            let routed = layer.moe.forward(&post)?;
-            let shared = layer.shared.forward(&post)?;
-            xs = ((routed + shared)? + h)?;
+            if timed { tick(&self.device, &mut t, which)?; }
+            let (h, post) = if fuse_norm {
+                crate::fuse_kernel::add_norm(&mixed, &xs, None, &layer.post_norm_w, layer.norm_eps)?
+            } else {
+                let h = (mixed + &xs)?;
+                let post = if l == 1 && skip("norms") { h.clone() } else { layer.post_norm.forward(&h)? };
+                (h, post)
+            };
+            if timed { tick(&self.device, &mut t, 4)?; }
+            let routed = if l == 1 && skip("moe") { post.zeros_like()? } else { layer.moe.forward(&post)? };
+            if timed { tick(&self.device, &mut t, 5)?; }
+            let shared = if l == 1 && skip("shared") { post.zeros_like()? } else { layer.shared.forward(&post)? };
+            if timed { tick(&self.device, &mut t, 6)?; }
+            if fuse_norm && i + 1 < n {
+                let (x2, nn) = crate::fuse_kernel::add_norm(&routed, &shared, Some(&h), &next_w[i + 1], layer.norm_eps)?;
+                xs = x2;
+                carried = Some(nn);
+            } else {
+                xs = ((routed + shared)? + h)?;
+            }
+            if timed { tick(&self.device, &mut t, 7)?; }
             if l > 1 {
                 if let Some(p) = &mut self.progress {
                     p(crate::model::Step::Layer(i + 1, n));

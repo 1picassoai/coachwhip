@@ -26,7 +26,16 @@ use tokenizers::Tokenizer;
 const MAX_BODY: usize = 1 << 20;
 
 /// Longest piece of a prompt read in one forward pass.
-const PROMPT_CHUNK: usize = 512;
+const PROMPT_CHUNK_DEFAULT: usize = 512;
+fn fast_chat() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_FAST_CHAT").map(|v| v == "1").unwrap_or(false))
+}
+/// Lab (`COACHWHIP_PROMPT_CHUNK=n`): smaller pieces when the experts are all resident and memory is tight.
+fn prompt_chunk() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("COACHWHIP_PROMPT_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(PROMPT_CHUNK_DEFAULT))
+}
 
 /// When a chat would grow past this many words, it is summarised first to make room.
 pub const CONTEXT_LIMIT: usize = 16384;
@@ -258,6 +267,12 @@ fn answer(
     tell: &Option<Rc<RefCell<Progress>>>,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<Answer> {
+    // Lab (`COACHWHIP_QOS=1`): this thread at user-interactive priority, so macOS wakes it at once
+    // when the GPU finishes a word.
+    if std::env::var("COACHWHIP_QOS").map(|v| v == "1").unwrap_or(false) {
+        extern "C" { fn pthread_set_qos_class_self_np(qos: u32, rel: i32) -> i32; }
+        unsafe { pthread_set_qos_class_self_np(0x21, 0); }
+    }
     let fmt = Fmt::of(model);
     let stops = fmt.stops(tokenizer);
     // gpt-oss thinking: the channels are read from the format markers, so keep them when decoding.
@@ -343,11 +358,25 @@ fn answer(
         if foresight() > 0 {
             model.foresee(next, base + out.len() - 1, foresight())?;
         }
-        let logits = model.forward(&Tensor::new(&[next], device)?.unsqueeze(0)?, base + out.len() - 1)?.squeeze(0)?;
-        next = sampler.sample(&logits)?;
+        // Lab (`COACHWHIP_FAST_CHAT=1`): the word goes in from the CPU (no GPU round trip before the
+        // pass) and, when greedy, the GPU picks the next one and only 4 bytes come back.
+        let fast = fast_chat() && device.is_metal();
+        let ta = std::time::Instant::now();
+        let logits = model.forward(&Tensor::new(&[next], if fast { &Device::Cpu } else { device })?.unsqueeze(0)?, base + out.len() - 1)?.squeeze(0)?;
+        let tb = std::time::Instant::now();
+        next = if fast && greedy { coachwhip_engine::fuse_kernel::argmax(&logits)?.flatten_all()?.to_vec1::<u32>()?[0] } else { sampler.sample(&logits)? };
+        let tc = std::time::Instant::now();
         if !stops.contains(&next) {
             out.push(next);
             stream_text(&out, &mut sent)?;
+        }
+        if std::env::var("COACHWHIP_CHAT_TIME").is_ok() {
+            static T: std::sync::Mutex<[f64; 4]> = std::sync::Mutex::new([0.0; 4]);
+            let mut g = T.lock().unwrap();
+            g[0] += (tb - ta).as_secs_f64(); g[1] += (tc - tb).as_secs_f64(); g[2] += tc.elapsed().as_secs_f64(); g[3] += 1.0;
+            if g[3] as u64 % 100 == 0 {
+                eprintln!("coachwhip chat time per word over {}: queue {:.2} ms, pick (GPU wait) {:.2} ms, decode+send {:.2} ms", g[3], 1000.0 * g[0] / g[3], 1000.0 * g[1] / g[3], 1000.0 * g[2] / g[3]);
+            }
         }
     }
     let write = t1.elapsed().as_secs_f64();
@@ -376,10 +405,10 @@ fn answer(
 /// While it reads, every finished layer is reported, counted across all the pieces, so the page
 /// is never silent.
 fn read_prompt(model: &mut Model, device: &Device, pos: usize, tokens: &[u32], tell: &Option<Rc<RefCell<Progress>>>) -> Result<Tensor> {
-    let pieces = tokens.len().div_ceil(PROMPT_CHUNK);
+    let pieces = tokens.len().div_ceil(prompt_chunk());
     let read = (|| -> Result<Tensor> {
     let mut logits = None;
-    for (i, piece) in tokens.chunks(PROMPT_CHUNK).enumerate() {
+    for (i, piece) in tokens.chunks(prompt_chunk()).enumerate() {
         model.set_progress(tell.clone().map(|t| -> Progress {
             Box::new(move |step| {
                 if let Step::Layer(layer, of) = step {
@@ -387,7 +416,7 @@ fn read_prompt(model: &mut Model, device: &Device, pos: usize, tokens: &[u32], t
                 }
             })
         }));
-        logits = Some(model.forward(&Tensor::new(piece, device)?.unsqueeze(0)?, pos + i * PROMPT_CHUNK)?.squeeze(0)?);
+        logits = Some(model.forward(&Tensor::new(piece, device)?.unsqueeze(0)?, pos + i * prompt_chunk())?.squeeze(0)?);
     }
     logits.ok_or_else(|| anyhow::anyhow!("empty prompt"))
     })();
@@ -494,6 +523,14 @@ fn openai(mut s: TcpStream, body: &[u8], model: &mut Model, model_name: &str, to
     let text = if model.harmony() { harmony_prompt(messages) } else { chat_prompt(messages, model.assistant_open(false)) };
     let prompt = tokenizer.encode(text, true).map_err(anyhow::Error::msg)?.get_ids().to_vec();
     let max_new = answer_budget(asked, max_new, prompt.len());
+    // The requests own temperature and top_p win over the doors defaults; 0 means the likeliest word.
+    let asked_sampling: Sampling = match (q["temperature"].as_f64(), q["top_p"].as_f64()) {
+        (Some(t), _) if t <= 0.0 => Sampling::ArgMax,
+        (Some(t), Some(p)) => Sampling::TopP { p, temperature: t },
+        (Some(t), None) => match sampling { Sampling::TopP { p, .. } => Sampling::TopP { p: *p, temperature: t }, _ => Sampling::All { temperature: t } },
+        (None, _) => sampling.clone(),
+    };
+    let sampling = &asked_sampling;
     let id = format!("chatcmpl-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
     let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let prompt_len = prompt.len();

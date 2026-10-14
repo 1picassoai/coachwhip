@@ -1552,3 +1552,61 @@ impl_rms_norm(rmsnorm_bf16, bfloat)
 impl_layer_norm(layernorm_bf16, bfloat)
 ROPE(rope_bf16, rope_i_bf16, rope_thd_bf16, bfloat)
 #endif
+
+
+// Coachwhip: sum = a + b (+ c), dst = rms_norm(sum) * alpha, one threadgroup per row.
+#define add_rms_norm_case(N)                            \
+case N: {                                               \
+    threadgroup RMS<float> shared[N];                   \
+    threadgroup float total;                            \
+    rms_norm<float, N>(                                 \
+        src_numel,                                      \
+        el_per_block,                                   \
+        sum,                                            \
+        dst,                                            \
+        alpha,                                          \
+        eps,                                            \
+        shared,                                         \
+        total,                                          \
+        tid,                                            \
+        dst_id);                                        \
+    break;                                              \
+}
+
+kernel void add_rms_norm_f32(
+    constant uint &src_numel,
+    constant uint &el_per_block,
+    device const float *a,
+    device const float *b,
+    device const float *c,
+    constant uint &has_c,
+    device float *sum,
+    device float *dst,
+    device const float *alpha,
+    constant float &eps,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    const uint off = dst_id * el_per_block;
+    const uint stop = min(off + el_per_block, src_numel);
+    for (uint i = off + tid; i < stop; i += block_dim) {
+        float v = a[i] + b[i];
+        if (has_c) v = v + c[i];
+        sum[i] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    switch (max_shared_mem<float>(block_dim)) {
+        add_rms_norm_case(1024);
+        add_rms_norm_case( 512);
+        add_rms_norm_case( 256);
+        add_rms_norm_case( 128);
+        add_rms_norm_case(  64);
+        add_rms_norm_case(  32);
+        add_rms_norm_case(  16);
+        add_rms_norm_case(   8);
+        add_rms_norm_case(   4);
+        add_rms_norm_case(   2);
+        add_rms_norm_case(   1);
+    }
+}

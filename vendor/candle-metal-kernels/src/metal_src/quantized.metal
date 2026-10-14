@@ -7863,3 +7863,48 @@ kernel void kernel_pool_2d_avg_f32(
 
     o_ptr[cur_oh * OW + cur_ow] = res;
 }
+
+
+// Coachwhip: grouped expert multiply. `piles` = (slot, word) pairs sorted by expert; `heads` = per used
+// expert: expert id, first pair, pair count. One threadgroup column (z) per used expert.
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_mul_mm_idg(
+        device const   uchar * src0s,
+        device const   uchar * src1,
+        device         float * dst,
+        device const  ushort2 * piles,
+        device const    uint * heads,
+        constant     int64_t & ne00,
+        constant     int64_t & ne02,
+        constant    uint64_t & nb01,
+        constant    uint64_t & nb02,
+        constant     int64_t & ne11,
+        constant     int64_t & ne12,
+        constant    uint64_t & nb10,
+        constant    uint64_t & nb11,
+        constant    uint64_t & nb12,
+        constant     int64_t & ne0,
+        constant     int64_t & ne1,
+        threadgroup    uchar * shared_memory [[threadgroup(0)]],
+        uint3                  tgpig[[threadgroup_position_in_grid]],
+        uint                   tiitg[[thread_index_in_threadgroup]],
+        uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
+    const uint z = tgpig.z;
+    const uint e = heads[3 * z];
+    const uint first = heads[3 * z + 1];
+    const uint cnt = heads[3 * z + 2];
+    tgpig.z = 0;
+    if (tgpig.x * 32 >= cnt) return;
+    device const uchar * src0 = src0s + e * nb02;
+    threadgroup ushort2 * rowids = (threadgroup ushort2 *)(shared_memory + 8192);
+    for (uint i = tiitg; i < cnt; i += 128) rowids[i] = piles[first + i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    kernel_mul_mm_id_impl<block_q, nl, dequantize_func>(
+        src0, src1, rowids, dst, ne00, ne02, nb01, nb02, ne11, ne12, nb10, nb11, nb12, ne0, cnt, ne0 * ne1,
+        shared_memory, tgpig, tiitg, sgitg);
+}
+
+typedef decltype(kernel_mul_mm_idg<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>) mat_mm_idg_t;
+template [[host_name("kernel_mul_mm_idg_iq2_xxs_f32")]] kernel mat_mm_idg_t kernel_mul_mm_idg<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
+template [[host_name("kernel_mul_mm_idg_iq3_xxs_f32")]] kernel mat_mm_idg_t kernel_mul_mm_idg<block_iq3_xxs, QK_NL, dequantize_iq3_xxs>;
+template [[host_name("kernel_mul_mm_idg_iq4_xs_f32")]]  kernel mat_mm_idg_t kernel_mul_mm_idg<block_iq4_xs,  QK_NL, dequantize_iq4_xs>;

@@ -5,6 +5,7 @@ pub mod experts;
 pub mod gpu_sync;
 pub mod delta_kernel;
 pub mod attn_kernel;
+pub mod fuse_kernel;
 pub mod requant;
 pub mod model;
 pub mod model_next;

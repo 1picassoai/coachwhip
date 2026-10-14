@@ -573,6 +573,12 @@ pub fn use_sharp() -> bool {
 }
 
 /// S4: the GPU never stops for the CPU (`COACHWHIP_PARALLEL=1`).
+/// Lab: gate and up side by side in one buffer per layer (resident path only).
+pub fn gu_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_GU").map(|v| v == "1").unwrap_or(false))
+}
+
 pub fn resident_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COACHWHIP_RESIDENT").map(|v| v == "1").unwrap_or(false))
@@ -1945,7 +1951,28 @@ impl ExpertStore {
         if !res.contains_key(&layer) {
             let experts = self.slices[layer].len();
             let mut out = Vec::with_capacity(3);
-            for m in 0..3 {
+            let (g0, u0) = (&self.slices[layer][0][0], &self.slices[layer][0][1]);
+            let gu = gu_on() && g0.dtype == u0.dtype && g0.dims == u0.dims && g0.bytes == u0.bytes;
+            if layer == 0 { eprintln!("coachwhip: gu check on={} g {:?} {:?} {} u {:?} {:?} {}", gu_on(), g0.dtype, g0.dims, g0.bytes, u0.dtype, u0.dims, u0.bytes); }
+            if gu {
+                // expert e = [its gate rows][its up rows], one after the other
+                let b = g0.bytes;
+                let mut graw = vec![0u8; b * experts];
+                self.file.read_exact_at(&mut graw, g0.offset)?;
+                let mut uraw = vec![0u8; b * experts];
+                self.file.read_exact_at(&mut uraw, u0.offset)?;
+                let mut raw = vec![0u8; 2 * b * experts];
+                for e in 0..experts {
+                    raw[2 * b * e..2 * b * e + b].copy_from_slice(&graw[b * e..b * (e + 1)]);
+                    raw[2 * b * e + b..2 * b * (e + 1)].copy_from_slice(&uraw[b * e..b * (e + 1)]);
+                }
+                drop((graw, uraw));
+                let st = Arc::new(exact_load(&self.metal, g0.dtype, &raw)?);
+                if layer == 0 { eprintln!("coachwhip: gate|up side by side, {:?}, {} rows per expert", g0.dtype, g0.dims[0] * 2); }
+                out.push((st.clone(), g0.dtype, g0.dims[0] * 2, g0.dims[1], 2 * b));
+                out.push((st, g0.dtype, g0.dims[0] * 2, g0.dims[1], 2 * b));
+            }
+            for m in (if gu { 2 } else { 0 })..3 {
                 let s0 = &self.slices[layer][0][m];
                 let mut raw = vec![0u8; s0.bytes * experts];
                 self.file.read_exact_at(&mut raw, s0.offset)?;
@@ -2191,6 +2218,66 @@ impl CustomOp2 for MoeMatvec {
         let dst = device.new_buffer_builder().with_size_for(elems, DType::F32).with_label("moe_mv_id").build()?;
         {
             let encoder = device.command_encoder()?;
+            let dt = candle_metal_kernels::GgmlDType::try_from(self.dtype)?;
+            if tokens > 1 && crate::fuse_kernel::group3_on() {
+                drop(encoder);
+                let (pb, hb) = crate::fuse_kernel::piles(&device, ids.buffer(), il.start_offset() * 4, tokens * nei0, nei0, self.slots)?;
+                let encoder = device.command_encoder()?;
+                if crate::mv_id::matmul_id_piles(device.device(), &encoder, device.kernels(), dt, (self.n, self.k, self.slots, self.bytes), self.bank.buffer(), x.buffer(), xl.start_offset() * 4, (ne11, nb11, nb12), &pb, &hb, (self.slots, tokens, nei0), &dst).map_err(candle::MetalError::from)? {
+                    drop(encoder);
+                    return Ok((MetalStorage::new(dst, device.clone(), elems, DType::F32), Shape::from((tokens, nei0, self.n))));
+                }
+                candle::bail!("grouped expert multiply: unsupported type {dt:?}")
+            }
+            if tokens > 1 && crate::mv_id::group2_on() {
+                // sort (slot, word) by expert once
+                let ids_cpu: Vec<u32> = {
+                    drop(encoder);
+                    let t = candle::Tensor::from_storage(candle::Storage::Metal(ids.clone()), il.shape().clone(), candle::op::BackpropOp::none(), false);
+                    t.flatten_all()?.to_vec1::<u32>()?
+                };
+                let mut pairs: Vec<(u32, u16, u16)> = Vec::with_capacity(ids_cpu.len());
+                for (i, &ex) in ids_cpu.iter().enumerate() {
+                    pairs.push((ex, (i % nei0) as u16, (i / nei0) as u16));
+                }
+                pairs.sort_by_key(|p| p.0);
+                let mut piles: Vec<u16> = Vec::with_capacity(pairs.len() * 2);
+                let mut heads: Vec<u32> = Vec::new();
+                let mut most = 0usize;
+                let mut i = 0;
+                while i < pairs.len() {
+                    let ex = pairs[i].0;
+                    let first = i;
+                    while i < pairs.len() && pairs[i].0 == ex {
+                        piles.push(pairs[i].1);
+                        piles.push(pairs[i].2);
+                        i += 1;
+                    }
+                    heads.extend_from_slice(&[ex, first as u32, (i - first) as u32]);
+                    most = most.max(i - first);
+                }
+                let used = heads.len() / 3;
+                let pb = device.new_buffer_with_data(&piles)?;
+                let hb = device.new_buffer_with_data(&heads)?;
+                let encoder = device.command_encoder()?;
+                if crate::mv_id::matmul_id_piles(device.device(), &encoder, device.kernels(), dt, (self.n, self.k, self.slots, self.bytes), self.bank.buffer(), x.buffer(), xl.start_offset() * 4, (ne11, nb11, nb12), &pb, &hb, (used, most, nei0), &dst).map_err(candle::MetalError::from)? {
+                    drop(encoder);
+                    return Ok((MetalStorage::new(dst, device.clone(), elems, DType::F32), Shape::from((tokens, nei0, self.n))));
+                }
+                candle::bail!("grouped expert multiply: unsupported type {dt:?}")
+            }
+            if tokens > 1 && crate::mv_id::group_on()
+                && crate::mv_id::matmul_id_grouped(device.device(), &encoder, device.kernels(), dt, (self.n, self.k, self.slots, self.bytes), self.bank.buffer(), x.buffer(), xl.start_offset() * 4, (ne11, nb11, nb12), ids.buffer(), il.start_offset() * 4, (nei0, tokens), &dst).map_err(candle::MetalError::from)?
+            {
+                drop(encoder);
+                return Ok((MetalStorage::new(dst, device.clone(), elems, DType::F32), Shape::from((tokens, nei0, self.n))));
+            }
+            if crate::mv_id::new_on()
+                && crate::mv_id::matvec_id_new(device.device(), &encoder, dt, (self.n, self.k, self.slots, self.bytes), self.bank.buffer(), x.buffer(), xl.start_offset() * 4, (ne11, nb11, nb12), ids.buffer(), il.start_offset() * 4, (nei0, tokens), &dst).map_err(candle::MetalError::from)?
+            {
+                drop(encoder);
+                return Ok((MetalStorage::new(dst, device.clone(), elems, DType::F32), Shape::from((tokens, nei0, self.n))));
+            }
             crate::mv_id::matvec_id(
                 device.device(),
                 &encoder,
@@ -2464,15 +2551,56 @@ impl StreamedMoe {
 
         // Resident mode: every expert is on the GPU; the GPU routes and its picks are the addresses.
         if resident_on() && !self.store.drafting() {
-            let logits = self.gate.forward(&xs)?;
-            let (top_ids, top_w) = route(&logits, self.top_k, self.norm_topk_prob)?;
-            let ids = top_ids.to_dtype(DType::U32)?.contiguous()?;
-            let gate = xs.apply_op2_no_bwd(&ids, &self.store.resident_op(self.layer, 0, self.top_k, false)?)?;
-            let up = xs.apply_op2_no_bwd(&ids, &self.store.resident_op(self.layer, 1, self.top_k, false)?)?;
-            let hidden = self.act.hidden(&gate, &up, || Ok(top_ids.clone()))?.reshape((n * self.top_k, ()))?;
-            let down = hidden.apply_op2_no_bwd(&ids, &self.store.resident_op(self.layer, 2, self.top_k, true)?)?;
+            let logits = if n == 1 && std::env::var("COACHWHIP_SKIP").map(|v| v.split(',').any(|x| x == "router")).unwrap_or(false) {
+                Tensor::zeros((1, self.store.slices[self.layer].len()), DType::F32, xs.device())?
+            } else if n == 1 && crate::fuse_kernel::router16_on() {
+                static R16: std::sync::Mutex<Option<HashMap<usize, Tensor>>> = std::sync::Mutex::new(None);
+                let w16 = {
+                    let mut g = R16.lock().unwrap();
+                    let m = g.get_or_insert_with(HashMap::new);
+                    if !m.contains_key(&self.layer) {
+                        m.insert(self.layer, self.gate.weight().to_dtype(DType::F16)?.contiguous()?);
+                    }
+                    m[&self.layer].clone()
+                };
+                crate::fuse_kernel::mv_f16(&w16, &xs)?
+            } else {
+                self.gate.forward(&xs)?
+            };
+            let fuse = crate::fuse_kernel::on();
+            let (top_ids, top_w) = if fuse { crate::fuse_kernel::route(&logits, self.top_k, self.norm_topk_prob)? } else { route(&logits, self.top_k, self.norm_topk_prob)? };
+            let ids = if fuse { top_ids.clone() } else { top_ids.to_dtype(DType::U32)?.contiguous()? };
+            let esk = |w: &str| n == 1 && std::env::var("COACHWHIP_SKIP").map(|v| v.split(',').any(|x| x == w)).unwrap_or(false);
+            let silu = matches!(self.act, ExpertAct::Silu);
+            if fuse && silu && gu_on() {
+                let gu = xs.apply_op2_no_bwd(&ids, &self.store.resident_op(self.layer, 0, self.top_k, false)?)?;
+                let gu_ok = gu.dim(D::Minus1)? == 2 * self.store.slices[self.layer][0][0].dims[0];
+                if gu_ok {
+                    let hidden = crate::fuse_kernel::silu_mul_gu(&gu)?.reshape((n * self.top_k, ()))?;
+                    let down = hidden.apply_op2_no_bwd(&ids, &self.store.resident_op(self.layer, 2, self.top_k, true)?)?;
+                    let down = self.act.finish(down, || Ok(top_ids.clone()))?;
+                    let out = crate::fuse_kernel::weighted_sum(&down, &top_w)?;
+                    return out.reshape((b, s, ()))?.to_dtype(dtype);
+                }
+            }
+            let (gate, up) = if esk("egate") {
+                let up = xs.apply_op2_no_bwd(&ids, &self.store.resident_op(self.layer, 1, self.top_k, false)?)?;
+                (up.clone(), up)
+            } else if esk("eup") {
+                let gate = xs.apply_op2_no_bwd(&ids, &self.store.resident_op(self.layer, 0, self.top_k, false)?)?;
+                (gate.clone(), gate)
+            } else {
+                (xs.apply_op2_no_bwd(&ids, &self.store.resident_op(self.layer, 0, self.top_k, false)?)?,
+                 xs.apply_op2_no_bwd(&ids, &self.store.resident_op(self.layer, 1, self.top_k, false)?)?)
+            };
+            let hidden = if fuse && silu { crate::fuse_kernel::silu_mul(&gate, &up)? } else { self.act.hidden(&gate, &up, || Ok(top_ids.clone()))? }.reshape((n * self.top_k, ()))?;
+            let down = if esk("edown") {
+                Tensor::zeros((n, self.top_k, xs.dim(1)?), DType::F32, xs.device())?
+            } else {
+                hidden.apply_op2_no_bwd(&ids, &self.store.resident_op(self.layer, 2, self.top_k, true)?)?
+            };
             let down = self.act.finish(down, || Ok(top_ids.clone()))?;
-            let out = down.broadcast_mul(&top_w.unsqueeze(2)?)?.sum(1)?;
+            let out = if fuse { crate::fuse_kernel::weighted_sum(&down, &top_w)? } else { down.broadcast_mul(&top_w.unsqueeze(2)?)?.sum(1)? };
             return out.reshape((b, s, ()))?.to_dtype(dtype);
         }
 

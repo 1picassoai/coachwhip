@@ -104,6 +104,7 @@ impl ComputeCommandEncoder {
     fn auto_barrier(&self) {
         let mut s = self.state.lock().unwrap();
         if s.needs_barrier {
+            crate::metal::commands::N_BARRIER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.raw.memoryBarrierWithScope(MTLBarrierScope::Buffers);
             s.needs_barrier = false;
             s.prev_outputs = std::mem::take(&mut s.next_outputs);
