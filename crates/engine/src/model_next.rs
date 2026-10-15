@@ -52,6 +52,12 @@ struct Trail {
 
 /// Keys and values kept between words, like candle's KvCache, plus `truncate` so a speculative
 /// draft can be taken back.
+/// The reserved conversation space in words, when the wrangler has set one.
+fn conv_tokens() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("COACHWHIP_CONV_TOKENS").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0))
+}
+
 struct KvBuf {
     k: Option<Tensor>,
     v: Option<Tensor>,
@@ -67,14 +73,32 @@ impl KvBuf {
     /// Appends along the sequence axis (dim 2) and returns everything kept so far.
     fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         let l = k.dim(2)?;
-        if self.k.is_none() || self.len + l > self.cap {
+        if let Some(fixed) = conv_tokens() {
+            if self.len + l > fixed {
+                candle::bail!("conversation space full: {} + {l} words over the {fixed} reserved", self.len)
+            }
+            if self.k.is_none() || self.cap != fixed {
+                let (b, h, _, d) = k.dims4()?;
+                let len = self.len;
+                let keep = |old: &Option<Tensor>, t: &Tensor| -> Result<Tensor> {
+                    let fresh = Tensor::zeros((b, h, fixed, d), t.dtype(), t.device())?;
+                    if let (Some(o), true) = (old, len > 0) {
+                        fresh.slice_set(&o.narrow(2, 0, len)?.contiguous()?, 2, 0)?;
+                    }
+                    Ok(fresh)
+                };
+                self.k = Some(keep(&self.k, k)?);
+                self.v = Some(keep(&self.v, v)?);
+                self.cap = fixed;
+            }
+        } else if self.k.is_none() || self.len + l > self.cap {
             let (b, h, _, d) = k.dims4()?;
             let cap = (self.len + l).max(self.cap) + 1024;
             let len = self.len;
             let grow = |old: &Option<Tensor>, t: &Tensor| -> Result<Tensor> {
                 let fresh = Tensor::zeros((b, h, cap, d), t.dtype(), t.device())?;
                 if let (Some(o), true) = (old, len > 0) {
-                    fresh.slice_set(&o.narrow(2, 0, len)?, 2, 0)?;
+                    fresh.slice_set(&o.narrow(2, 0, len)?.contiguous()?, 2, 0)?;
                 }
                 Ok(fresh)
             };
@@ -635,7 +659,7 @@ impl FullAttn {
         let q = self.rope(&heads(q)?, offset)?;
         let k = self.rope(&heads(k)?, offset)?;
         let v = heads(v)?;
-        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v)?;
+        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
         let s_len = k.dim(2)?;
 
         let g = self.n_head / self.n_kv;
@@ -1023,6 +1047,61 @@ impl Qwen3Next {
                 Mixer::Linear(a) => a.reset(),
             }
         }
+    }
+
+    /// The conversation's whole state, layer by layer, as (shape, f32 values); an empty shape for a
+    /// memory not yet started. Waits for the GPU once.
+    pub fn save_state(&self) -> Result<Vec<(Vec<usize>, Vec<f32>)>> {
+        let part = |t: Option<&Tensor>| -> Result<(Vec<usize>, Vec<f32>)> {
+            match t {
+                Some(t) => Ok((t.dims().to_vec(), t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?)),
+                None => Ok((vec![], vec![])),
+            }
+        };
+        let mut out = Vec::new();
+        for layer in self.layers.iter() {
+            match &layer.mixer {
+                Mixer::Linear(a) => {
+                    out.push(part(a.conv_state.as_ref())?);
+                    out.push(part(a.state.as_ref())?);
+                }
+                Mixer::Full(a) => {
+                    let kv = &a.kv_cache;
+                    match (&kv.k, &kv.v) {
+                        (Some(k), Some(v)) if kv.len > 0 => {
+                            out.push(part(Some(&k.narrow(2, 0, kv.len)?.contiguous()?))?);
+                            out.push(part(Some(&v.narrow(2, 0, kv.len)?.contiguous()?))?);
+                        }
+                        _ => { out.push((vec![], vec![])); out.push((vec![], vec![])); }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Puts back a state from [`Self::save_state`]; the model then stands where that conversation ended.
+    pub fn load_state(&mut self, parts: &[(Vec<usize>, Vec<f32>)]) -> Result<()> {
+        if parts.len() != 2 * self.layers.len() {
+            candle::bail!("snapshot holds {} parts, this model needs {}", parts.len(), 2 * self.layers.len())
+        }
+        self.clear_kv_cache();
+        let device = self.device.clone();
+        let t = |p: &(Vec<usize>, Vec<f32>)| -> Result<Option<Tensor>> {
+            if p.0.is_empty() { Ok(None) } else { Ok(Some(Tensor::from_slice(&p.1, p.0.as_slice(), &device)?)) }
+        };
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let (a0, a1) = (t(&parts[2 * i])?, t(&parts[2 * i + 1])?);
+            match &mut layer.mixer {
+                Mixer::Linear(a) => { a.conv_state = a0; a.state = a1; }
+                Mixer::Full(a) => {
+                    if let (Some(k), Some(v)) = (a0, a1) {
+                        a.kv_cache.append(&k, &v)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// S6 measurement. Drafts `k` words after `last` with routing confined to the bank (no reads),

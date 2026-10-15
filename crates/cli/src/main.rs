@@ -156,7 +156,7 @@ fn main() -> Result<()> {
         if fits && matches!(arch.as_deref(), Some("qwen35moe") | Some("qwen3next")) {
             for (k, v) in [("COACHWHIP_RESIDENT", "1"), ("COACHWHIP_FUSE", "1"), ("COACHWHIP_NEWMV", "1"), ("COACHWHIP_ADDNORM", "1"),
                            ("COACHWHIP_ROUTER16", "1"), ("COACHWHIP_GDN2", "1"), ("COACHWHIP_PIECE", "1"), ("COACHWHIP_GROUP", "3"),
-                           ("COACHWHIP_PROMPT_CHUNK", "256"), ("COACHWHIP_SHORT", "256"), ("COACHWHIP_FAST_CHAT", "1"), ("COACHWHIP_SPIN", "1")] {
+                           ("COACHWHIP_PROMPT_CHUNK", "256"), ("COACHWHIP_SHORT", "256"), ("COACHWHIP_FAST_CHAT", "1"), ("COACHWHIP_CONV_TOKENS", "8192")] {
                 if std::env::var(k).is_err() {
                     std::env::set_var(k, v);
                 }

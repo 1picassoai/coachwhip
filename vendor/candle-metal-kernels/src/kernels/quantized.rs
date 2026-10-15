@@ -381,3 +381,75 @@ pub fn call_quantized_get_rows(
 fn divide(m: usize, b: usize) -> usize {
     m.div_ceil(b)
 }
+
+
+#[repr(C)]
+struct KargsMvExt {
+    ne00: i32, ne01: i32, ne02: i32, nb00: u64, nb01: u64, nb02: u64, nb03: u64,
+    ne10: i32, ne11: i32, ne12: i32, nb10: u64, nb11: u64, nb12: u64, nb13: u64,
+    ne0: i32, ne1: i32, r2: i16, r3: i16,
+}
+
+/// Coachwhip (`COACHWHIP_EXT=1`): m = 2..4 words times a K-quant matrix (n rows, k columns), every
+/// weight row read once for all m words. Returns Ok(false) when not supported (caller falls back).
+#[allow(clippy::too_many_arguments)]
+pub fn call_mul_mv_ext(
+    device: &crate::metal::Device,
+    ep: impl EncoderProvider,
+    dtype: GgmlDType,
+    (m, n, k): (usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<bool, MetalKernelError> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("COACHWHIP_EXT").map(|v| v == "1").unwrap_or(false)) {
+        return Ok(false);
+    }
+    let (tname, block) = match dtype {
+        GgmlDType::Q4K => ("q4_K", 144usize),
+        GgmlDType::Q5K => ("q5_K", 176),
+        GgmlDType::Q6K => ("q6_K", 210),
+        _ => return Ok(false),
+    };
+    if !(2..=4).contains(&m) || k % 256 != 0 {
+        return Ok(false);
+    }
+    let nx: usize = if m < 3 { 16 } else { 8 };
+    let name = format!("kernel_mul_mv_ext_{tname}_f32_r1_{m}");
+    static P: OnceLock<Mutex<HashMap<(String, usize), Arc<crate::metal::ComputePipeline>>>> = OnceLock::new();
+    let pipeline = {
+        let mut g = P.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+        if let Some(p) = g.get(&(name.clone(), nx)) {
+            p.clone()
+        } else {
+            let src = if nx == 16 { include_str!("../metal_src/ggml_mv_ext16.metal") } else { include_str!("../metal_src/ggml_mv_ext8.metal") };
+            let lib = device.new_library_with_source(src, None)?;
+            let f = lib.get_function(&name, None)?;
+            let p = Arc::new(device.new_compute_pipeline_state_with_function(&f)?);
+            g.insert((name.clone(), nx), p.clone());
+            p
+        }
+    };
+    let encoder = ep.encoder();
+    let encoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    let row = (k / 256 * block) as u64;
+    let args = KargsMvExt {
+        ne00: k as i32, ne01: n as i32, ne02: 1, nb00: block as u64, nb01: row, nb02: row * n as u64, nb03: row * n as u64,
+        ne10: k as i32, ne11: m as i32, ne12: 1, nb10: 4, nb11: (k * 4) as u64, nb12: (k * 4 * m) as u64, nb13: (k * 4 * m) as u64,
+        ne0: n as i32, ne1: m as i32, r2: 1, r3: 1,
+    };
+    encoder.set_bytes(0, &args);
+    encoder.set_input_buffer(1, Some(rhs), 0);
+    encoder.set_input_buffer(2, Some(lhs), lhs_offset);
+    encoder.set_output_buffer(3, Some(dst), dst_offset);
+    let nsg = 2usize;
+    let r0ptg = (32 / nx) * nsg;
+    encoder.dispatch_thread_groups(MTLSize { width: n.div_ceil(r0ptg), height: 1, depth: 1 }, MTLSize { width: 32, height: nsg, depth: 1 });
+    Ok(true)
+}

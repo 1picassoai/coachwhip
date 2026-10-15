@@ -326,6 +326,14 @@ impl QMetalStorage {
             .with_label("qmatmul")
             .build()?;
         let encoder = device.command_encoder()?;
+        if candle_metal_kernels::kernels::quantized::call_mul_mv_ext(
+            device.device(), &encoder, candle_metal_kernels::GgmlDType::try_from(self.dtype)?, (m, n, k),
+            storage.buffer(), layout.start_offset() * storage.dtype().size_in_bytes(), &self.buffer, 0, &dst,
+        ).map_err(MetalError::from)? {
+            drop(encoder);
+            let dst_storage = crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+            return Ok((dst_storage, dst_shape));
+        }
         // In some cases it would be better to use the mm variant, though it has its drawbacks
         // around memory alignment.
         for batch_id in 0..m {
@@ -376,7 +384,7 @@ impl QMetalStorage {
             )
         }
 
-        if src_shape.dim(D::Minus2)? == 1 || self.dtype == GgmlDType::Mxfp4 {
+        if src_shape.dim(D::Minus2)? <= 8 || self.dtype == GgmlDType::Mxfp4 {
             return self.fwd_mv(self_shape, storage, layout);
         }
 

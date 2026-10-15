@@ -298,6 +298,22 @@ impl Model {
         }
     }
 
+    /// The conversation's state, for models that can hand it over (None otherwise).
+    pub fn save_state(&self) -> Result<Option<Vec<(Vec<usize>, Vec<f32>)>>> {
+        match self {
+            Self::Qwen3Next(m) => m.save_state().map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// Puts a saved conversation state back; false when this model cannot.
+    pub fn load_state(&mut self, parts: &[(Vec<usize>, Vec<f32>)]) -> Result<bool> {
+        match self {
+            Self::Qwen3Next(m) => m.load_state(parts).map(|_| true),
+            _ => Ok(false),
+        }
+    }
+
     /// True for a model whose chat format is OpenAI's harmony (gpt-oss) rather than ChatML.
     pub fn harmony(&self) -> bool {
         matches!(self, Self::GptOss(_))

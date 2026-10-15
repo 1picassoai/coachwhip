@@ -38,7 +38,13 @@ fn prompt_chunk() -> usize {
 }
 
 /// When a chat would grow past this many words, it is summarised first to make room.
-pub const CONTEXT_LIMIT: usize = 16384;
+pub const CONTEXT_LIMIT_MAX: usize = 16384;
+/// The most a chat can ever hold (the reserved space may set less).
+pub const CONTEXT_LIMIT: usize = CONTEXT_LIMIT_MAX;
+/// The chat limit: the reserved conversation space when the wrangler set one, else 16384.
+pub fn context_limit() -> usize {
+    std::env::var("COACHWHIP_CONV_TOKENS").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).map_or(CONTEXT_LIMIT_MAX, |n: usize| n.min(CONTEXT_LIMIT_MAX))
+}
 
 /// Longest summary written when making room.
 const SUMMARY_TOKENS: usize = 500;
@@ -200,7 +206,7 @@ pub fn generate(
         tokens.extend(session.pending);
         tokens.extend(encode(format!("{}{turn}", fmt.close()))?);
         // Too long to go on: the model summarises the chat, and the summary opens a new one.
-        if session.pos + tokens.len() + max_new > CONTEXT_LIMIT {
+        if session.pos + tokens.len() + max_new > context_limit() {
             summary = Some(summarise(model, tokenizer, device, session, &stops, &tell)?);
             fresh = true;
         }
@@ -219,6 +225,102 @@ pub fn generate(
     a
 }
 
+
+/// Compaction reuse (`COACHWHIP_SNAPSHOTS=1`): conversation states saved on the SSD, keyed by the exact
+/// words they cover, kept to a disk budget, the least used first out.
+mod snaps {
+    use std::io::{Read, Write};
+    use std::path::PathBuf;
+    pub struct Entry { pub tokens: Vec<u32>, pub file: PathBuf, pub bytes: u64, pub hits: u64, pub used: u64 }
+    pub struct Store { pub dir: PathBuf, pub budget: u64, pub list: Vec<Entry>, pub clock: u64 }
+    pub fn on() -> bool { std::env::var("COACHWHIP_SNAPSHOTS").map(|v| v == "1").unwrap_or(false) }
+    impl Store {
+        pub fn open() -> Store {
+            let dir = std::env::var("COACHWHIP_SNAP_DIR").map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".coachwhip").join("snapshots"));
+            let _ = std::fs::create_dir_all(&dir);
+            let gb: f64 = std::env::var("COACHWHIP_SNAP_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
+            let mut list = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().map(|x| x == "tok").unwrap_or(false) {
+                        if let Ok(b) = std::fs::read(&p) {
+                            let tokens: Vec<u32> = b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                            let file = p.with_extension("state");
+                            let bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+                            if bytes > 0 { list.push(Entry { tokens, file, bytes, hits: 0, used: 0 }); }
+                        }
+                    }
+                }
+            }
+            Store { dir, budget: (gb * 1e9) as u64, list, clock: 0 }
+        }
+        /// The longest saved conversation the prompt begins with (at least `min` words, shorter than the prompt).
+        pub fn find(&mut self, prompt: &[u32], min: usize) -> Option<usize> {
+            let mut best: Option<usize> = None;
+            for (i, e) in self.list.iter().enumerate() {
+                let n = e.tokens.len();
+                if n >= min && n < prompt.len() && prompt[..n] == e.tokens[..] && best.map_or(true, |b| self.list[b].tokens.len() < n) {
+                    best = Some(i);
+                }
+            }
+            if let Some(i) = best { self.clock += 1; self.list[i].hits += 1; self.list[i].used = self.clock; }
+            best
+        }
+        pub fn read(&self, i: usize) -> std::io::Result<Vec<(Vec<usize>, Vec<f32>)>> {
+            let mut b = Vec::new();
+            std::fs::File::open(&self.list[i].file)?.read_to_end(&mut b)?;
+            let mut at = 0usize;
+            let mut u64_at = |b: &[u8], at: &mut usize| -> u64 { let v = u64::from_le_bytes(b[*at..*at + 8].try_into().unwrap()); *at += 8; v };
+            let parts = u64_at(&b, &mut at) as usize;
+            let mut out = Vec::with_capacity(parts);
+            for _ in 0..parts {
+                let rank = u64_at(&b, &mut at) as usize;
+                let dims: Vec<usize> = (0..rank).map(|_| u64_at(&b, &mut at) as usize).collect();
+                let n: usize = if rank == 0 { 0 } else { dims.iter().product() };
+                let vals: Vec<f32> = b[at..at + 4 * n].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                at += 4 * n;
+                out.push((dims, vals));
+            }
+            Ok(out)
+        }
+        pub fn save(&mut self, tokens: &[u32], parts: &[(Vec<usize>, Vec<f32>)]) -> std::io::Result<()> {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            tokens.hash(&mut h);
+            let name = format!("{:016x}", h.finish());
+            let file = self.dir.join(format!("{name}.state"));
+            let mut w = std::io::BufWriter::new(std::fs::File::create(&file)?);
+            w.write_all(&(parts.len() as u64).to_le_bytes())?;
+            for (dims, vals) in parts {
+                w.write_all(&(dims.len() as u64).to_le_bytes())?;
+                for d in dims { w.write_all(&(*d as u64).to_le_bytes())?; }
+                for v in vals { w.write_all(&v.to_le_bytes())?; }
+            }
+            w.flush()?;
+            let tok: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+            std::fs::write(self.dir.join(format!("{name}.tok")), tok)?;
+            let bytes = std::fs::metadata(&file)?.len();
+            self.clock += 1;
+            self.list.retain(|e| e.tokens != tokens);
+            self.list.push(Entry { tokens: tokens.to_vec(), file, bytes, hits: 0, used: self.clock });
+            // over budget: the least used go first (fewest hits, then oldest)
+            while self.list.iter().map(|e| e.bytes).sum::<u64>() > self.budget && self.list.len() > 1 {
+                let (i, _) = self.list.iter().enumerate().min_by_key(|(_, e)| (e.hits, e.used)).unwrap();
+                let e = self.list.remove(i);
+                let _ = std::fs::remove_file(&e.file);
+                let _ = std::fs::remove_file(e.file.with_extension("tok"));
+            }
+            Ok(())
+        }
+    }
+    pub fn store() -> &'static std::sync::Mutex<Store> {
+        static S: std::sync::OnceLock<std::sync::Mutex<Store>> = std::sync::OnceLock::new();
+        S.get_or_init(|| std::sync::Mutex::new(Store::open()))
+    }
+}
+
 /// Answers a whole conversation sent at once, as the OpenAI API does. When it begins with what the
 /// model has already read, only the rest is read; otherwise the model starts afresh.
 #[allow(clippy::too_many_arguments)]
@@ -232,14 +334,31 @@ pub fn generate_full(
     sampling: &Sampling,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<Answer> {
-    if prompt.len() + max_new > CONTEXT_LIMIT {
-        anyhow::bail!("the conversation and its answer would be over {CONTEXT_LIMIT} tokens; start a new one");
+    if prompt.len() + max_new > context_limit() {
+        anyhow::bail!("the conversation and its answer would be over {} tokens; start a new one", context_limit());
     }
     let known = session.fed.len();
-    let fresh = known == 0 || prompt.len() <= known || !prompt.starts_with(&session.fed);
+    let mut fresh = known == 0 || prompt.len() <= known || !prompt.starts_with(&session.fed);
     if fresh {
         model.clear_kv_cache();
         *session = Session::default();
+        // A conversation that begins with words already saved starts from that snapshot.
+        if snaps::on() {
+            let mut st = snaps::store().lock().unwrap();
+            if let Some(i) = st.find(&prompt, 256) {
+                let n = st.list[i].tokens.len();
+                match st.read(i).map_err(anyhow::Error::from).and_then(|parts| model.load_state(&parts).map_err(anyhow::Error::from)) {
+                    Ok(true) => {
+                        session.fed = prompt[..n].to_vec();
+                        session.pos = n;
+                        fresh = false;
+                        eprintln!("  snapshot: restored {n} words, reading only the {} new", prompt.len() - n);
+                    }
+                    Ok(false) => {}
+                    Err(e) => { eprintln!("  snapshot: could not restore ({e}); reading afresh"); model.clear_kv_cache(); *session = Session::default(); }
+                }
+            }
+        }
     } else {
         // The word an earlier answer was cut off on is part of what the client sent back.
         session.pending = None;
@@ -248,6 +367,14 @@ pub fn generate_full(
     let think = model.harmony();
     let a = answer(model, tokenizer, device, session, tokens, fresh, false, think, max_new, sampling, &None, emit);
     session.by_api = true;
+    // Kept for the next conversation that begins the same way.
+    if snaps::on() && a.is_ok() && session.fed.len() >= 256 {
+        if let Ok(Some(parts)) = model.save_state() {
+            if let Err(e) = snaps::store().lock().unwrap().save(&session.fed, &parts) {
+                eprintln!("  snapshot: could not save ({e})");
+            }
+        }
+    }
     a
 }
 
@@ -405,10 +532,21 @@ fn answer(
 /// While it reads, every finished layer is reported, counted across all the pieces, so the page
 /// is never silent.
 fn read_prompt(model: &mut Model, device: &Device, pos: usize, tokens: &[u32], tell: &Option<Rc<RefCell<Progress>>>) -> Result<Tensor> {
-    let pieces = tokens.len().div_ceil(prompt_chunk());
+    // The pieces shrink as the chat grows, so the attention scores of a piece (piece x chat) never
+    // need more memory than a full piece at 4K of chat.
+    let piece_at = |at: usize| -> usize { let full = prompt_chunk(); if at <= 4096 { full } else { (full * 4096 / at).max(32) } };
+    let mut bounds = Vec::new();
+    let mut at = 0usize;
+    while at < tokens.len() {
+        let n = piece_at(pos + at + piece_at(pos + at)).min(tokens.len() - at);
+        bounds.push((at, n));
+        at += n;
+    }
+    let pieces = bounds.len();
     let read = (|| -> Result<Tensor> {
     let mut logits = None;
-    for (i, piece) in tokens.chunks(prompt_chunk()).enumerate() {
+    for (i, &(start, n)) in bounds.iter().enumerate() {
+        let piece = &tokens[start..start + n];
         model.set_progress(tell.clone().map(|t| -> Progress {
             Box::new(move |step| {
                 if let Step::Layer(layer, of) = step {
@@ -416,7 +554,7 @@ fn read_prompt(model: &mut Model, device: &Device, pos: usize, tokens: &[u32], t
                 }
             })
         }));
-        logits = Some(model.forward(&Tensor::new(piece, device)?.unsqueeze(0)?, pos + i * prompt_chunk())?.squeeze(0)?);
+        logits = Some(model.forward(&Tensor::new(piece, device)?.unsqueeze(0)?, pos + start)?.squeeze(0)?);
     }
     logits.ok_or_else(|| anyhow::anyhow!("empty prompt"))
     })();
@@ -614,7 +752,7 @@ pub fn own_page(host: &str, origin: &str, port: u16) -> bool {
 /// How many tokens an API answer may write: what the client asked for, capped by Coachwhip's own
 /// limit; with no limit asked for, whatever room the 16K conversation leaves.
 pub fn answer_budget(asked: Option<u64>, max_new: usize, prompt_len: usize) -> usize {
-    let room = CONTEXT_LIMIT.saturating_sub(prompt_len);
+    let room = context_limit().saturating_sub(prompt_len);
     asked.map_or(max_new.min(room), |m| (m as usize).min(max_new))
 }
 

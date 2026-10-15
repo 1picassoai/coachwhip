@@ -2219,7 +2219,7 @@ impl CustomOp2 for MoeMatvec {
         {
             let encoder = device.command_encoder()?;
             let dt = candle_metal_kernels::GgmlDType::try_from(self.dtype)?;
-            if tokens > 1 && crate::fuse_kernel::group3_on() {
+            if tokens > 8 && crate::fuse_kernel::group3_on() {
                 drop(encoder);
                 let (pb, hb) = crate::fuse_kernel::piles(&device, ids.buffer(), il.start_offset() * 4, tokens * nei0, nei0, self.slots)?;
                 let encoder = device.command_encoder()?;
