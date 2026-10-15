@@ -330,7 +330,7 @@ impl CustomOp1 for Route {
         let dev = x.device().clone();
         let n = t * self.k;
         let dt = if self.which == 0 { DType::U32 } else { DType::F32 };
-        let dst = dev.new_buffer_builder().with_size_for(n, dt).with_label("cw-route").build()?;
+        let dst = crate::arena::take_for(&dev, n, dt, "cw-route")?;
         let p = pipe(&dev, "cw_route")?;
         {
             let enc = dev.command_encoder()?;
@@ -359,7 +359,7 @@ impl CustomOp2 for SiluMul {
         need(g, gl, "gate")?; need(u, ul, "up")?;
         let n = gl.shape().elem_count();
         let dev = g.device().clone();
-        let dst = dev.new_buffer_builder().with_size_for(n, DType::F32).with_label("cw-silu-mul").build()?;
+        let dst = crate::arena::take_for(&dev, n, DType::F32, "cw-silu-mul")?;
         let p = pipe(&dev, "cw_silu_mul")?;
         {
             let enc = dev.command_encoder()?;
@@ -382,7 +382,7 @@ impl CustomOp2 for WSum {
         need(d, dl, "down")?; need(w, wl, "weights")?;
         let (t, k, h) = dl.shape().dims3()?;
         let dev = d.device().clone();
-        let dst = dev.new_buffer_builder().with_size_for(t * h, DType::F32).with_label("cw-wsum").build()?;
+        let dst = crate::arena::take_for(&dev, t * h, DType::F32, "cw-wsum")?;
         let p = pipe(&dev, "cw_weighted_sum")?;
         {
             let enc = dev.command_encoder()?;
@@ -409,7 +409,7 @@ impl CustomOp1 for SiluMulGu {
         *dims.last_mut().unwrap() = i;
         let n = gl.shape().elem_count() / 2;
         let dev = g.device().clone();
-        let dst = dev.new_buffer_builder().with_size_for(n, DType::F32).with_label("cw-silu-mul-gu").build()?;
+        let dst = crate::arena::take_for(&dev, n, DType::F32, "cw-silu-mul-gu")?;
         let p = pipe(&dev, "cw_silu_mul_gu")?;
         {
             let enc = dev.command_encoder()?;
@@ -567,8 +567,8 @@ pub fn group3_on() -> bool {
 pub fn piles(dev: &candle::MetalDevice, ids: &candle_metal_kernels::metal::Buffer, ids_offset: usize, n_ids: usize, nei0: usize, experts: usize)
     -> Result<(Arc<candle_metal_kernels::metal::Buffer>, Arc<candle_metal_kernels::metal::Buffer>)> {
     if experts > 256 { candle::bail!("cw-pile: {experts} experts") }
-    let pb = dev.new_buffer_builder().with_size_for(n_ids, DType::U32).with_label("cw-piles").build()?;
-    let hb = dev.new_buffer_builder().with_size_for(3 * experts, DType::U32).with_label("cw-heads").build()?;
+    let pb = crate::arena::take_for(&dev, n_ids, DType::U32, "cw-piles")?;
+    let hb = crate::arena::take_for(&dev, 3 * experts, DType::U32, "cw-heads")?;
     let p = pipe(dev, "cw_pile")?;
     {
         let enc = dev.command_encoder()?;

@@ -124,6 +124,9 @@ impl MetalDevice {
     }
 
     fn drop_unused_buffers(&self) -> Result<()> {
+        if HOLD_POOL.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
         let mut buffers = self.buffers.write().map_err(MetalError::from)?;
         for subbuffers in buffers.values_mut() {
             subbuffers.retain(|s| {
@@ -206,6 +209,14 @@ impl MetalDevice {
     }
 
     /// Returns a builder for buffer allocation. See `BufferBuilder`.
+    /// Coachwhip: a buffer outside the pool, owned by the caller (the engine's own arena).
+    pub fn new_raw_buffer(&self, size: usize) -> Result<Arc<Buffer>> {
+        let new_buffer = self.device.new_buffer(size, PRIVATE_RESOURCE_OPTIONS).map_err(MetalError::from)?;
+        let new_buffer = Arc::new(new_buffer);
+        self.residency_set.insert(&new_buffer);
+        Ok(new_buffer)
+    }
+
     pub fn new_buffer_builder(&self) -> BufferBuilder<'_> {
         BufferBuilder::new(self)
     }
@@ -479,6 +490,9 @@ mod tests {
         assert_eq!(buf_size(2), 2);
     }
 }
+
+/// Once set, the pool never gives a buffer back: memory held is memory kept (grow only).
+pub static HOLD_POOL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn find_available_buffer(size: usize, buffers: &BufferMap) -> Option<Arc<Buffer>> {
     let mut best_buffer: Option<&Arc<Buffer>> = None;

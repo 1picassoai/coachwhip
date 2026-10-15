@@ -1989,6 +1989,10 @@ impl ExpertStore {
                     eprintln!("coachwhip: resident layer {layer} loaded; GPU {:.2} of {:.2} GB", used as f64 / 1e9, limit as f64 / 1e9);
                 }
             }
+            if layer + 1 == self.layers && std::env::var("COACHWHIP_HOLD_POOL").map(|v| v != "0").unwrap_or(true) {
+                candle::metal_backend::HOLD_POOL.store(true, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("coachwhip: GPU memory held from here on (grow only)");
+            }
         }
         let (st, dtype, n, k, bytes) = res[&layer][which].clone();
         Ok(MoeMatvec { bank: st, dtype, n, k, slots: self.slices[layer].len(), bytes, nei0, rows_per_expert })
@@ -2215,7 +2219,7 @@ impl CustomOp2 for MoeMatvec {
         let (ne11, nb11, nb12) = if self.rows_per_expert { (nei0, k * 4, nei0 * k * 4) } else { (1, 0, k * 4) };
         let device = x.device().clone();
         let elems = tokens * nei0 * self.n;
-        let dst = device.new_buffer_builder().with_size_for(elems, DType::F32).with_label("moe_mv_id").build()?;
+        let dst = crate::arena::take_for(&device, elems, DType::F32, "moe_mv_id")?;
         {
             let encoder = device.command_encoder()?;
             let dt = candle_metal_kernels::GgmlDType::try_from(self.dtype)?;

@@ -18,7 +18,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
 
 mod device;
-pub use device::{DeviceId, MetalDevice};
+pub use device::{DeviceId, MetalDevice, HOLD_POOL};
 
 pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffset<'a> {
     BufferOffset {

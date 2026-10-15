@@ -452,6 +452,8 @@ kernel void coachwhip_gdn_piece_cols(
     constant uint& cycle           [[buffer(15)]],
     constant float& eps            [[buffer(16)]],
     constant uint& L               [[buffer(17)]],
+    device const float* pre        [[buffer(18)]],
+    constant uint& use_pre         [[buffer(19)]],
     uint g   [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint tgs [[threads_per_threadgroup]])
@@ -479,6 +481,13 @@ kernel void coachwhip_gdn_piece_cols(
     #define ROWV(u, c) ((int)(u) < 0 ? conv_state[((int)(u) + (int)taps - 1) * channels + (c)] : qkv[(uint)(u) * channels + (c)])
     for (uint t = 0; t < L; t++) {
         const int base = (int)t - (int)(taps - 1);
+        float v;
+        if (use_pre) {
+            device const float* pr = pre + t * channels;
+            for (uint i = tid; i < dk; i += tgs) { q_sh[i] = pr[kh * dk + i]; k_sh[i] = pr[n_k * dk + kh * dk + i]; }
+            v = pr[cv];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else {
         for (uint i = tid; i < dk; i += tgs) {
             uint cq = kh * dk + i;
             uint ck = n_k * dk + kh * dk + i;
@@ -505,15 +514,15 @@ kernel void coachwhip_gdn_piece_cols(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i = tid; i < dk; i += tgs) { q_sh[i] *= qscale; k_sh[i] *= kscale; }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        float xv = 0.0f;
+        for (uint tt = 0; tt + 1 < taps; tt++) xv += conv_w[cv * taps + tt] * ROWV(base + (int)tt, cv);
+        xv += conv_w[cv * taps + taps - 1] * qkv[t * channels + cv];
+        v = silu_f(xv);
+        }
 
         const float beta = 1.0f / (1.0f + exp(-ba[t * n_v + h]));
         const float alpha = ba[L * n_v + t * n_v + h];
         const float gg = exp(log(exp(alpha + dtb) + 1.0f) * av);
-
-        float xv = 0.0f;
-        for (uint tt = 0; tt + 1 < taps; tt++) xv += conv_w[cv * taps + tt] * ROWV(base + (int)tt, cv);
-        xv += conv_w[cv * taps + taps - 1] * qkv[t * channels + cv];
-        const float v = silu_f(xv);
 
         float skv = 0.0f;
         for (uint ii = 0; ii < 32; ii++) skv += k_sh[i0 + ii] * col[ii];
@@ -546,6 +555,48 @@ kernel void coachwhip_gdn_piece_cols(
         }
     }
     if (r == 0) for (uint tt = 0; tt + 1 < taps; tt++) c_out[tt * channels + cv] = ROWV(last + (int)tt, cv);
+}
+
+// One thread per (word, channel): the conv over the taps and the silu, once per piece.
+kernel void coachwhip_gdn_prep(
+    device const float* qkv        [[buffer(0)]],
+    device const float* conv_state [[buffer(1)]],
+    device const float* conv_w     [[buffer(2)]],
+    device float* pre              [[buffer(3)]],
+    constant uint& channels        [[buffer(4)]],
+    constant uint& taps            [[buffer(5)]],
+    constant uint& L               [[buffer(6)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= L * channels) return;
+    const uint t = i / channels, c = i % channels;
+    const int base = (int)t - (int)(taps - 1);
+    float x = 0.0f;
+    for (uint tt = 0; tt + 1 < taps; tt++) x += conv_w[c * taps + tt] * ROWV(base + (int)tt, c);
+    x += conv_w[c * taps + taps - 1] * qkv[t * channels + c];
+    pre[i] = silu_f(x);
+}
+
+// One thread per (word, k-head): the q and k norms, same serial sums as the walk had.
+kernel void coachwhip_gdn_normqk(
+    device float* pre              [[buffer(0)]],
+    constant uint& channels        [[buffer(1)]],
+    constant uint& n_k             [[buffer(2)]],
+    constant uint& dk              [[buffer(3)]],
+    constant float& eps            [[buffer(4)]],
+    constant uint& L               [[buffer(5)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= L * n_k) return;
+    const uint t = i / n_k, kh = i % n_k;
+    device float* q = pre + t * channels + kh * dk;
+    device float* k = pre + t * channels + n_k * dk + kh * dk;
+    float sq = 0.0f, sk = 0.0f;
+    for (uint j = 0; j < dk; j++) { sq += q[j] * q[j]; sk += k[j] * k[j]; }
+    const float r0 = sqrt(sq + eps), r1 = sqrt(sk + eps);
+    const float qscale = 1.0f / (r0 * sqrt((float)dk));
+    const float kscale = 1.0f / r1;
+    for (uint j = 0; j < dk; j++) { q[j] *= qscale; k[j] *= kscale; }
 }
 
 // One thread per (word, head): the output RMS norm over the head's dv values, then the silu gate,
@@ -587,6 +638,26 @@ fn pipelines_cols(device: &candle::MetalDevice) -> Result<(Arc<ComputePipeline>,
     Ok(p)
 }
 
+fn pipelines_prep(device: &candle::MetalDevice) -> Result<(Arc<ComputePipeline>, Arc<ComputePipeline>)> {
+    static PIPE: OnceLock<(Arc<ComputePipeline>, Arc<ComputePipeline>)> = OnceLock::new();
+    if let Some(p) = PIPE.get() {
+        return Ok(p.clone());
+    }
+    let lib = device.device().new_library_with_source(SOURCE_PIECE_COLS, None).map_err(candle::MetalError::from)?;
+    let mk = |name: &str| -> Result<Arc<ComputePipeline>> {
+        let f = lib.get_function(name, None).map_err(candle::MetalError::from)?;
+        Ok(Arc::new(device.device().new_compute_pipeline_state_with_function(&f).map_err(candle::MetalError::from)?))
+    };
+    let p = (mk("coachwhip_gdn_prep")?, mk("coachwhip_gdn_normqk")?);
+    let _ = PIPE.set(p.clone());
+    Ok(p)
+}
+
+fn piece_prep_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_PIECE_PREP").map(|v| v != "0").unwrap_or(true))
+}
+
 fn piece_cols_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("COACHWHIP_PIECE_COLS").map(|v| v != "0").unwrap_or(true))
@@ -611,7 +682,9 @@ impl CustomOp3 for GdnPiece {
         let channels = 2 * n_k * dk + n_v * dv;
         let n_out = l * n_v * dv + n_v * dk * dv + (taps - 1) * channels;
         let device = qkv.device().clone();
-        let dst = device.new_buffer_builder().with_size_for(n_out, DType::F32).with_label("gdn-piece").build()?;
+        let dst = crate::arena::take_for(&device, n_out, DType::F32, "gdn-piece")?;
+        let pre = crate::arena::take_for(&device, l * channels, DType::F32, "gdn-pre")?;
+        let use_pre = piece_cols_on() && piece_prep_on();
         let pipe = pipeline_piece(&device)?;
         let cs = w.conv_state.storage_and_layout();
         let cw = w.conv_w.storage_and_layout();
@@ -623,16 +696,29 @@ impl CustomOp3 for GdnPiece {
             match g { Storage::Metal(m) => Ok(m), _ => candle::bail!("coachwhip-gdn-piece: not on Metal") }
         }
         let (cs_m, cw_m, db_m, av_m, nw_m, ss_m) = (m(&cs.0)?, m(&cw.0)?, m(&db.0)?, m(&av.0)?, m(&nw.0)?, m(&ss.0)?);
+        if use_pre {
+            let (pp, pn) = pipelines_prep(&device)?;
+            let encoder = device.command_encoder()?;
+            let encoder = encoder.as_ref();
+            let (ch_u, taps_u, l_u, n_k_u, dk_u) = (channels as u32, taps as u32, l as u32, n_k as u32, dk as u32);
+            encoder.set_compute_pipeline_state(&pp);
+            set_params!(encoder, ((qkv.buffer(), ql.start_offset() * 4), (cs_m.buffer(), cs.1.start_offset() * 4), (cw_m.buffer(), cw.1.start_offset() * 4), Output::with_offset(&pre, 0), ch_u, taps_u, l_u));
+            encoder.dispatch_thread_groups(MTLSize { width: (l * channels).div_ceil(256), height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
+            encoder.set_compute_pipeline_state(&pn);
+            set_params!(encoder, (Output::with_offset(&pre, 0), ch_u, n_k_u, dk_u, w.eps, l_u));
+            encoder.dispatch_thread_groups(MTLSize { width: (l * n_k).div_ceil(64), height: 1, depth: 1 }, MTLSize { width: 64, height: 1, depth: 1 });
+        }
         {
             let encoder = device.command_encoder()?;
             let encoder = encoder.as_ref();
             encoder.set_compute_pipeline_state(&pipe);
             let (n_k_u, n_v_u, dk_u, dv_u, taps_u, cycle_u, l_u) = (n_k as u32, n_v as u32, dk as u32, dv as u32, taps as u32, w.cycle as u32, l as u32);
+            let use_pre_u = use_pre as u32;
             set_params!(encoder, (
                 (qkv.buffer(), ql.start_offset() * 4), (z.buffer(), zl.start_offset() * 4), (ba.buffer(), bl.start_offset() * 4),
                 (cs_m.buffer(), cs.1.start_offset() * 4), (cw_m.buffer(), cw.1.start_offset() * 4), (db_m.buffer(), db.1.start_offset() * 4),
                 (av_m.buffer(), av.1.start_offset() * 4), (nw_m.buffer(), nw.1.start_offset() * 4), (ss_m.buffer(), ss.1.start_offset() * 4),
-                Output::with_offset(&dst, 0), n_k_u, n_v_u, dk_u, dv_u, taps_u, cycle_u, w.eps, l_u
+                Output::with_offset(&dst, 0), n_k_u, n_v_u, dk_u, dv_u, taps_u, cycle_u, w.eps, l_u, Output::with_offset(&pre, 0), use_pre_u
             ));
             if piece_cols_on() {
                 let (pc, _) = pipelines_cols(&device)?;
@@ -669,8 +755,8 @@ pub fn gdn_piece(op: GdnWord, qkv: &Tensor, z: &Tensor, beta: &Tensor, alpha: &T
     let ba = Tensor::cat(&[&f(beta)?, &f(alpha)?], 0)?.contiguous()?;
     let out = qkv.apply_op3_no_bwd(&z, &ba, &GdnPiece { w: op, l })?;
     let o = out.narrow(0, 0, l * n_v * dv)?.reshape((l, n_v * dv))?;
-    let s_new = out.narrow(0, l * n_v * dv, n_v * dk * dv)?.reshape((n_v, dk, dv))?;
-    let conv_new = out.narrow(0, l * n_v * dv + n_v * dk * dv, (taps - 1) * channels)?.reshape((taps - 1, channels))?;
+    let s_new = out.narrow(0, l * n_v * dv, n_v * dk * dv)?.affine(1.0, 0.0)?.reshape((n_v, dk, dv))?;
+    let conv_new = out.narrow(0, l * n_v * dv + n_v * dk * dv, (taps - 1) * channels)?.affine(1.0, 0.0)?.reshape((taps - 1, channels))?;
     Ok((o, s_new, conv_new))
 }
 
