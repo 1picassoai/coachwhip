@@ -1953,7 +1953,6 @@ impl ExpertStore {
             let mut out = Vec::with_capacity(3);
             let (g0, u0) = (&self.slices[layer][0][0], &self.slices[layer][0][1]);
             let gu = gu_on() && g0.dtype == u0.dtype && g0.dims == u0.dims && g0.bytes == u0.bytes;
-            if layer == 0 { eprintln!("coachwhip: gu check on={} g {:?} {:?} {} u {:?} {:?} {}", gu_on(), g0.dtype, g0.dims, g0.bytes, u0.dtype, u0.dims, u0.bytes); }
             if gu {
                 // expert e = [its gate rows][its up rows], one after the other
                 let b = g0.bytes;

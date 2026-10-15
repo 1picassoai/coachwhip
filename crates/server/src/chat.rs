@@ -818,7 +818,7 @@ fn openai(mut s: TcpStream, body: &[u8], model: &mut Model, model_name: &str, to
             eprintln!("  error detail: {e:#}");
                 let oom = gpu_out_of_memory(&e);
             let msg = if oom {
-                "The GPU ran out of memory. Coachwhip has stopped: close some apps, or start it again with a smaller --bank.".to_string()
+                "The GPU ran out of memory. Coachwhip has stopped: close other apps and start it again, or send a shorter prompt.".to_string()
             } else {
                 format!("{e}")
             };
@@ -972,7 +972,7 @@ fn handle(mut s: TcpStream, model: &mut Model, model_name: &str, tokenizer: &Tok
                 eprintln!("  error detail: {e:#}");
                 let oom = gpu_out_of_memory(&e);
                 let msg = if oom {
-                    "The GPU ran out of memory. Coachwhip has stopped: close some apps, or start it again with a smaller --bank.".to_string()
+                    "The GPU ran out of memory. Coachwhip has stopped: close other apps and start it again, or send a shorter prompt.".to_string()
                 } else {
                     format!("The answer could not be finished: {e}")
                 };
