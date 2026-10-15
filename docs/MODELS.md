@@ -190,6 +190,8 @@ Measured 6 Oct 2026: one person, one run per bank, on the same Mac with a backgr
 - Tokenizer: [tokenizer.json](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) from the model's own page.
 - **On 0.4.0:** not re-measured. Its code path is unchanged, but nobody has run it on the release build.
 
+**On 0.5.1, every expert on the GPU.** With unsloth's [UD-IQ2_M file](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) (11.5 GB) all 256 experts of all 40 layers stay in GPU memory and nothing streams from the SSD. Measured 15 Oct 2026 on the same Mac: **writing 38 tok/s** (300 tokens after a 1,500-token prompt, four runs between 37.9 and 38.3); **reading about 300 tok/s** on that prompt (289 to 304); single prompts of 7,500, 9,300 and 16,800 tokens read at 242, 227 and 202 tok/s on one running engine. Chosen by itself when the file fits with 1 GB to spare; the start line is the same as any model, and no bank number is needed. Quality on a four-agent CrewAI coding job (8 behaviour checks, temperature 0.7): 5, 3 and 5 of 8 over three runs. The Q4 file above still runs the streaming way.
+
 ## Qwen3-Coder-30B-A3B
 
 The smaller download (architecture `qwen3moe`), 18.6 GB at Q4_K_M. Bank 44 on 16 GB. Its experts are bigger than the 80B's, so it holds about 11 GB while hot and leaves about 3 GB for everything else.
