@@ -532,7 +532,12 @@ fn answer(
 fn read_prompt(model: &mut Model, device: &Device, pos: usize, tokens: &[u32], tell: &Option<Rc<RefCell<Progress>>>) -> Result<Tensor> {
     // The pieces shrink as the chat grows, so the attention scores of a piece (piece x chat) never
     // need more memory than a full piece at 4K of chat.
-    let piece_at = |at: usize| -> usize { let full = prompt_chunk(); if at <= 4096 { full } else { (full * 4096 / at).max(32) } };
+    let space: Option<usize> = std::env::var("COACHWHIP_CONV_TOKENS").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0);
+    let piece_at = |at: usize| -> usize {
+        let full = prompt_chunk();
+        let at = space.map_or(at, |s| at.min(s));
+        if at <= 4096 { full } else { (full * 4096 / at).max(32) }
+    };
     let mut bounds = Vec::new();
     let mut at = 0usize;
     while at < tokens.len() {

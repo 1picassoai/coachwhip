@@ -80,7 +80,8 @@ impl KvBuf {
             if self.len + l > fixed {
                 // Roll: keep the opening and the newest, let the oldest middle go.
                 let sink = 256.min(self.len);
-                let drop = self.len + l - fixed;
+                // Roll a quarter of the space at once, so the shift is rare, not once per word.
+                let drop = (self.len + l - fixed).max(fixed / 4).min(self.len.saturating_sub(256.min(self.len)));
                 let keep_from = (sink + drop).min(self.len);
                 if let (Some(kb), Some(vb)) = (&self.k, &self.v) {
                     if keep_from < self.len {
