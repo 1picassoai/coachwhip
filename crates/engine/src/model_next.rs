@@ -74,8 +74,23 @@ impl KvBuf {
     fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
         let l = k.dim(2)?;
         if let Some(fixed) = conv_tokens() {
+            if l > fixed / 2 {
+                candle::bail!("a piece of {l} words is over half the {fixed}-word conversation space")
+            }
             if self.len + l > fixed {
-                candle::bail!("conversation space full: {} + {l} words over the {fixed} reserved", self.len)
+                // Roll: keep the opening and the newest, let the oldest middle go.
+                let sink = 256.min(self.len);
+                let drop = self.len + l - fixed;
+                let keep_from = (sink + drop).min(self.len);
+                if let (Some(kb), Some(vb)) = (&self.k, &self.v) {
+                    if keep_from < self.len {
+                        let tail_k = kb.narrow(2, keep_from, self.len - keep_from)?.contiguous()?;
+                        let tail_v = vb.narrow(2, keep_from, self.len - keep_from)?.contiguous()?;
+                        kb.slice_set(&tail_k, 2, sink)?;
+                        vb.slice_set(&tail_v, 2, sink)?;
+                    }
+                }
+                self.len = sink + (self.len - keep_from);
             }
             if self.k.is_none() || self.cap != fixed {
                 let (b, h, _, d) = k.dims4()?;
@@ -666,6 +681,14 @@ impl FullAttn {
         let q = q.contiguous()?.reshape((1, self.n_kv, g * l, self.hd))?;
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * (1.0 / (self.hd as f64).sqrt()))?;
         if let Some(m) = mask {
+            // After the space has rolled, the mask is rebuilt for the words actually kept.
+            let rebuilt;
+            let m = if m.dim(D::Minus1)? != s_len {
+                rebuilt = candle_transformers::utils::build_additive_causal_mask(l, s_len - l, None, scores.device(), DType::F32)?;
+                &rebuilt
+            } else {
+                m
+            };
             scores = scores
                 .reshape((1, self.n_kv, g, l, s_len))?
                 .broadcast_add(&m.to_dtype(scores.dtype())?.unsqueeze(1)?)?

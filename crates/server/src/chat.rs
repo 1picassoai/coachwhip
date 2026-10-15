@@ -334,9 +334,7 @@ pub fn generate_full(
     sampling: &Sampling,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<Answer> {
-    if prompt.len() + max_new > context_limit() {
-        anyhow::bail!("the conversation and its answer would be over {} tokens; start a new one", context_limit());
-    }
+    // No refusal: past the reserved space the conversation rolls (see the engine's KvBuf).
     let known = session.fed.len();
     let mut fresh = known == 0 || prompt.len() <= known || !prompt.starts_with(&session.fed);
     if fresh {
@@ -752,8 +750,9 @@ pub fn own_page(host: &str, origin: &str, port: u16) -> bool {
 /// How many tokens an API answer may write: what the client asked for, capped by Coachwhip's own
 /// limit; with no limit asked for, whatever room the 16K conversation leaves.
 pub fn answer_budget(asked: Option<u64>, max_new: usize, prompt_len: usize) -> usize {
-    let room = context_limit().saturating_sub(prompt_len);
-    asked.map_or(max_new.min(room), |m| (m as usize).min(max_new))
+    // The conversation rolls past its space, so the answer is never squeezed to fit.
+    let _ = prompt_len;
+    asked.map_or(max_new, |m| (m as usize).min(max_new))
 }
 
 pub fn html_escape(t: &str) -> String {
