@@ -226,6 +226,116 @@ pub fn generate(
 }
 
 
+
+/// Request-level extras the chain sampler reads (the door answers one request at a time).
+static SAMPLER_EXTRA: std::sync::Mutex<(Option<usize>, Option<f64>)> = std::sync::Mutex::new((None, None));
+static REPEAT_REQ: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+fn default_repeat_penalty() -> f64 { std::env::var("COACHWHIP_REPEAT_PENALTY").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0) }
+fn repeat_last_n() -> usize { std::env::var("COACHWHIP_REPEAT_LAST_N").ok().and_then(|v| v.parse().ok()).unwrap_or(64) }
+fn default_top_k() -> usize { std::env::var("COACHWHIP_TOP_K").ok().and_then(|v| v.parse().ok()).unwrap_or(40) }
+fn default_min_p() -> f64 { std::env::var("COACHWHIP_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.05) }
+
+/// The word pick: argmax at temperature 0, else top-k -> top-p -> min-p -> temperature -> draw.
+struct Picker { s: Sampling, k: usize, min_p: f64, rng: u64, penalty: f64, hist: std::collections::VecDeque<u32> }
+impl Picker {
+    fn new(s: &Sampling) -> Self {
+        let (k, mp) = *SAMPLER_EXTRA.lock().unwrap();
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x9E3779B97F4A7C15, |d| d.as_nanos() as u64) | 1;
+        let penalty = REPEAT_REQ.lock().unwrap().unwrap_or_else(default_repeat_penalty);
+        Picker { s: s.clone(), k: k.unwrap_or_else(default_top_k), min_p: mp.unwrap_or_else(default_min_p), rng: seed, penalty, hist: std::collections::VecDeque::new() }
+    }
+    /// The words the penalty looks back over: the end of the prompt, then every word picked.
+    fn remember(&mut self, words: &[u32]) {
+        for &w in words { self.hist.push_back(w); }
+        while self.hist.len() > repeat_last_n() { self.hist.pop_front(); }
+    }
+    fn penalised(&self) -> bool { self.penalty != 1.0 }
+    fn uniform(&mut self) -> f64 {
+        let mut x = self.rng;
+        x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+        self.rng = x;
+        (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn sample(&mut self, logits: &Tensor) -> candle::Result<u32> {
+        // Fast path: no penalty, a temperature, on the GPU: only the k best come back.
+        let t_now = match &self.s { Sampling::ArgMax => 0.0, Sampling::All { temperature } | Sampling::TopK { temperature, .. } | Sampling::TopP { temperature, .. } | Sampling::TopKThenTopP { temperature, .. } => *temperature, #[allow(unreachable_patterns)] _ => 0.0 };
+        let k_now = match &self.s { Sampling::TopK { k, .. } | Sampling::TopKThenTopP { k, .. } => *k, _ => self.k };
+        if !self.penalised() && t_now > 0.0 && k_now >= 1 && k_now <= 64 && logits.device().is_metal() && std::env::var("COACHWHIP_GPU_TOPK").map(|v| v != "0").unwrap_or(true) {
+            let (vals, ids) = coachwhip_engine::fuse_kernel::topk(logits, k_now)?;
+            let p_now = match &self.s { Sampling::TopP { p, .. } | Sampling::TopKThenTopP { p, .. } => *p, _ => 1.0 };
+            let pick = self.draw(&vals, &ids, p_now, t_now);
+            self.remember(&[pick]);
+            return Ok(pick);
+        }
+        let mut v: Vec<f32> = logits.flatten_all()?.to_dtype(candle::DType::F32)?.to_vec1()?;
+        if self.penalised() {
+            let mut seen = std::collections::HashSet::new();
+            for &w in &self.hist {
+                if seen.insert(w) {
+                    if let Some(x) = v.get_mut(w as usize) {
+                        *x = if *x > 0.0 { *x / self.penalty as f32 } else { *x * self.penalty as f32 };
+                    }
+                }
+            }
+        }
+        let pick = self.pick(&v)?;
+        self.remember(&[pick]);
+        Ok(pick)
+    }
+    /// Top-p, min-p, temperature and the draw over k candidates already in best-first order.
+    fn draw(&mut self, vals: &[f32], ids: &[u32], p: f64, t: f64) -> u32 {
+        let m = vals[0] as f64;
+        let mut pr: Vec<f64> = vals.iter().map(|&x| (x as f64 - m).exp()).collect();
+        let z: f64 = pr.iter().sum();
+        for x in pr.iter_mut() { *x /= z; }
+        let mut cum = 0.0; let mut keep = pr.len();
+        for (j, &x) in pr.iter().enumerate() { cum += x; if cum >= p { keep = j + 1; break; } }
+        let cut = self.min_p * pr[0];
+        let keep = pr[..keep].iter().take_while(|&&x| x >= cut).count().max(1);
+        let w: Vec<f64> = vals[..keep].iter().map(|&x| ((x as f64 - m) / t).exp()).collect();
+        let total: f64 = w.iter().sum();
+        let mut r = self.uniform() * total;
+        for (j, &x) in w.iter().enumerate() { r -= x; if r <= 0.0 { return ids[j]; } }
+        ids[keep - 1]
+    }
+    fn pick(&mut self, v: &[f32]) -> candle::Result<u32> {
+        let v = v.to_vec();
+        let argmax = |v: &[f32]| -> u32 { let mut b = 0usize; for (i, &x) in v.iter().enumerate() { if x > v[b] { b = i; } } b as u32 };
+        let (k, p, t) = match &self.s {
+            Sampling::ArgMax => return Ok(argmax(&v)),
+            Sampling::All { temperature } => (self.k, 1.0, *temperature),
+            Sampling::TopK { k, temperature } => (*k, 1.0, *temperature),
+            Sampling::TopP { p, temperature } => (self.k, *p, *temperature),
+            Sampling::TopKThenTopP { k, p, temperature } => (*k, *p, *temperature),
+            #[allow(unreachable_patterns)]
+            _ => (self.k, 1.0, 1.0),
+        };
+        if t <= 0.0 { return Ok(argmax(&v)); }
+        let k = k.max(1).min(v.len());
+        let mut idx: Vec<usize> = (0..v.len()).collect();
+        let desc = |a: &usize, b: &usize| v[*b].partial_cmp(&v[*a]).unwrap_or(std::cmp::Ordering::Equal);
+        if k < idx.len() { idx.select_nth_unstable_by(k - 1, desc); idx.truncate(k); }
+        idx.sort_by(desc);
+        let m = v[idx[0]] as f64;
+        let mut pr: Vec<f64> = idx.iter().map(|&i| (v[i] as f64 - m).exp()).collect();
+        let z: f64 = pr.iter().sum();
+        for x in pr.iter_mut() { *x /= z; }
+        // top-p
+        let mut cum = 0.0; let mut keep = pr.len();
+        for (j, &x) in pr.iter().enumerate() { cum += x; if cum >= p { keep = j + 1; break; } }
+        // min-p
+        let cut = self.min_p * pr[0];
+        let keep = pr[..keep].iter().take_while(|&&x| x >= cut).count().max(1);
+        idx.truncate(keep);
+        // temperature, then one draw
+        let w: Vec<f64> = idx.iter().map(|&i| ((v[i] as f64 - m) / t).exp()).collect();
+        let total: f64 = w.iter().sum();
+        let mut r = self.uniform() * total;
+        for (j, &x) in w.iter().enumerate() { r -= x; if r <= 0.0 { return Ok(idx[j] as u32); } }
+        Ok(idx[idx.len() - 1] as u32)
+    }
+}
+
 /// Compaction reuse (`COACHWHIP_SNAPSHOTS=1`): conversation states saved on the SSD, keyed by the exact
 /// words they cover, kept to a disk budget, the least used first out.
 mod snaps {
@@ -402,7 +512,8 @@ fn answer(
     let stops = fmt.stops(tokenizer);
     // gpt-oss thinking: the channels are read from the format markers, so keep them when decoding.
     let channels = fmt.harmony && think;
-    let mut sampler = LogitsProcessor::from_sampling(42, sampling.clone());
+    let mut sampler = Picker::new(sampling);
+    sampler.remember(&tokens[tokens.len().saturating_sub(repeat_last_n())..]);
     let t0 = std::time::Instant::now();
     let logits = read_prompt(model, device, session.pos, &tokens, tell)?;
     session.fed.extend(&tokens);
@@ -489,7 +600,7 @@ fn answer(
         let ta = std::time::Instant::now();
         let logits = model.forward(&Tensor::new(&[next], if fast { &Device::Cpu } else { device })?.unsqueeze(0)?, base + out.len() - 1)?.squeeze(0)?;
         let tb = std::time::Instant::now();
-        next = if fast && greedy { coachwhip_engine::fuse_kernel::argmax(&logits)?.flatten_all()?.to_vec1::<u32>()?[0] } else { sampler.sample(&logits)? };
+        next = if fast && greedy && !sampler.penalised() { coachwhip_engine::fuse_kernel::argmax(&logits)?.flatten_all()?.to_vec1::<u32>()?[0] } else { sampler.sample(&logits)? };
         let tc = std::time::Instant::now();
         if !stops.contains(&next) {
             out.push(next);
@@ -665,11 +776,16 @@ fn openai(mut s: TcpStream, body: &[u8], model: &mut Model, model_name: &str, to
     let prompt = tokenizer.encode(text, true).map_err(anyhow::Error::msg)?.get_ids().to_vec();
     let max_new = answer_budget(asked, max_new, prompt.len());
     // The requests own temperature and top_p win over the doors defaults; 0 means the likeliest word.
-    let asked_sampling: Sampling = match (q["temperature"].as_f64(), q["top_p"].as_f64()) {
-        (Some(t), _) if t <= 0.0 => Sampling::ArgMax,
-        (Some(t), Some(p)) => Sampling::TopP { p, temperature: t },
-        (Some(t), None) => match sampling { Sampling::TopP { p, .. } => Sampling::TopP { p: *p, temperature: t }, _ => Sampling::All { temperature: t } },
-        (None, _) => sampling.clone(),
+    // The request's own sampling wins over the door's defaults; temperature 0 means the likeliest word.
+    *SAMPLER_EXTRA.lock().unwrap() = (q["top_k"].as_u64().map(|k| k as usize).filter(|&k| k > 0), q["min_p"].as_f64());
+    *REPEAT_REQ.lock().unwrap() = q["repeat_penalty"].as_f64().filter(|&r| r > 0.0);
+    let door_p = match sampling { Sampling::TopP { p, .. } | Sampling::TopKThenTopP { p, .. } => *p, _ => 1.0 };
+    let door_t = match sampling { Sampling::ArgMax => 0.0, Sampling::TopP { temperature, .. } | Sampling::TopKThenTopP { temperature, .. } | Sampling::All { temperature } | Sampling::TopK { temperature, .. } => *temperature, #[allow(unreachable_patterns)] _ => 0.7 };
+    let t = q["temperature"].as_f64().unwrap_or(door_t);
+    let asked_sampling: Sampling = if t <= 0.0 {
+        Sampling::ArgMax
+    } else {
+        Sampling::TopKThenTopP { k: q["top_k"].as_u64().map(|k| k as usize).filter(|&k| k > 0).unwrap_or_else(default_top_k), p: q["top_p"].as_f64().unwrap_or(door_p), temperature: t }
     };
     let sampling = &asked_sampling;
     let id = format!("chatcmpl-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));

@@ -423,6 +423,175 @@ fn pipeline_piece(device: &candle::MetalDevice) -> Result<Arc<ComputePipeline>> 
     Ok(p)
 }
 
+
+const SOURCE_PIECE_COLS: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+inline float silu_f(float x) { return x / (1.0f + exp(-x)); }
+
+// Group g: head h = g / 4, column block cb = g % 4 (columns cb*32 .. cb*32+31). 128 threads:
+// jj = tid % 32 (column in block), r = tid / 32 (row quarter, 32 rows). Writes the RAW output (before
+// the RMS norm and gate) to out[t*od + h*dv + j]; the norm+gate pass finishes it.
+kernel void coachwhip_gdn_piece_cols(
+    device const float* qkv        [[buffer(0)]],
+    device const float* z          [[buffer(1)]],
+    device const float* ba         [[buffer(2)]],
+    device const float* conv_state [[buffer(3)]],
+    device const float* conv_w     [[buffer(4)]],
+    device const float* dt_bias    [[buffer(5)]],
+    device const float* a_vec      [[buffer(6)]],
+    device const float* norm_w     [[buffer(7)]],
+    device const float* s          [[buffer(8)]],
+    device float* out              [[buffer(9)]],
+    constant uint& n_k             [[buffer(10)]],
+    constant uint& n_v             [[buffer(11)]],
+    constant uint& dk              [[buffer(12)]],
+    constant uint& dv              [[buffer(13)]],
+    constant uint& taps            [[buffer(14)]],
+    constant uint& cycle           [[buffer(15)]],
+    constant float& eps            [[buffer(16)]],
+    constant uint& L               [[buffer(17)]],
+    uint g   [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgs [[threads_per_threadgroup]])
+{
+    threadgroup float q_sh[128];
+    threadgroup float k_sh[128];
+    threadgroup float part[4][32];
+    threadgroup float red[2];
+    const uint h = g / 4, cb = g % 4;
+    const uint channels = 2 * n_k * dk + n_v * dv;
+    const uint per_group = n_v / n_k;
+    const uint kh = cycle ? (h % n_k) : (h / per_group);
+    const uint od = n_v * dv;
+    device float* s_out = out + L * od;
+    device float* c_out = s_out + n_v * dk * dv;
+    const uint jj = tid % 32, r = tid / 32;
+    const uint j = cb * 32 + jj;
+    const uint i0 = r * 32;
+    device const float* sh = s + h * dk * dv;
+    device float* so = s_out + h * dk * dv;
+    float col[32];
+    for (uint ii = 0; ii < 32; ii++) col[ii] = sh[(i0 + ii) * dv + j];
+    const uint cv = 2 * n_k * dk + h * dv + j;
+    const float dtb = dt_bias[h], av = a_vec[h];
+    #define ROWV(u, c) ((int)(u) < 0 ? conv_state[((int)(u) + (int)taps - 1) * channels + (c)] : qkv[(uint)(u) * channels + (c)])
+    for (uint t = 0; t < L; t++) {
+        const int base = (int)t - (int)(taps - 1);
+        for (uint i = tid; i < dk; i += tgs) {
+            uint cq = kh * dk + i;
+            uint ck = n_k * dk + kh * dk + i;
+            float xq = 0.0f, xk = 0.0f;
+            for (uint tt = 0; tt + 1 < taps; tt++) {
+                xq += conv_w[cq * taps + tt] * ROWV(base + (int)tt, cq);
+                xk += conv_w[ck * taps + tt] * ROWV(base + (int)tt, ck);
+            }
+            xq += conv_w[cq * taps + taps - 1] * qkv[t * channels + cq];
+            xk += conv_w[ck * taps + taps - 1] * qkv[t * channels + ck];
+            q_sh[i] = silu_f(xq);
+            k_sh[i] = silu_f(xk);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float sq = 0.0f, sk = 0.0f;
+            for (uint i = 0; i < dk; i++) { sq += q_sh[i] * q_sh[i]; sk += k_sh[i] * k_sh[i]; }
+            red[0] = sqrt(sq + eps);
+            red[1] = sqrt(sk + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float qscale = 1.0f / (red[0] * sqrt((float)dk));
+        const float kscale = 1.0f / red[1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < dk; i += tgs) { q_sh[i] *= qscale; k_sh[i] *= kscale; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const float beta = 1.0f / (1.0f + exp(-ba[t * n_v + h]));
+        const float alpha = ba[L * n_v + t * n_v + h];
+        const float gg = exp(log(exp(alpha + dtb) + 1.0f) * av);
+
+        float xv = 0.0f;
+        for (uint tt = 0; tt + 1 < taps; tt++) xv += conv_w[cv * taps + tt] * ROWV(base + (int)tt, cv);
+        xv += conv_w[cv * taps + taps - 1] * qkv[t * channels + cv];
+        const float v = silu_f(xv);
+
+        float skv = 0.0f;
+        for (uint ii = 0; ii < 32; ii++) skv += k_sh[i0 + ii] * col[ii];
+        part[r][jj] = skv;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float tot = ((part[0][jj] + part[1][jj]) + part[2][jj]) + part[3][jj];
+        const float d = (v - tot * gg) * beta;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float acc = 0.0f;
+        for (uint ii = 0; ii < 32; ii++) {
+            const float ns = gg * col[ii] + k_sh[i0 + ii] * d;
+            col[ii] = ns;
+            acc += q_sh[i0 + ii] * ns;
+        }
+        part[r][jj] = acc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (r == 0) out[t * od + h * dv + j] = ((part[0][jj] + part[1][jj]) + part[2][jj]) + part[3][jj];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint ii = 0; ii < 32; ii++) so[(i0 + ii) * dv + j] = col[ii];
+    const int last = (int)L - (int)(taps - 1);
+    if (cb == 0) {
+        for (uint i = tid; i < dk; i += tgs) {
+            uint cq = kh * dk + i;
+            uint ck = n_k * dk + kh * dk + i;
+            for (uint tt = 0; tt + 1 < taps; tt++) {
+                c_out[tt * channels + cq] = ROWV(last + (int)tt, cq);
+                c_out[tt * channels + ck] = ROWV(last + (int)tt, ck);
+            }
+        }
+    }
+    if (r == 0) for (uint tt = 0; tt + 1 < taps; tt++) c_out[tt * channels + cv] = ROWV(last + (int)tt, cv);
+}
+
+// One thread per (word, head): the output RMS norm over the head's dv values, then the silu gate,
+// in the same serial order as the one-group kernel.
+kernel void coachwhip_gdn_norm_gate(
+    device float* out           [[buffer(0)]],
+    device const float* z       [[buffer(1)]],
+    device const float* norm_w  [[buffer(2)]],
+    constant uint& rows         [[buffer(3)]],
+    constant uint& dv           [[buffer(4)]],
+    constant float& eps         [[buffer(5)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= rows) return;
+    device float* o = out + i * dv;
+    device const float* zz = z + i * dv;
+    float ss = 0.0f;
+    for (uint jj = 0; jj < dv; jj++) { float x = o[jj]; ss += x * x; }
+    const float rms = rsqrt(ss / (float)dv + eps);
+    for (uint jj = 0; jj < dv; jj++) {
+        float x = o[jj] * rms * norm_w[jj];
+        o[jj] = x * silu_f(zz[jj]);
+    }
+}
+"#;
+
+fn pipelines_cols(device: &candle::MetalDevice) -> Result<(Arc<ComputePipeline>, Arc<ComputePipeline>)> {
+    static PIPE: OnceLock<(Arc<ComputePipeline>, Arc<ComputePipeline>)> = OnceLock::new();
+    if let Some(p) = PIPE.get() {
+        return Ok(p.clone());
+    }
+    let lib = device.device().new_library_with_source(SOURCE_PIECE_COLS, None).map_err(candle::MetalError::from)?;
+    let mk = |name: &str| -> Result<Arc<ComputePipeline>> {
+        let f = lib.get_function(name, None).map_err(candle::MetalError::from)?;
+        Ok(Arc::new(device.device().new_compute_pipeline_state_with_function(&f).map_err(candle::MetalError::from)?))
+    };
+    let p = (mk("coachwhip_gdn_piece_cols")?, mk("coachwhip_gdn_norm_gate")?);
+    let _ = PIPE.set(p.clone());
+    Ok(p)
+}
+
+fn piece_cols_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COACHWHIP_PIECE_COLS").map(|v| v != "0").unwrap_or(true))
+}
+
 pub fn piece_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("COACHWHIP_PIECE").map(|v| v == "1").unwrap_or(false))
@@ -465,7 +634,23 @@ impl CustomOp3 for GdnPiece {
                 (av_m.buffer(), av.1.start_offset() * 4), (nw_m.buffer(), nw.1.start_offset() * 4), (ss_m.buffer(), ss.1.start_offset() * 4),
                 Output::with_offset(&dst, 0), n_k_u, n_v_u, dk_u, dv_u, taps_u, cycle_u, w.eps, l_u
             ));
-            encoder.dispatch_thread_groups(MTLSize { width: n_v, height: 1, depth: 1 }, MTLSize { width: 512, height: 1, depth: 1 });
+            if piece_cols_on() {
+                let (pc, _) = pipelines_cols(&device)?;
+                encoder.set_compute_pipeline_state(&pc);
+                encoder.dispatch_thread_groups(MTLSize { width: n_v * 4, height: 1, depth: 1 }, MTLSize { width: 128, height: 1, depth: 1 });
+            } else {
+                encoder.dispatch_thread_groups(MTLSize { width: n_v, height: 1, depth: 1 }, MTLSize { width: 512, height: 1, depth: 1 });
+            }
+        }
+        if piece_cols_on() {
+            let (_, ng) = pipelines_cols(&device)?;
+            let encoder = device.command_encoder()?;
+            let encoder = encoder.as_ref();
+            encoder.set_compute_pipeline_state(&ng);
+            let rows = l * n_v;
+            let (rows_u, dv_u) = (rows as u32, dv as u32);
+            set_params!(encoder, (Output::with_offset(&dst, 0), (z.buffer(), zl.start_offset() * 4), (nw_m.buffer(), nw.1.start_offset() * 4), rows_u, dv_u, w.eps));
+            encoder.dispatch_thread_groups(MTLSize { width: rows.div_ceil(64), height: 1, depth: 1 }, MTLSize { width: 64, height: 1, depth: 1 });
         }
         Ok((MetalStorage::new(dst, device, n_out, DType::F32), Shape::from(n_out)))
     }

@@ -201,6 +201,57 @@ kernel void cw_pile(
     for (uint i = 0; i < n_ids; i++) if (ids[i] == e) { piles[w] = ushort2(i % nei0, i / nei0); w++; }
 }
 
+// Top-k, one pass: group g takes elements [g*4096, (g+1)*4096), 256 threads x 16 values in registers,
+// and writes its k best (value, index) in order. has_ids: the input carries its own indices (pass 2).
+kernel void cw_topk(
+    device const float* xv [[buffer(0)]],
+    device const uint* xi  [[buffer(1)]],
+    device float* ov       [[buffer(2)]],
+    device uint* oi        [[buffer(3)]],
+    constant uint& n       [[buffer(4)]],
+    constant uint& k       [[buffer(5)]],
+    constant uint& has_ids [[buffer(6)]],
+    uint g    [[threadgroup_position_in_grid]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]])
+{
+    const uint T = 256;
+    const uint start = g * T * 16;
+    float v[16]; uint id[16];
+    for (uint j = 0; j < 16; j++) {
+        uint i = start + j * T + tid;
+        if (i < n) { v[j] = xv[i]; id[j] = has_ids ? xi[i] : i; } else { v[j] = -INFINITY; id[j] = 0xFFFFFFFFu; }
+    }
+    threadgroup float bv[8];
+    threadgroup uint bi[8];
+    threadgroup uint win;
+    for (uint r = 0; r < k; r++) {
+        float best = -INFINITY; uint bid = 0xFFFFFFFFu; uint bj = 99;
+        for (uint j = 0; j < 16; j++) {
+            if (id[j] != 0xFFFFFFFFu && (bj == 99 || v[j] > best || (v[j] == best && id[j] < bid))) { best = v[j]; bid = id[j]; bj = j; }
+        }
+        float sb = best; uint si = bid;
+        for (uint off = 16; off > 0; off >>= 1) {
+            float o_v = simd_shuffle_down(sb, off); uint o_i = simd_shuffle_down(si, off);
+            if (o_i != 0xFFFFFFFFu && (si == 0xFFFFFFFFu || o_v > sb || (o_v == sb && o_i < si))) { sb = o_v; si = o_i; }
+        }
+        if (lane == 0) { bv[sg] = sb; bi[sg] = si; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float b = bv[0]; uint ix = bi[0];
+            for (uint q = 1; q < 8; q++) {
+                if (bi[q] != 0xFFFFFFFFu && (ix == 0xFFFFFFFFu || bv[q] > b || (bv[q] == b && bi[q] < ix))) { b = bv[q]; ix = bi[q]; }
+            }
+            ov[g * k + r] = b; oi[g * k + r] = ix; win = ix;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint w = win;
+        if (bj < 16 && bid == w) { v[bj] = -INFINITY; id[bj] = 0xFFFFFFFFu; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // down: (T, K, H) rows; w: (T, K); out: (T, H). One thread per (t, j).
 kernel void cw_weighted_sum(
     device const float* down [[buffer(0)]],
@@ -507,4 +558,48 @@ pub fn piles(dev: &candle::MetalDevice, ids: &candle_metal_kernels::metal::Buffe
         enc.dispatch_thread_groups(MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
     }
     Ok((pb, hb))
+}
+
+struct TopK { k: usize }
+impl CustomOp1 for TopK {
+    fn name(&self) -> &'static str { "cw-topk" }
+    fn cpu_fwd(&self, _: &candle::CpuStorage, _: &Layout) -> Result<(candle::CpuStorage, Shape)> { candle::bail!("metal only") }
+    fn metal_fwd(&self, x: &MetalStorage, l: &Layout) -> Result<(MetalStorage, Shape)> {
+        need(x, l, "scores")?;
+        let n = l.shape().elem_count();
+        let k = self.k;
+        if k == 0 || k > 64 { candle::bail!("cw-topk: k {k}") }
+        let groups = n.div_ceil(4096);
+        let n2 = groups * k;
+        if n2 > 4096 { candle::bail!("cw-topk: {n} scores too many for two passes") }
+        let dev = x.device().clone();
+        let v1 = dev.new_buffer_builder().with_size_for(n2, DType::F32).with_label("cw-topk-v1").build()?;
+        let i1 = dev.new_buffer_builder().with_size_for(n2, DType::U32).with_label("cw-topk-i1").build()?;
+        let dst = dev.new_buffer_builder().with_size_for(2 * k, DType::U32).with_label("cw-topk").build()?;
+        let p = pipe(&dev, "cw_topk")?;
+        {
+            let enc = dev.command_encoder()?;
+            let enc = enc.as_ref();
+            enc.set_compute_pipeline_state(&p);
+            let (n_u, k_u, no) = (n as u32, k as u32, 0u32);
+            set_params!(enc, ((x.buffer(), l.start_offset() * 4), (x.buffer(), l.start_offset() * 4), Output::with_offset(&v1, 0), Output::with_offset(&i1, 0), n_u, k_u, no));
+            enc.dispatch_thread_groups(MTLSize { width: groups, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
+        }
+        {
+            let enc = dev.command_encoder()?;
+            let enc = enc.as_ref();
+            enc.set_compute_pipeline_state(&p);
+            let (n_u, k_u, yes) = (n2 as u32, k as u32, 1u32);
+            set_params!(enc, ((&*v1, 0usize), (&*i1, 0usize), Output::with_offset(&dst, 0), Output::with_offset(&dst, k * 4), n_u, k_u, yes));
+            enc.dispatch_thread_groups(MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
+        }
+        Ok((MetalStorage::new(dst, dev, 2 * k, DType::U32), Shape::from(2 * k)))
+    }
+}
+/// The k best scores and their word ids, best first (first id on equal scores); only 2k numbers come back.
+pub fn topk(logits: &Tensor, k: usize) -> Result<(Vec<f32>, Vec<u32>)> {
+    let x = logits.flatten_all()?.to_dtype(DType::F32)?.contiguous()?;
+    let out: Vec<u32> = x.apply_op1_no_bwd(&TopK { k })?.to_vec1()?;
+    let vals = out[..k].iter().map(|b| f32::from_bits(*b)).collect();
+    Ok((vals, out[k..].to_vec()))
 }
