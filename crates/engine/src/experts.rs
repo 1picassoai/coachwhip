@@ -1989,7 +1989,7 @@ impl ExpertStore {
                     eprintln!("coachwhip: resident layer {layer} loaded; GPU {:.2} of {:.2} GB", used as f64 / 1e9, limit as f64 / 1e9);
                 }
             }
-            if layer + 1 == self.layers && std::env::var("COACHWHIP_HOLD_POOL").map(|v| v != "0").unwrap_or(true) {
+            if layer + 1 == self.layers && std::env::var("COACHWHIP_HOLD_POOL").map(|v| v == "1").unwrap_or(false) {
                 candle::metal_backend::HOLD_POOL.store(true, std::sync::atomic::Ordering::Relaxed);
                 eprintln!("coachwhip: GPU memory held from here on (grow only)");
             }
