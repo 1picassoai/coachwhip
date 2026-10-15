@@ -145,6 +145,25 @@ fn main() -> Result<()> {
         std::env::set_var("COACHWHIP_NOCACHE", "1");
     }
     let device = Device::new_metal(0)?;
+    // Wrangler: when the whole file fits in the GPU with a gigabyte to spare for the chat, every
+    // expert is kept resident and the fast path is used. Any switch set by hand wins.
+    if std::env::var("COACHWHIP_RESIDENT").is_err() {
+        let arch = std::fs::File::open(&args.model).ok().and_then(|mut f| candle::quantized::gguf_file::Content::read(&mut f).ok())
+            .and_then(|c| c.metadata.get("general.architecture").and_then(|v| v.to_string().ok().cloned()));
+        let file_len = std::fs::metadata(&args.model).map(|m| m.len()).unwrap_or(u64::MAX);
+        let max = coachwhip_engine::gpu_sync::gpu_memory(&device).map(|(_, m)| m).unwrap_or(0);
+        let fits = file_len.saturating_add(1_000_000_000) < max;
+        if fits && matches!(arch.as_deref(), Some("qwen35moe") | Some("qwen3next")) {
+            for (k, v) in [("COACHWHIP_RESIDENT", "1"), ("COACHWHIP_FUSE", "1"), ("COACHWHIP_NEWMV", "1"), ("COACHWHIP_ADDNORM", "1"),
+                           ("COACHWHIP_ROUTER16", "1"), ("COACHWHIP_GDN2", "1"), ("COACHWHIP_PIECE", "1"), ("COACHWHIP_GROUP", "3"),
+                           ("COACHWHIP_PROMPT_CHUNK", "256"), ("COACHWHIP_SHORT", "256"), ("COACHWHIP_FAST_CHAT", "1"), ("COACHWHIP_SPIN", "1")] {
+                if std::env::var(k).is_err() {
+                    std::env::set_var(k, v);
+                }
+            }
+            eprintln!("coachwhip: the whole model fits in the GPU ({:.1} of {:.1} GB): every expert stays resident", file_len as f64 / 1e9, max as f64 / 1e9);
+        }
+    }
     // A hot path belongs to one model: its routes live in a folder named after the model file.
     let model_name = args.model.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "model".into());
     let routes = args.routes.join(&model_name);
