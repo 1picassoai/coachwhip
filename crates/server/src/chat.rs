@@ -815,7 +815,8 @@ fn openai(mut s: TcpStream, body: &[u8], model: &mut Model, model_name: &str, to
         Ok(a) => a,
         Err(e) => {
             *session = Session::default();
-            let oom = gpu_out_of_memory(&e);
+            eprintln!("  error detail: {e:#}");
+                let oom = gpu_out_of_memory(&e);
             let msg = if oom {
                 "The GPU ran out of memory. Coachwhip has stopped: close some apps, or start it again with a smaller --bank.".to_string()
             } else {
@@ -968,6 +969,7 @@ fn handle(mut s: TcpStream, model: &mut Model, model_name: &str, tokenizer: &Tok
             Err(e) => {
                 // A broken answer leaves the model part-way through it, so the next question starts afresh.
                 *session = Session::default();
+                eprintln!("  error detail: {e:#}");
                 let oom = gpu_out_of_memory(&e);
                 let msg = if oom {
                     "The GPU ran out of memory. Coachwhip has stopped: close some apps, or start it again with a smaller --bank.".to_string()

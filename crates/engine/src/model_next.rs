@@ -679,24 +679,36 @@ impl FullAttn {
         let s_len = k.dim(2)?;
 
         let g = self.n_head / self.n_kv;
-        let q = q.contiguous()?.reshape((1, self.n_kv, g * l, self.hd))?;
-        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * (1.0 / (self.hd as f64).sqrt()))?;
-        if let Some(m) = mask {
-            // After the space has rolled, the mask is rebuilt for the words actually kept.
-            let rebuilt;
-            let m = if m.dim(D::Minus1)? != s_len {
-                rebuilt = candle_transformers::utils::build_additive_causal_mask(l, s_len - l, None, scores.device(), DType::F32)?;
-                &rebuilt
-            } else {
-                m
-            };
-            scores = scores
-                .reshape((1, self.n_kv, g, l, s_len))?
-                .broadcast_add(&m.to_dtype(scores.dtype())?.unsqueeze(1)?)?
-                .reshape((1, self.n_kv, g * l, s_len))?;
+        // After the space has rolled, the mask is rebuilt for the words actually kept.
+        let rebuilt;
+        let mask = match mask {
+            Some(m) if m.dim(D::Minus1)? != s_len => {
+                rebuilt = candle_transformers::utils::build_additive_causal_mask(l, s_len - l, None, q.device(), DType::F32)?;
+                Some(&rebuilt)
+            }
+            other => other,
+        };
+        let slice = attn_slice();
+        let kt = k.transpose(2, 3)?;
+        let mut parts = Vec::new();
+        let mut a = 0usize;
+        while a < l {
+            let ls = if l > slice { slice.min(l - a) } else { l };
+            let qs = if ls == l { q.clone() } else { q.narrow(2, a, ls)? };
+            let qs = qs.contiguous()?.reshape((1, self.n_kv, g * ls, self.hd))?;
+            let mut scores = (qs.matmul(&kt)? * (1.0 / (self.hd as f64).sqrt()))?;
+            if let Some(m) = mask {
+                let ms = if ls == l { m.clone() } else { let r = m.rank(); m.narrow(r - 2, a, ls)? };
+                scores = scores
+                    .reshape((1, self.n_kv, g, ls, s_len))?
+                    .broadcast_add(&ms.to_dtype(scores.dtype())?.unsqueeze(1)?)?
+                    .reshape((1, self.n_kv, g * ls, s_len))?;
+            }
+            let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+            parts.push(probs.matmul(&v)?.reshape((1, self.n_head, ls, self.hd))?);
+            a += ls;
         }
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?.reshape((1, self.n_head, l, self.hd))?;
+        let ctx = if parts.len() == 1 { parts.pop().unwrap() } else { Tensor::cat(&parts, 2)? };
         let ctx = ctx.transpose(1, 2)?.reshape((l, self.n_head * self.hd))?;
         let ctx = (ctx * candle_nn::ops::sigmoid(&gate)?)?;
         self.wo.forward(&ctx)?.reshape((b, l, ()))
@@ -768,6 +780,15 @@ fn split_tick(dev: &Device, t: &mut std::time::Instant, which: usize) -> Result<
 fn short_max() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("COACHWHIP_SHORT").ok().and_then(|v| v.parse().ok()).unwrap_or(1))
+}
+/// Query rows per slice when full attention reads a long piece (`COACHWHIP_ATTN_SLICE`, default 128).
+fn attn_slice() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("COACHWHIP_ATTN_SLICE").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0).unwrap_or(128))
+}
+fn piece_sync() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("COACHWHIP_PIECE_SYNC").ok().and_then(|v| v.parse().ok()).unwrap_or(4))
 }
 fn skip(what: &str) -> bool {
     static S: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -1416,6 +1437,14 @@ impl Qwen3Next {
                 xs = ((routed + shared)? + h)?;
             }
             if timed { tick(&self.device, &mut t, 7)?; }
+            // Reading a prompt piece: hand scratch memory back every few layers, so a big piece never
+            // holds 40 layers of scratch at once (`COACHWHIP_PIECE_SYNC`, layers, default 4; 0 = off).
+            if l > 1 {
+                let every = piece_sync();
+                if every > 0 && (i + 1) % every == 0 {
+                    self.device.synchronize()?;
+                }
+            }
             if l > 1 {
                 if let Some(p) = &mut self.progress {
                     p(crate::model::Step::Layer(i + 1, n));
