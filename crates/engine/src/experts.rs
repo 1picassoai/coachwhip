@@ -2222,9 +2222,15 @@ impl CustomOp2 for MoeMatvec {
             if tokens > 8 && crate::fuse_kernel::group3_on() {
                 drop(encoder);
                 let (pb, hb) = crate::fuse_kernel::piles(&device, ids.buffer(), il.start_offset() * 4, tokens * nei0, nei0, self.slots)?;
+                let min_cnt = crate::mv_id::pile_min();
                 let encoder = device.command_encoder()?;
-                if crate::mv_id::matmul_id_piles(device.device(), &encoder, device.kernels(), dt, (self.n, self.k, self.slots, self.bytes), self.bank.buffer(), x.buffer(), xl.start_offset() * 4, (ne11, nb11, nb12), &pb, &hb, (self.slots, tokens, nei0), &dst).map_err(candle::MetalError::from)? {
+                if crate::mv_id::matmul_id_piles(device.device(), &encoder, device.kernels(), dt, (self.n, self.k, self.slots, self.bytes), self.bank.buffer(), x.buffer(), xl.start_offset() * 4, (ne11, nb11, nb12), &pb, &hb, (self.slots, tokens, nei0), &dst, min_cnt).map_err(candle::MetalError::from)? {
                     drop(encoder);
+                    if min_cnt > 1 {
+                        let (sp, sn) = crate::fuse_kernel::small_pairs(&device, &pb, &hb, tokens * nei0, self.slots, min_cnt)?;
+                        let encoder = device.command_encoder()?;
+                        crate::mv_id::matvec_id_list(device.device(), &encoder, dt, (self.n, self.k, self.slots, self.bytes), self.bank.buffer(), x.buffer(), xl.start_offset() * 4, (ne11, nb11, nb12), ids.buffer(), il.start_offset() * 4, (nei0, tokens), &sp, &sn, tokens * nei0, &dst).map_err(candle::MetalError::from)?;
+                    }
                     return Ok((MetalStorage::new(dst, device.clone(), elems, DType::F32), Shape::from((tokens, nei0, self.n))));
                 }
                 candle::bail!("grouped expert multiply: unsupported type {dt:?}")
@@ -2260,7 +2266,7 @@ impl CustomOp2 for MoeMatvec {
                 let pb = device.new_buffer_with_data(&piles)?;
                 let hb = device.new_buffer_with_data(&heads)?;
                 let encoder = device.command_encoder()?;
-                if crate::mv_id::matmul_id_piles(device.device(), &encoder, device.kernels(), dt, (self.n, self.k, self.slots, self.bytes), self.bank.buffer(), x.buffer(), xl.start_offset() * 4, (ne11, nb11, nb12), &pb, &hb, (used, most, nei0), &dst).map_err(candle::MetalError::from)? {
+                if crate::mv_id::matmul_id_piles(device.device(), &encoder, device.kernels(), dt, (self.n, self.k, self.slots, self.bytes), self.bank.buffer(), x.buffer(), xl.start_offset() * 4, (ne11, nb11, nb12), &pb, &hb, (used, most, nei0), &dst, 0).map_err(candle::MetalError::from)? {
                     drop(encoder);
                     return Ok((MetalStorage::new(dst, device.clone(), elems, DType::F32), Shape::from((tokens, nei0, self.n))));
                 }

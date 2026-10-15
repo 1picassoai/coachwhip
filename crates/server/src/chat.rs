@@ -232,8 +232,8 @@ static SAMPLER_EXTRA: std::sync::Mutex<(Option<usize>, Option<f64>)> = std::sync
 static REPEAT_REQ: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
 fn default_repeat_penalty() -> f64 { std::env::var("COACHWHIP_REPEAT_PENALTY").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0) }
 fn repeat_last_n() -> usize { std::env::var("COACHWHIP_REPEAT_LAST_N").ok().and_then(|v| v.parse().ok()).unwrap_or(64) }
-fn default_top_k() -> usize { std::env::var("COACHWHIP_TOP_K").ok().and_then(|v| v.parse().ok()).unwrap_or(40) }
-fn default_min_p() -> f64 { std::env::var("COACHWHIP_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.05) }
+fn default_top_k() -> usize { std::env::var("COACHWHIP_TOP_K").ok().and_then(|v| v.parse().ok()).unwrap_or(20) }
+fn default_min_p() -> f64 { std::env::var("COACHWHIP_MIN_P").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0) }
 
 /// The word pick: argmax at temperature 0, else top-k -> top-p -> min-p -> temperature -> draw.
 struct Picker { s: Sampling, k: usize, min_p: f64, rng: u64, penalty: f64, hist: std::collections::VecDeque<u32> }

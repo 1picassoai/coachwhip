@@ -293,6 +293,7 @@ pub fn matmul_id_piles(
     heads: &Buffer,
     (used, most, nei0): (usize, usize, usize),
     dst: &Buffer,
+    min_cnt: u32,
 ) -> Result<bool, MetalKernelError> {
     let (name, block) = match dtype {
         GgmlDType::Iq2Xxs => ("kernel_mul_mm_idg_iq2_xxs_f32", 66usize),
@@ -322,9 +323,67 @@ pub fn matmul_id_piles(
     let ne1 = nei0 as i64;
     set_params!(
         encoder,
-        (src0s, (src1, src1_offset), Output::with_offset(dst, 0), piles, heads, ne00, ne02_, nb01, nb02_, ne11_, ne12, nb10, nb11_, nb12_, ne0, ne1)
+        (src0s, (src1, src1_offset), Output::with_offset(dst, 0), piles, heads, ne00, ne02_, nb01, nb02_, ne11_, ne12, nb10, nb11_, nb12_, ne0, ne1, min_cnt)
     );
     let groups = MTLSize { width: most.div_ceil(32), height: n.div_ceil(64), depth: used };
     encoder.dispatch_thread_groups(groups, MTLSize { width: 128, height: 1, depth: 1 });
     Ok(true)
+}
+
+
+/// The one-word expert multiply over a list of (slot, word) pairs; `npairs` holds the list length.
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_id_list(
+    device: &Device,
+    ep: impl EncoderProvider,
+    dtype: GgmlDType,
+    (n, k, ne02, nb02): (usize, usize, usize, usize),
+    src0s: &Buffer,
+    src1: &Buffer,
+    src1_offset: usize,
+    (ne11, nb11, nb12): (usize, usize, usize),
+    ids: &Buffer,
+    ids_offset: usize,
+    (nei0, nei1): (usize, usize),
+    pairs: &Buffer,
+    npairs: &Buffer,
+    max_pairs: usize,
+    dst: &Buffer,
+) -> Result<bool, MetalKernelError> {
+    let nb32 = k / 32;
+    let short_row = nb32 < 32 && 32 % nb32 == 0;
+    let (name, block, nr0, split, smem) = match dtype {
+        GgmlDType::Iq2Xxs => ("kernel_mul_mv_idl_iq2_xxs_f32", 66usize, if short_row { 8 } else { 4 }, short_row, 256 * 8 + 128),
+        GgmlDType::Iq3Xxs => ("kernel_mul_mv_idl_iq3_xxs_f32", 98, if short_row { 8 } else { 4 }, short_row, 256 * 4 + 128),
+        GgmlDType::Iq4Xs => ("kernel_mul_mv_idl_iq4_xs_f32", 136, 2, false, 32 * 4),
+        _ => return Ok(false),
+    };
+    let nsg = 2usize;
+    let pipeline = new_pipe(device, name, split)?;
+    let encoder = ep.encoder();
+    let encoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_threadgroup_memory_length(0, smem);
+    let args = KargsMvId {
+        nei0: nei0 as i32, nei1: nei1 as i32, nbi1: (nei0 * 4) as u64,
+        ne00: k as i32, ne01: n as i32, ne02: ne02 as i32,
+        nb00: block as u64, nb01: (k / 256 * block) as u64, nb02: nb02 as u64,
+        ne10: k as i32, ne11: ne11 as i32, ne12: nei1 as i32, ne13: 1,
+        nb10: 4, nb11: nb11 as u64, nb12: nb12 as u64,
+        ne0: n as i32, ne1: nei0 as i32, nb1: (n * 4) as u64, nr0: nr0 as i32,
+    };
+    encoder.set_bytes(0, &args);
+    encoder.set_input_buffer(1, Some(src0s), 0);
+    encoder.set_input_buffer(2, Some(src1), src1_offset);
+    encoder.set_output_buffer(3, Some(dst), 0);
+    encoder.set_input_buffer(4, Some(ids), ids_offset);
+    encoder.set_input_buffer(5, Some(pairs), 0);
+    encoder.set_input_buffer(6, Some(npairs), 0);
+    encoder.dispatch_thread_groups(MTLSize { width: n.div_ceil(nr0 * nsg), height: 1, depth: max_pairs }, MTLSize { width: 32, height: nsg, depth: 1 });
+    Ok(true)
+}
+
+pub fn pile_min() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("COACHWHIP_PILE_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }

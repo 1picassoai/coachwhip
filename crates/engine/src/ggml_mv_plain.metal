@@ -7554,3 +7554,44 @@ template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
 template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;
 template [[host_name("kernel_mul_mv_id_tq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tq2_0_f32_impl  <N_R0_TQ2_0>>>;
+
+
+// Coachwhip: the one-word expert multiply over a LIST of (slot, word) pairs (the small piles' words).
+template<mul_mv_disp_fn_t disp_fn>
+kernel void kernel_mul_mv_idl(
+        constant ggml_metal_kargs_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        device const char * ids,
+        device const ushort2 * pairs,
+        device const uint * npairs,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    if (tgpig.z >= npairs[0]) return;
+    const ushort2 pr = pairs[tgpig.z];
+    const int iid1 = pr.y;
+    const int idx  = pr.x;
+    tgpig.z = 0;
+    const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
+    const int64_t i11 = idx % args.ne11;
+    const int64_t i12 = iid1;
+    const int64_t i1 = idx;
+    const int64_t i2 = i12;
+    device const char * src0_cur = src0s + i02*args.nb02;
+    device const char * src1_cur = src1  + i11*args.nb11 + i12*args.nb12;
+    device char * dst_cur = dst + (i1*args.ne0 + i2*args.ne1*args.ne0)*sizeof(float);
+    ggml_metal_kargs_mul_mv args0 = {
+        args.ne00, args.ne01, 1, args.nb00, args.nb01, args.nb02, args.nb02,
+        args.ne10, 1, 1, args.nb10, args.nb11, args.nb12, args.nb12,
+        args.ne0, 1, args.nr0, 1, 1,
+    };
+    disp_fn(args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiitg, tiisg, sgitg);
+}
+typedef decltype(kernel_mul_mv_idl<mmv_fn<kernel_mul_mv_t_t_disp<float, float>>>) kernel_mul_mv_idl_t;
+template [[host_name("kernel_mul_mv_idl_iq2_xxs_f32")]] kernel kernel_mul_mv_idl_t kernel_mul_mv_idl<mmv_fn<kernel_mul_mv_iq2_xxs_f32_disp<ggml_metal_kargs_mul_mv>>>;
+template [[host_name("kernel_mul_mv_idl_iq3_xxs_f32")]] kernel kernel_mul_mv_idl_t kernel_mul_mv_idl<mmv_fn<kernel_mul_mv_iq3_xxs_f32_disp<ggml_metal_kargs_mul_mv>>>;
+template [[host_name("kernel_mul_mv_idl_iq4_xs_f32")]]  kernel kernel_mul_mv_idl_t kernel_mul_mv_idl<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;

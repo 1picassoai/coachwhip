@@ -201,6 +201,27 @@ kernel void cw_pile(
     for (uint i = 0; i < n_ids; i++) if (ids[i] == e) { piles[w] = ushort2(i % nei0, i / nei0); w++; }
 }
 
+// The small piles' words: thread e copies its pile when it has fewer than min_cnt words.
+kernel void cw_small(
+    device const ushort2* piles [[buffer(0)]],
+    device const uint* heads    [[buffer(1)]],
+    device ushort2* outp        [[buffer(2)]],
+    device uint* npairs         [[buffer(3)]],
+    constant uint& experts      [[buffer(4)]],
+    constant uint& min_cnt      [[buffer(5)]],
+    uint e [[thread_position_in_threadgroup]])
+{
+    threadgroup uint counts[256];
+    uint c = 0, first = 0;
+    if (e < experts) { c = heads[3 * e + 2]; first = heads[3 * e + 1]; if (c >= min_cnt) c = 0; }
+    counts[e] = c;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint off = 0;
+    for (uint j = 0; j < e; j++) off += counts[j];
+    for (uint i = 0; i < c; i++) outp[off + i] = piles[first + i];
+    if (e == 255) { uint tot = off + c; npairs[0] = tot; }
+}
+
 // Top-k, one pass: group g takes elements [g*4096, (g+1)*4096), 256 threads x 16 values in registers,
 // and writes its k best (value, index) in order. has_ids: the input carries its own indices (pass 2).
 kernel void cw_topk(
@@ -602,4 +623,21 @@ pub fn topk(logits: &Tensor, k: usize) -> Result<(Vec<f32>, Vec<u32>)> {
     let out: Vec<u32> = x.apply_op1_no_bwd(&TopK { k })?.to_vec1()?;
     let vals = out[..k].iter().map(|b| f32::from_bits(*b)).collect();
     Ok((vals, out[k..].to_vec()))
+}
+
+/// From the piles: the list of words in piles smaller than `min_cnt`, and its length (on the GPU).
+pub fn small_pairs(dev: &candle::MetalDevice, piles: &candle_metal_kernels::metal::Buffer, heads: &candle_metal_kernels::metal::Buffer, n_pairs: usize, experts: usize, min_cnt: u32)
+    -> Result<(Arc<candle_metal_kernels::metal::Buffer>, Arc<candle_metal_kernels::metal::Buffer>)> {
+    let ob = dev.new_buffer_builder().with_size_for(n_pairs.max(1), DType::U32).with_label("cw-small").build()?;
+    let nb = dev.new_buffer_builder().with_size_for(1, DType::U32).with_label("cw-small-n").build()?;
+    let p = pipe(dev, "cw_small")?;
+    {
+        let enc = dev.command_encoder()?;
+        let enc = enc.as_ref();
+        enc.set_compute_pipeline_state(&p);
+        let (e_u, m_u) = (experts as u32, min_cnt);
+        set_params!(enc, ((piles, 0usize), (heads, 0usize), Output::with_offset(&ob, 0), Output::with_offset(&nb, 0), e_u, m_u));
+        enc.dispatch_thread_groups(MTLSize { width: 1, height: 1, depth: 1 }, MTLSize { width: 256, height: 1, depth: 1 });
+    }
+    Ok((ob, nb))
 }

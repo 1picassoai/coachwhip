@@ -7885,6 +7885,7 @@ kernel void kernel_mul_mm_idg(
         constant    uint64_t & nb12,
         constant     int64_t & ne0,
         constant     int64_t & ne1,
+        constant        uint & min_cnt,
         threadgroup    uchar * shared_memory [[threadgroup(0)]],
         uint3                  tgpig[[threadgroup_position_in_grid]],
         uint                   tiitg[[thread_index_in_threadgroup]],
@@ -7894,7 +7895,7 @@ kernel void kernel_mul_mm_idg(
     const uint first = heads[3 * z + 1];
     const uint cnt = heads[3 * z + 2];
     tgpig.z = 0;
-    if (tgpig.x * 32 >= cnt) return;
+    if (cnt < min_cnt || tgpig.x * 32 >= cnt) return;
     device const uchar * src0 = src0s + e * nb02;
     threadgroup ushort2 * rowids = (threadgroup ushort2 *)(shared_memory + 8192);
     for (uint i = tiitg; i < cnt; i += 128) rowids[i] = piles[first + i];
