@@ -155,7 +155,17 @@ Measured 9 Oct 2026 on Coachwhip 0.4.0 by the tester, greedy. Exact mode (the mo
 
 ## Qwen3-Coder-Next (80B)
 
-The 80B coder has no thinking mode. Download the file below and its [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next), then start it with a bank of 70 for the Q3_K_M file or 56 for the Q4_K_M:
+The 80B coder has no thinking mode.
+
+**The fast path, from 0.5.1: the ready-squeezed file.** Download [`Qwen3-Coder-Next.Q2X.gguf`](https://huggingface.co/vinnj/coachwhip-models/resolve/main/Qwen3-Coder-Next.Q2X.gguf) (29.3 GB, sha256 `cdc0584c1e4d30134cbb83f18e4c7607af90bd1145a64940c7a357b02a0216af`; 30 GB free to keep it) and the [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next), then:
+
+```sh
+~/coachwhip/coachwhip.sh ~/Downloads/Qwen3-Coder-Next.Q2X.gguf ~/Downloads/tokenizer.json 109 8090 --parallel --flash-reads --stand-ins
+```
+
+Measured on the 0.5.0 build, Mac mini M4 16 GB, tester's hand, three runs each: 12.8 to 13.4 tok/s on short prompts, 11.5 tok/s at a 13,061-token prompt, 10.67 GB peak of the 12.71 GB GPU limit, 3.00 GB left for macOS at its tightest. `--stand-ins` changes the answers; on the retry-helper prompt it scored 4.5 of 5 against the plain file's 5. Details and what is not yet measured: [release notes 0.5.1](releases/0.5.1.md). The file was made from the Q3_K_M below by the shipped `coachwhip-prepare` (gate and up experts to Q2_K, down to Q3_K), and the squeeze is reproducible: remade from the same source, the same sha256. To make it yourself you need about 67 GB free for the 211 seconds it takes.
+
+**The plain path, every expert read:** download the file below and its [tokenizer.json](https://huggingface.co/Qwen/Qwen3-Coder-Next), then start it with a bank of 70 for the Q3_K_M file or 56 for the Q4_K_M:
 
 ```sh
 ~/coachwhip/coachwhip.sh ~/Downloads/Qwen3-Coder-Next.Q3_K_M.gguf ~/Downloads/tokenizer.json 70
@@ -190,7 +200,7 @@ Measured 6 Oct 2026: one person, one run per bank, on the same Mac with a backgr
 - Tokenizer: [tokenizer.json](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) from the model's own page.
 - **On 0.4.0:** not re-measured. Its code path is unchanged, but nobody has run it on the release build.
 
-**On 0.5.1, every expert on the GPU.** With unsloth's [UD-IQ2_M file](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) (11.5 GB) all 256 experts of all 40 layers stay in GPU memory and nothing streams from the SSD. Measured 15 Oct 2026 on the same Mac: **writing 38 tok/s** (300 tokens after a 1,500-token prompt, four runs between 37.9 and 38.3); **reading about 300 tok/s** on that prompt (289 to 304); single prompts of 7,500, 9,300 and 16,800 tokens read at 242, 227 and 202 tok/s on one running engine. Chosen by itself when the file fits with 1 GB to spare; the start line is the same as any model, and no bank number is needed. Quality on a four-agent CrewAI coding job (8 behaviour checks, temperature 0.7): 5, 3 and 5 of 8 over three runs. The Q4 file above still runs the streaming way.
+**On 0.5.3, every expert on the GPU.** With unsloth's [UD-IQ2_M file](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) (11.5 GB) all 256 experts of all 40 layers stay in GPU memory and nothing streams from the SSD. Measured 15 Oct 2026 on the same Mac: **writing 38 tok/s** (300 tokens after a 1,500-token prompt, four runs between 37.9 and 38.3); **reading about 300 tok/s** on that prompt (289 to 304); single prompts of 7,500, 9,300 and 16,800 tokens read at 242, 227 and 202 tok/s on one running engine. Chosen by itself when the file fits with 1 GB to spare; the start line is the same as any model, and no bank number is needed. Quality on a four-agent CrewAI coding job (8 behaviour checks, temperature 0.7): 5, 3 and 5 of 8 over three runs. The Q4 file above still runs the streaming way.
 
 ## Qwen3-Coder-30B-A3B
 

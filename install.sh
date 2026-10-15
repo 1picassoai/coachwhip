@@ -13,7 +13,7 @@ set -euo pipefail
 main() {
 DIR="${COACHWHIP_DIR:-$HOME/coachwhip}"
 REPO="${COACHWHIP_REPO:-https://github.com/1picassoai/coachwhip}"
-VERSION="${COACHWHIP_VERSION:-v0.5.1}"
+VERSION="${COACHWHIP_VERSION:-v0.5.3}"
 ASSET="coachwhip-$VERSION-macos-arm64.tar.gz"
 DIST="${COACHWHIP_DIST:-$REPO/releases/download/$VERSION}"
 

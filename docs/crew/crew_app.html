@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coachwhip Crew</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#070912; --panel:rgba(18,22,34,.72); --line:rgba(255,255,255,.07); --text:#eef1f8; --muted:#8e97ad; --mono:"JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+          --ba:#64b5ff; --arch:#c48bff; --dev:#58e39b; --tester:#ffb454; --bad:#ff6b7a; }
+  * { box-sizing:border-box; }
+  body { margin:0; color:var(--text); font:14px/1.45 Inter, -apple-system, "Segoe UI", sans-serif; overflow:hidden; min-height:100vh;
+         background: radial-gradient(1200px 600px at 15% -10%, rgba(100,181,255,.14), transparent 60%), radial-gradient(900px 500px at 95% 110%, rgba(88,227,155,.12), transparent 60%), radial-gradient(700px 400px at 60% 40%, rgba(196,139,255,.07), transparent 60%), var(--bg); }
+  body::before { content:""; position:fixed; inset:0; background-image: linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px); background-size: 36px 36px; mask-image: radial-gradient(ellipse at center, #000 30%, transparent 85%); pointer-events:none; }
+  header { position:relative; display:flex; align-items:center; gap:14px; padding:12px 22px; border-bottom:1px solid var(--line); backdrop-filter: blur(8px); }
+  .brand { font-weight:800; font-size:19px; letter-spacing:-.2px; white-space:nowrap; } .brand span { background:linear-gradient(90deg,var(--dev),var(--ba)); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .meta { color:var(--muted); font-family:var(--mono); font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:380px; }
+  .right { margin-left:auto; display:flex; gap:8px; align-items:center; }
+  .chip { font-size:11.5px; padding:4px 10px; border-radius:999px; border:1px solid var(--line); background:rgba(255,255,255,.03); color:var(--muted); font-family:var(--mono); white-space:nowrap; }
+  .chip.on { border-color:rgba(88,227,155,.5); color:var(--dev); background:rgba(88,227,155,.08); box-shadow: 0 0 14px rgba(88,227,155,.15); }
+  .chip.warn { border-color:rgba(255,180,84,.5); color:var(--tester); background:rgba(255,180,84,.08); }
+  main { position:relative; padding:12px 22px 0; }
+  .task { display:flex; gap:10px; align-items:center; margin-bottom:12px; }
+  .task .text { flex:1; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:9px 14px; font:12.5px/1.4 var(--mono); color:#c9d0de; height:42px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .task button { background:linear-gradient(135deg, var(--dev), #37c8ff); color:#06231a; border:0; border-radius:12px; height:42px; padding:0 22px; font-weight:800; font-size:14px; cursor:pointer; box-shadow: 0 6px 20px rgba(88,227,155,.25); }
+  .task button:disabled { opacity:.45; cursor:default; box-shadow:none; }
+  .flow { display:grid; grid-template-columns: 1fr 48px 1fr 48px 1fr 48px 1fr; align-items:stretch; margin-bottom:12px; }
+  .node { --c: var(--muted); background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:12px 14px 10px; position:relative; min-height:160px; transition: border-color .3s, box-shadow .3s, transform .3s; backdrop-filter: blur(6px); }
+  #n-ba { --c: var(--ba); } #n-arch { --c: var(--arch); } #n-dev { --c: var(--dev); } #n-tester { --c: var(--tester); }
+  .node::before { content:""; position:absolute; left:0; top:0; width:100%; height:3px; border-radius:16px 16px 0 0; background:var(--c); opacity:.25; }
+  .node.active { border-color:var(--c); box-shadow: 0 0 0 1px color-mix(in srgb, var(--c) 35%, transparent), 0 10px 40px color-mix(in srgb, var(--c) 22%, transparent); transform: translateY(-2px); }
+  .node.active::before { opacity:1; box-shadow: 0 0 18px var(--c); }
+  .node.done { border-color: color-mix(in srgb, var(--c) 40%, transparent); } .node.done::before { opacity:.7; }
+  .node .top { display:flex; align-items:center; gap:12px; }
+  .node .name { font-weight:800; font-size:14.5px; letter-spacing:-.1px; }
+  .node .role { color:var(--muted); font-size:11.5px; font-family:var(--mono); }
+  .node .st { margin-left:auto; font-family:var(--mono); font-size:11px; color:var(--muted); }
+  .node.active .st { color:var(--c); } .node.done .st { color:var(--c); opacity:.8; }
+  .node.active .st::before { content:"●"; margin-right:5px; animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:.15; } }
+  .bot { width:48px; height:48px; flex:none; filter: drop-shadow(0 4px 10px rgba(0,0,0,.4)); }
+  .bot .body { fill:#161b2a; stroke:#3b4461; stroke-width:1.5; }
+  .bot .eye { fill:#3b4461; stroke:#3b4461; }
+  .bot .ant { stroke:#3b4461; stroke-width:2; fill:none; }
+  .node.active .bot .body { stroke:var(--c); fill: color-mix(in srgb, var(--c) 12%, #161b2a); }
+  .node.active .bot .eye { fill:var(--c); stroke:var(--c); animation: eyes 1.2s infinite; filter: drop-shadow(0 0 6px var(--c)); }
+  .node.active .bot .ant { stroke:var(--c); }
+  .node.active .bot { animation: bob 1.4s ease-in-out infinite; }
+  .node.done .bot .eye { fill:var(--c); stroke:var(--c); opacity:.75; } .node.done .bot .body { stroke: color-mix(in srgb, var(--c) 60%, #3b4461); }
+  @keyframes bob { 50% { transform: translateY(-4px) rotate(-2deg); } }
+  @keyframes eyes { 0%,100% { opacity:1 } 50% { opacity:.3 } }
+  .screen { margin-top:10px; background:#070a12; border:1px solid rgba(255,255,255,.06); border-radius:10px; height:78px; overflow:hidden; padding:7px 9px; font:11px/1.35 var(--mono); color:#aeb6c8; white-space:pre-wrap; position:relative; }
+  .screen::after { content:""; position:absolute; left:0; right:0; top:0; height:20px; background:linear-gradient(#070a12, transparent); }
+  .node.active .screen { border-color: color-mix(in srgb, var(--c) 35%, transparent); }
+  .node.active .screen::before { content:"▍"; position:absolute; right:8px; bottom:6px; color:var(--c); animation: blink .8s infinite; }
+  .foot { margin-top:7px; font-family:var(--mono); font-size:11px; color:var(--muted); min-height:14px; }
+  .node.done .foot { color:var(--c); }
+  .link { position:relative; }
+  .link::before { content:""; position:absolute; left:6px; right:6px; top:50%; height:2px; background:rgba(255,255,255,.08); border-radius:2px; }
+  .link .dot { position:absolute; top:50%; left:6px; width:9px; height:9px; margin-top:-4px; border-radius:50%; background:#fff; box-shadow:0 0 12px #fff; opacity:0; }
+  .link.on .dot { animation: travel 1s linear infinite; }
+  @keyframes travel { 0% { left:6px; opacity:0 } 15% { opacity:1 } 85% { opacity:1 } 100% { left:calc(100% - 14px); opacity:0 } }
+  .link.done::before { background:linear-gradient(90deg, rgba(88,227,155,.6), rgba(88,227,155,.25)); }
+  .bottom { display:grid; grid-template-columns: 1.6fr 1fr 1fr; gap:12px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:16px; overflow:hidden; display:flex; flex-direction:column; height:318px; backdrop-filter: blur(6px); }
+  .panel h3 { margin:0; padding:10px 14px; font-size:12.5px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:8px; color:#d6dbe8; font-weight:700; }
+  .panel h3 .st { margin-left:auto; font-family:var(--mono); font-size:11px; color:var(--muted); font-weight:400; }
+  .panel .out { flex:1; overflow:auto; padding:10px 14px; font:12px/1.5 var(--mono); white-space:pre-wrap; color:#d7dbe4; }
+  .score { font-size:52px; font-weight:800; line-height:1; margin:4px 0 6px; font-family:var(--mono); letter-spacing:-1px; }
+  .score.ok { color:var(--dev); text-shadow: 0 0 24px rgba(88,227,155,.45); } .score.bad { color:var(--bad); text-shadow: 0 0 24px rgba(255,107,122,.4); } .score.wait { color:#232a3b; }
+  .judge .out { font-size:11.5px; }
+  .verdict { padding:9px 14px; border-top:1px solid var(--line); font-size:12px; font-family:var(--mono); color:var(--muted); min-height:38px; }
+  .verdict.ok { color:var(--dev); } .verdict.bad { color:var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">coachwhip <span>crew</span></div>
+  <div class="meta" id="meta">model: waiting for the door</div>
+  <div class="right">
+    <span class="chip" id="speed">tok/s: measuring</span>
+    <span class="chip on" id="bytes">bytes to the internet: 0</span>
+    <span class="chip" id="cost">cost: $0.00</span>
+    <span class="chip on" id="local">127.0.0.1 only</span>
+    <span class="chip on">no telemetry</span>
+    <span class="chip" id="clock">00:00</span>
+  </div>
+</header>
+<main>
+  <div class="task">
+    <div class="text" id="tasktext" title=""></div>
+    <button id="go">Run the crew</button>
+  </div>
+  <div class="flow">
+    <div class="node" id="n-ba"><div class="top">
+      <svg class="bot" viewBox="0 0 44 44"><path class="ant" d="M22 4v6"/><circle class="ant" cx="22" cy="4" r="2"/><rect class="body" x="7" y="10" width="30" height="24" rx="7"/><circle class="eye" cx="16" cy="21" r="3"/><circle class="eye" cx="28" cy="21" r="3"/><rect class="body" x="14" y="34" width="16" height="6" rx="2"/></svg>
+      <div><div class="name">Analyst</div><div class="role">requirements</div></div><div class="st" id="st-ba">waiting</div></div>
+      <div class="screen" id="sc-ba"></div><div class="foot" id="ft-ba"></div></div>
+    <div class="link" id="l1"><div class="dot"></div></div>
+    <div class="node" id="n-arch"><div class="top">
+      <svg class="bot" viewBox="0 0 44 44"><path class="ant" d="M22 4v6"/><circle class="ant" cx="22" cy="4" r="2"/><rect class="body" x="7" y="10" width="30" height="24" rx="7"/><rect class="eye" x="12" y="18" width="8" height="6" rx="1.5"/><rect class="eye" x="24" y="18" width="8" height="6" rx="1.5"/><rect class="body" x="14" y="34" width="16" height="6" rx="2"/></svg>
+      <div><div class="name">Architect</div><div class="role">design</div></div><div class="st" id="st-arch">waiting</div></div>
+      <div class="screen" id="sc-arch"></div><div class="foot" id="ft-arch"></div></div>
+    <div class="link" id="l2"><div class="dot"></div></div>
+    <div class="node" id="n-dev"><div class="top">
+      <svg class="bot" viewBox="0 0 44 44"><path class="ant" d="M22 4v6"/><circle class="ant" cx="22" cy="4" r="2"/><rect class="body" x="7" y="10" width="30" height="24" rx="7"/><circle class="eye" cx="16" cy="21" r="3.5"/><circle class="eye" cx="28" cy="21" r="3.5"/><rect class="body" x="14" y="34" width="16" height="6" rx="2"/></svg>
+      <div><div class="name">Developer</div><div class="role">code</div></div><div class="st" id="st-dev">waiting</div></div>
+      <div class="screen" id="sc-dev"></div><div class="foot" id="ft-dev"></div></div>
+    <div class="link" id="l3"><div class="dot"></div></div>
+    <div class="node" id="n-tester"><div class="top">
+      <svg class="bot" viewBox="0 0 44 44"><path class="ant" d="M22 4v6"/><circle class="ant" cx="22" cy="4" r="2"/><rect class="body" x="7" y="10" width="30" height="24" rx="7"/><path class="eye" d="M12 19l4 4 4-4" fill="none" stroke-width="2.5"/><path class="eye" d="M24 19l4 4 4-4" fill="none" stroke-width="2.5"/><rect class="body" x="14" y="34" width="16" height="6" rx="2"/></svg>
+      <div><div class="name">Tester</div><div class="role">review</div></div><div class="st" id="st-tester">waiting</div></div>
+      <div class="screen" id="sc-tester"></div><div class="foot" id="ft-tester"></div></div>
+  </div>
+  <div class="bottom">
+    <div class="panel"><h3>live output <span class="st" id="live-who">—</span></h3><div class="out" id="live"></div></div>
+    <div class="panel"><h3>▶ runner · executes the code, no AI <span class="st" id="st-run">waiting</span></h3><div class="out" id="out-run"></div></div>
+    <div class="panel judge"><h3>⚖ judge · 8 executed checks, same for every run <span class="st" id="st-judge">waiting</span></h3>
+      <div class="out"><div class="score wait" id="score">– / 8</div><div id="out-judge"></div></div>
+      <div class="verdict" id="verdict"></div></div>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const SEATS = ['ba','arch','dev','tester'];
+const LINKS = {ba:null, arch:'l1', dev:'l2', tester:'l3'};
+const buf = {};
+let t0=null, timer=null, live=null;
+function tick(){ if(!t0) return; const s=Math.floor((Date.now()-t0)/1000); $('clock').textContent=String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); }
+function reset(){ for(const k of SEATS){ buf[k]=''; $('sc-'+k).textContent=''; $('ft-'+k).textContent=''; $('st-'+k).textContent='waiting'; $('n-'+k).className='node'; }
+  for(const l of ['l1','l2','l3']) $(l).className='link'; $('live').textContent=''; $('live-who').textContent='—';
+  $('out-run').textContent=''; $('st-run').textContent='waiting'; $('score').textContent='– / 8'; $('score').className='score wait'; $('out-judge').textContent=''; $('st-judge').textContent='waiting';
+  $('verdict').textContent=''; $('verdict').className='verdict'; $('speed').textContent='tok/s: measuring'; $('speed').className='chip'; $('cost').textContent='cost: $0.00'; }
+const es = new EventSource('/events');
+es.onmessage = e => {
+  const ev = JSON.parse(e.data);
+  if (ev.kind==='model'){ $('meta').textContent='model: '+ev.model+' · '+ev.where; if (ev.task){ $('tasktext').textContent=ev.task; $('tasktext').title=ev.task; }
+    if (ev.local){ $('local').textContent='127.0.0.1 only'; $('local').className='chip on'; $('bytes').textContent='bytes to the internet: 0'; $('bytes').className='chip on'; }
+    else { $('local').textContent='cloud: '+ev.host; $('local').className='chip warn'; $('bytes').className='chip warn'; } }
+  else if (ev.kind==='start'){ $('n-'+ev.seat).className='node active'; $('st-'+ev.seat).textContent='working'; live=ev.seat; $('live-who').textContent=$('n-'+ev.seat).querySelector('.name').textContent; $('live').textContent=''; const l=LINKS[ev.seat]; if(l){ $(l).className='link on'; } }
+  else if (ev.kind==='chunk'){ buf[ev.seat]=(buf[ev.seat]||'')+ev.text; $('sc-'+ev.seat).textContent=buf[ev.seat].slice(-420); if(live===ev.seat){ $('live').textContent=buf[ev.seat]; $('live').scrollTop=$('live').scrollHeight; } }
+  else if (ev.kind==='done'){ $('n-'+ev.seat).className='node done'; $('st-'+ev.seat).textContent='done'; const l=LINKS[ev.seat]; if(l) $(l).className='link done';
+    $('ft-'+ev.seat).textContent = ev.secs+' s'+(ev.tps?' · wrote '+ev.tokens+' at '+ev.tps+' tok/s':'')+(ev.rps?' · read '+ev.ptokens+' at '+ev.rps+' tok/s':'');
+    if (ev.seat==='dev' && ev.tps){ $('speed').textContent=ev.tps+' tok/s measured'; $('speed').className='chip on'; }
+    if (!buf[ev.seat] && ev.output){ $('sc-'+ev.seat).textContent=ev.output.slice(-420); if(live===ev.seat) $('live').textContent=ev.output; } }
+  else if (ev.kind==='bytes'){ $('bytes').textContent='bytes to the internet: '+ev.bytes.toLocaleString(); }
+  else if (ev.kind==='cost'){ $('cost').textContent='cost: $'+ev.usd.toFixed(4); }
+  else if (ev.kind==='run_start'){ $('st-run').textContent='running '+(ev.lang||''); }
+  else if (ev.kind==='run_done'){ $('st-run').textContent= ev.ok===null?'skipped':(ev.ok?'exit 0':'failed'); $('out-run').textContent=ev.output; }
+  else if (ev.kind==='judge'){ $('st-judge').textContent='scored'; $('score').textContent=ev.pass+' / '+ev.total; $('score').className='score '+(ev.pass===ev.total?'ok':'bad'); $('out-judge').textContent=ev.lines; }
+  else if (ev.kind==='verdict'){ $('verdict').textContent=(ev.met?'tester: ALL REQUIREMENTS MET':'tester: '+ev.text.split('\n')[0].slice(0,140)); $('verdict').className='verdict '+(ev.met?'ok':'bad'); }
+  else if (ev.kind==='error'){ $('verdict').textContent=ev.text; $('verdict').className='verdict bad'; }
+  else if (ev.kind==='end'){ $('go').disabled=false; clearInterval(timer); tick(); }
+};
+$('go').onclick = async () => { reset(); $('go').disabled=true; t0=Date.now(); timer=setInterval(tick,500);
+  const r = await fetch('/run',{method:'POST'}); if (r.status!==202) $('go').disabled=false; };
+fetch('/task').then(r=>r.json()).then(j=>{ $('tasktext').textContent=j.task; $('tasktext').title=j.task; });
+</script>
+</body>
+</html>

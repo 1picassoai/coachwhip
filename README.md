@@ -7,11 +7,44 @@
 
 # Coachwhip
 
-**Run mixture-of-experts models that are bigger than your memory, on your own Mac.**
+## **Qwen3.6-35B on a 16 GB Mac. 38 tok/s. Fully offline.**
 
-Coachwhip is one Rust binary. It takes a model file in GGUF format, keeps the part of the model every word needs on the GPU, and streams the rest from the SSD as each word asks for it. A 120-billion-parameter model runs on a 16 GB Mac. Which models, how fast, and how to set each one up: [docs/MODELS.md](docs/MODELS.md).
+**Install: under a minute. Model: 11.5 GB, a few minutes on a fast line. Then it runs, with every expert on the GPU.**
 
-<p align="center"><img src="docs/coachwhip-demo.gif" alt="A 122-billion-parameter model writing TypeScript in the Coachwhip chat on a 16 GB Mac mini, in real time" width="720"></p>
+Apple silicon, 16 GB, macOS 15 or later, 15 GB of free disk.
+
+**1. Install**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/1picassoai/coachwhip/main/install.sh | bash
+```
+
+**2. Download the model** (11.5 GB, unsloth's UD-IQ2_M file, used as it is)
+
+```sh
+mkdir -p ~/coachwhip/models && cd ~/coachwhip/models
+curl -L -O https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-IQ2_M.gguf
+curl -L -O https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/tokenizer.json
+```
+
+**3. Run** (the chat opens in your browser)
+
+```sh
+~/coachwhip/coachwhip.sh ~/coachwhip/models/Qwen3.6-35B-A3B-UD-IQ2_M.gguf ~/coachwhip/models/tokenizer.json 44 8090 --max-tokens 16000
+```
+
+The file fits, so Coachwhip keeps all 256 experts of all 40 layers in GPU memory and reads nothing from the SSD while it runs.
+
+**Next**
+
+- Your tools: OpenAI API on `http://127.0.0.1:8090/v1`, any key, model `Qwen3.6-35B-A3B-UD-IQ2_M`. Aider: `aider --openai-api-base http://127.0.0.1:8090/v1 --openai-api-key anything --model openai/Qwen3.6-35B-A3B-UD-IQ2_M --map-tokens 0`
+- Each request's `temperature`, `top_p`, `top_k` and `min_p` are honoured; without them the model gets Qwen's own 0.7 / 0.8 / 20 / 0.
+- Bigger models: the 80B coder and gpt-oss-120b, on the [models page](docs/MODELS.md).
+- Numbers and how they were measured: [release notes](docs/releases/0.5.3.md).
+
+Measured on a Mac mini M4 with 16 GB: writing 38 tok/s, reading about 300 tok/s on a 1,500-token prompt; your Mac and your prompt move the numbers. The squeezed `Q2X` file from 0.5.2 still runs the streaming way at its own numbers.
+
+---
 
 ## Why we built it
 
@@ -21,24 +54,6 @@ Two reasons, and both had to hold at once.
 
 **It had to be fast enough to use.** A model big enough to be worth asking does not fit in a laptop's memory, and the usual answer, a smaller model, is a worse assistant. Coachwhip's answer is to stop loading the whole model. A mixture-of-experts model is made of many small experts, and a router picks only a few of them for each word. Coachwhip reads exactly those, keeps the ones it has used lately on the GPU, and guesses the next layer's picks while the GPU is busy on this one. The big model stays big; only its working set is in memory.
 
-## Install
-
-One line in Terminal:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/1picassoai/coachwhip/main/install.sh | bash
-```
-
-It checks your Mac and downloads the ready-built Coachwhip into `~/coachwhip`, in under a minute. Nothing to compile, no Rust. Run it again at any time to update to the latest release.
-
-To build from source instead, run it with `COACHWHIP_FROM_SOURCE=1` in front of `bash`: it installs Apple's command line tools and Rust if they are missing, and the build takes about 10 minutes.
-
-**What you need:** a Mac with Apple silicon (M4 or later recommended; M1 to M3 run it slower), 16 GB of memory, macOS 26 (tested), and disk for the model file. Coachwhip itself is 15 MB. Each model's disk and memory needs are on the [models page](docs/MODELS.md).
-
-## Bring a model
-
-Coachwhip is the engine; the model is yours. Download a supported model's GGUF file and its `tokenizer.json` from the publisher's page, then start Coachwhip with both. Some models are squeezed once on your Mac before first use; the models page has the steps and the exact start line for each one.
-
 ## Use
 
 **Chat in your browser:**
@@ -47,34 +62,14 @@ Coachwhip is the engine; the model is yours. Download a supported model's GGUF f
 ~/coachwhip/coachwhip.sh /path/to/model.gguf /path/to/tokenizer.json 56
 ```
 
-The last number is the bank, the expert slots kept on the GPU per layer (44 if you leave it out; each model's number is on the models page). The chat opens in your browser. Type, press Send, and the answer streams as it is written. Follow-up questions read only your new words; press **New chat** to start again. Stop Coachwhip with Ctrl+C.
+The last number is the bank: expert slots kept on the GPU per layer. Each model's number is on the [models page](docs/MODELS.md). Ctrl+C stops it.
 
-**Thinking.** A model that thinks before it answers shows its thinking in a box above the answer. A model with an optional thinking mode shows a **let it think first** box on the page. Either way Coachwhip only puts the model's own template text at the start of its turn; each word comes at the same speed, and thinking makes the reply longer, not slower per word. In the terminal it is `--think`; through the API it is always off, so coding tools get the answer.
+- A thinking model shows its thinking in a box above the answer. Through the API thinking is off, so coding tools get the answer.
+- A conversation holds up to 16K tokens, sized for a 16 GB Mac.
+- Only programs on this Mac can reach it. The chat page and your tools share one model, one request at a time.
+- Tested with the official `openai` Python client and with [Aider](https://aider.chat). `--map-tokens 0` turns off Aider's repository map, which adds about a thousand tokens to every request.
 
-**From your coding tools:** while Coachwhip runs, it also speaks the OpenAI chat API, so any tool that takes an OpenAI base URL can use the model.
-
-| Setting | Value |
-|---|---|
-| Base URL | `http://127.0.0.1:8090/v1` |
-| API key | anything; it is ignored |
-| Model | the model's file name, as listed at `/v1/models` |
-
-A conversation holds up to 16K tokens: the history, the question and the answer together. That limit is sized to fit a 16 GB Mac; the models themselves support longer.
-
-Only programs on this Mac can reach it. Follow-ups that resend the whole conversation read only the new part. The chat page and your tools share one model, one request at a time; when a tool has used it, the page's next question starts a new chat.
-
-Tested with the official `openai` Python client and with [Aider](https://aider.chat), the coding agent for the terminal:
-
-```sh
-aider --openai-api-base http://127.0.0.1:8090/v1 --openai-api-key anything \
-      --model openai/<model file name> --map-tokens 0 src/queue.ts
-```
-
-<p align="center"><img src="docs/coachwhip-aider.png" alt="Aider using an 80-billion-parameter coder through Coachwhip on a 16 GB Mac: it finds a sort-order bug and rewrites the file" width="720"></p>
-
-<p align="center"><sub>Aider on a Windows laptop, reaching the Mac through an SSH tunnel, so the requests arrive as a local program.</sub></p>
-
-`--map-tokens 0` turns off Aider's repository map, which adds up to about a thousand tokens to each request by default; with it on, each request takes longer to read.
+<p align="center"><img src="docs/coachwhip-aider.png" alt="Aider using an 80B coder through Coachwhip on a 16 GB Mac: it finds a sort-order bug and rewrites the file" width="720"></p>
 
 **One answer in the terminal:**
 
@@ -101,16 +96,6 @@ cd ~/coachwhip
 | `--profile` | Print where the time went after each answer |
 | `--help` | Everything else |
 
-## How it works
-
-- **Streams experts, not files.** The small, always-used part of the model lives on the GPU. The experts stay on the SSD, and for each word Coachwhip reads exactly the experts the router picked.
-- **An expert bank on the GPU.** Recently used experts stay in a bank in the GPU's memory and are reused, so the SSD is only touched for experts the bank does not hold.
-- **The early guess.** While the GPU works on one layer, Coachwhip runs the router of a layer ahead on the same input, so it already knows most of the experts that layer will want, and reads them in while the GPU is busy. A guess that would land too late is dropped rather than evicting an expert still in use. The last few layers, which have no later router, use the routes the model has taken before, and every chat teaches that table more.
-- **One GPU dispatch per layer.** All the experts a layer picked run together in a single fused kernel.
-- **Reads while it computes.** When a prompt needs more experts than the bank holds, the GPU starts on each expert the moment its bytes land, while the rest are still being read.
-- **Unified memory, used properly.** On Apple silicon the CPU and GPU share one memory, so an expert read from the SSD lands straight where the GPU reads it. No copies.
-- **Stays inside your Mac.** Coachwhip picks the bank that fits, warns you when macOS is short, and if the GPU runs out of room it says so on the page and stops; close some apps, or start it again with a smaller `--bank`.
-
 ## Tell us how it ran
 
 Good or bad, especially if it was slow, the fan worked hard, or it ran hot. [Open an issue](https://github.com/1picassoai/coachwhip/issues) with your Mac (chip and memory), macOS version, the model file, the `--bank` you used, and the speed line the chat page shows under each answer. Questions and ideas are welcome there too.
@@ -128,6 +113,4 @@ Release notes, every version: [docs/releases](docs/releases).
 
 Built on [Candle](https://github.com/huggingface/candle); `vendor/candle-core` is its core crate with an MXFP4 kernel for Metal. gpt-oss-120b is [OpenAI's](https://huggingface.co/openai/gpt-oss-120b), under Apache-2.0. `crates/engine/src/model.rs` is derived from Candle's Qwen3 model, and the fused expert kernel is ggml's `mul_mv_id`, which ships inside Candle. The block-at-a-time linear attention follows [Gated Delta Networks](https://arxiv.org/abs/2412.06464) (Yang, Kautz and Hatamizadeh, ICLR 2025).
 
-## Licence
-
-Apache-2.0. See [LICENSE](LICENSE).
+To build from source instead of taking the ready-built binary, run the install line with `COACHWHIP_FROM_SOURCE=1` in front of `bash`; it installs Apple's command line tools and Rust if they are missing, about 10 minutes.
