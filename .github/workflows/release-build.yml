@@ -1,0 +1,45 @@
+# Builds the ready-built download on GitHub's own Mac, from the public source at this commit, and
+# signs where it came from (artifact attestation). Anyone can check a download with:
+#   gh attestation verify coachwhip-<version>-macos-arm64.tar.gz --repo 1picassoai/coachwhip
+name: release build
+
+on:
+  push:
+    tags: ["v*"]
+    branches: ["main", "ci/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustc --version
+          xcrun --show-sdk-version
+          sw_vers
+      - name: Build and package
+        env:
+          # macOS refuses to start the binary below the version Coachwhip needs (Metal residency sets).
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
+        run: bash tools/package-release.sh
+      - name: Checksums
+        run: |
+          cd dist && cat *.sha256
+          tar -xzf *.tar.gz -C /tmp && shasum -a 256 /tmp/target/release/coachwhip /tmp/target/release/coachwhip-prepare
+          vtool -show-build /tmp/target/release/coachwhip | grep -E "minos|sdk"
+      - name: Attest where the download came from
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coachwhip-macos-arm64
+          path: dist/

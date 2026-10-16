@@ -5,7 +5,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/1picassoai/coachwhip" alt="License: Apache-2.0"></a>
   <img src="https://img.shields.io/badge/macOS_15+-Apple_silicon-black?logo=apple" alt="macOS 15 or later on Apple silicon">
   <img src="https://img.shields.io/badge/built_with-Rust-b7410e?logo=rust" alt="Built with Rust">
-  <a href="https://www.virustotal.com/gui/file/8aa8dfe2ccd4323c5057079914d9e7c2c49c729be9d4949b8d91860c96b9aba1"><img src="https://img.shields.io/badge/VirusTotal_v0.5.3-0%2F62_engines_flag_it-brightgreen" alt="VirusTotal: 0 of 62 engines flag the v0.5.3 download"></a></p>
+  <a href="https://github.com/1picassoai/coachwhip/actions/workflows/release-build.yml"><img src="https://github.com/1picassoai/coachwhip/actions/workflows/release-build.yml/badge.svg?branch=main" alt="Build on GitHub's Mac: status"></a></p>
 
 # Coachwhip
 
