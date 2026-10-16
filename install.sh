@@ -23,6 +23,8 @@ die() { printf "\033[1;31merror:\033[0m %s\n" "$*" >&2; exit 1; }
 # 1. This Mac
 [ "$(uname -s)" = Darwin ] || die "Coachwhip runs on macOS only."
 [ "$(uname -m)" = arm64 ] || die "Coachwhip needs an Apple silicon Mac (M1 or later)."
+os_major="$(sw_vers -productVersion | cut -d. -f1)"
+[ "$os_major" -ge 15 ] || die "Coachwhip needs macOS 15 or later; this Mac has macOS $(sw_vers -productVersion)."
 mem_gb=$(( $(sysctl -n hw.memsize) / 1073741824 ))
 [ "$mem_gb" -ge 16 ] || die "Coachwhip needs 16 GB of memory; this Mac has $mem_gb GB."
 need_gb=1

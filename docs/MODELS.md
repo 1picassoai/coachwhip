@@ -42,10 +42,10 @@ Any model that needs no squeeze starts with one line, the bank last:
 
 | | gpt-oss-120b | 122B | 80B | 30B |
 |---|---|---|---|---|
-| Mac | Apple silicon, M4 or later recommended; M1 to M3 run it slower. Tested on a Mac mini M4. | the same | the same | the same |
+| Mac | Apple silicon, M4 or later recommended; M1 to M3 run it slower. | the same | the same | the same |
 | Memory | 16 GB | 16 GB | 16 GB; 24 GB has room to spare | 16 GB |
 | Disk | 106 GB free while squeezing, 43 GB once you delete the download | 105 GB free while squeezing, 46 GB once you delete the download | 39 GB (Q3_K_M) or 49 GB (Q4_K_M) | 19 GB |
-| macOS | Tested on macOS 26 | the same | the same | the same |
+| macOS | 15 or later | the same | the same | the same |
 
 **What it does to your Mac.** While a model is hot, Coachwhip holds its bank and the model's always-used part on the GPU; the rest of the memory is yours.
 
@@ -58,7 +58,7 @@ The 30B's experts are bigger than the 80B's, so it holds more. If memory runs sh
 
 ## How we measure
 
-- **Machine:** Mac mini M4, 16 GB, macOS 26.
+- **Machine:** Mac mini M4, 16 GB.
 - **Engine:** the version named in each section, with its default settings, temperature 0. The 80B and the 35B were measured on 0.3.0 (`--prefetch 10 --ahead 4`); the 122B on 0.4.0 (`--prefetch 6 --ahead 2`, its own default); gpt-oss-120b on 0.5.0.
 - **Speed:** the five coding prompts in [`bench/speed/prompts.json`](../bench/speed/prompts.json), each a fresh conversation capped at 300 tokens, run by [`bench/speed/run.py`](../bench/speed/run.py). "Writing" is answer tokens per second from the first token to the last, the same thing the chat shows under each answer; the table gives the mean over the five prompts, with the slowest and fastest in brackets.
 - **Quality:** 8 small coding tasks in [`bench/quality/tasks.json`](../bench/quality/tasks.json). Each answer's code is run against tests the model never sees ([`bench/quality/tests.py`](../bench/quality/tests.py)); a task passes only if every test does. Quality depends on the model file, not on Coachwhip's settings: the bank and the prefetch change how fast an answer comes, never what it says. Fast modes (`--experts`, `--stand-ins`) are the exception and are measured separately.

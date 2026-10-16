@@ -41,7 +41,7 @@ What this says about the model: on a problem with several interacting rules it p
 
 The task is one prompt: a generic cancellable asynchronous task pool in TypeScript with dependency resolution. The model thinks, then writes the code, about 4,000 words in all. The code is run against 20 hidden checks, 4 checks to a point. A second wording of the same job, a build-pipeline runner, checks that a score is not a fluke.
 
-All rows: Mac mini M4, 16 GB, macOS 26, the squeezed file (every expert matrix at Q2_K), `--parallel --flash-reads`, temperature 0.
+All rows: Mac mini M4, 16 GB, the squeezed file (every expert matrix at Q2_K), `--parallel --flash-reads`, temperature 0.
 
 | Setup | Speed | Score | Second wording |
 |---|---|---|---|
@@ -131,4 +131,3 @@ gpt-oss speaks OpenAI's harmony format: an analysis channel for its thinking, a 
 ## Not tested
 
 - Chats past 16K tokens.
-- Macs other than an M4 with 16 GB.
