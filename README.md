@@ -11,19 +11,31 @@
 
 ## **Qwen3.6-35B on a 16 GB Mac. 38 tok/s. Fully offline.**
 
-**Install: under a minute. Model: 11.5 GB, a few minutes on a fast line. Then it runs, with every expert on the GPU.**
+**Install:** under a minute. **Model:** one 11.5 GB download. **Runtime:** every expert held in GPU memory, nothing streamed from the SSD.
 
-Apple silicon, 16 GB, macOS 15 or later, 15 GB of free disk.
+### Requirements
 
-On 16 Oct 2026 the v0.5.3 download was scanned by 62 antivirus engines on VirusTotal and none flagged it: [the public report](https://www.virustotal.com/gui/file/8aa8dfe2ccd4323c5057079914d9e7c2c49c729be9d4949b8d91860c96b9aba1) for the download, and [the one](https://www.virustotal.com/gui/file/4d782084b4ac3aa80c62d270091f8209e836620faf6c164ea57c228daa0ec7b2) for the `coachwhip` program inside it.
+- Apple silicon (M1 or later)
+- 16 GB of memory
+- macOS 15 or later
+- 15 GB of free disk
 
-**1. Install**
+### Integrity (16 Oct 2026)
+
+The v0.5.3 download was scanned by 62 antivirus engines on VirusTotal. None flagged it.
+
+- [VirusTotal: the v0.5.3 download](https://www.virustotal.com/gui/file/8aa8dfe2ccd4323c5057079914d9e7c2c49c729be9d4949b8d91860c96b9aba1)
+- [VirusTotal: the `coachwhip` program inside it](https://www.virustotal.com/gui/file/4d782084b4ac3aa80c62d270091f8209e836620faf6c164ea57c228daa0ec7b2)
+
+### Quick start
+
+**1. Install Coachwhip**
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/1picassoai/coachwhip/main/install.sh | bash
 ```
 
-**2. Download the model** (11.5 GB, unsloth's UD-IQ2_M file, used as it is)
+**2. Download the model.** Unsloth's 11.5 GB UD-IQ2_M file, used as it is:
 
 ```sh
 mkdir -p ~/coachwhip/models && cd ~/coachwhip/models
@@ -31,22 +43,34 @@ curl -L -O https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen
 curl -L -O https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/tokenizer.json
 ```
 
-**3. Run** (the chat opens in your browser)
+**3. Run.** Starts the engine and opens the chat in your browser:
 
 ```sh
 ~/coachwhip/coachwhip.sh ~/coachwhip/models/Qwen3.6-35B-A3B-UD-IQ2_M.gguf ~/coachwhip/models/tokenizer.json 44 8090 --max-tokens 16000
 ```
 
-The file fits, so Coachwhip keeps all 256 experts of all 40 layers in GPU memory and reads nothing from the SSD while it runs.
+`44` is the bank, the expert slots kept on the GPU; this model fits whole, so any number works. `8090` is the port.
 
-**Next**
+The file fits in memory, so Coachwhip keeps all 256 experts of all 40 layers on the GPU instead of streaming them from the SSD.
 
-- Your tools: OpenAI API on `http://127.0.0.1:8090/v1`, any key, model `Qwen3.6-35B-A3B-UD-IQ2_M`. Aider: `aider --openai-api-base http://127.0.0.1:8090/v1 --openai-api-key anything --model openai/Qwen3.6-35B-A3B-UD-IQ2_M --map-tokens 0`
-- Each request's `temperature`, `top_p`, `top_k` and `min_p` are honoured; without them the model gets Qwen's own 0.7 / 0.8 / 20 / 0.
-- Bigger models: the 80B coder and gpt-oss-120b, on the [models page](docs/MODELS.md).
-- Numbers and how they were measured: [release notes](docs/releases/0.5.3.md).
+### Use it from your tools
 
-Measured on a Mac mini M4 with 16 GB: writing 38 tok/s, reading about 300 tok/s on a 1,500-token prompt; your Mac and your prompt move the numbers. The squeezed `Q2X` file from 0.5.2 still runs the streaming way at its own numbers.
+- **OpenAI-compatible API:** `http://127.0.0.1:8090/v1`, any key, model `Qwen3.6-35B-A3B-UD-IQ2_M`.
+- **Aider:**
+
+  ```sh
+  aider --openai-api-base http://127.0.0.1:8090/v1 --openai-api-key anything --model openai/Qwen3.6-35B-A3B-UD-IQ2_M --map-tokens 0
+  ```
+
+- **Sampling:** each request's `temperature`, `top_p`, `top_k` and `min_p` are honoured. Without them the model gets Qwen's own 0.7 / 0.8 / 20 / 0.
+- **Bigger models:** the 80B coder and gpt-oss-120b stream their experts from the SSD; see the [models page](docs/MODELS.md).
+
+### Measured (Mac mini M4, 16 GB)
+
+- **Writing:** 38 tok/s
+- **Reading the prompt:** about 300 tok/s on a 1,500-token prompt
+
+Your Mac and your prompt move the numbers; the [release notes](docs/releases/0.5.3.md) say how they were measured. The squeezed `Q2X` file from 0.5.2 still runs the streaming way, at its own numbers.
 
 ---
 
