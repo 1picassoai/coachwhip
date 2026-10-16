@@ -3,7 +3,9 @@
 <p align="center">
   <a href="https://github.com/1picassoai/coachwhip/releases/latest"><img src="https://img.shields.io/github/v/release/1picassoai/coachwhip" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/1picassoai/coachwhip" alt="License: Apache-2.0"></a>
-  <img src="https://img.shields.io/badge/macOS-Apple%20silicon-black?logo=apple" alt="macOS on Apple silicon"></p>
+  <img src="https://img.shields.io/badge/macOS_15+-Apple_silicon-black?logo=apple" alt="macOS 15 or later on Apple silicon">
+  <img src="https://img.shields.io/badge/built_with-Rust-b7410e?logo=rust" alt="Built with Rust">
+  <a href="https://www.virustotal.com/gui/file/8aa8dfe2ccd4323c5057079914d9e7c2c49c729be9d4949b8d91860c96b9aba1"><img src="https://img.shields.io/badge/VirusTotal_v0.5.3-0%2F62_engines_flag_it-brightgreen" alt="VirusTotal: 0 of 62 engines flag the v0.5.3 download"></a></p>
 
 # Coachwhip
 
@@ -12,6 +14,8 @@
 **Install: under a minute. Model: 11.5 GB, a few minutes on a fast line. Then it runs, with every expert on the GPU.**
 
 Apple silicon, 16 GB, macOS 15 or later, 15 GB of free disk.
+
+On 16 Oct 2026 the v0.5.3 download was scanned by 62 antivirus engines on VirusTotal and none flagged it: [the public report](https://www.virustotal.com/gui/file/8aa8dfe2ccd4323c5057079914d9e7c2c49c729be9d4949b8d91860c96b9aba1) for the download, and [the one](https://www.virustotal.com/gui/file/4d782084b4ac3aa80c62d270091f8209e836620faf6c164ea57c228daa0ec7b2) for the `coachwhip` program inside it.
 
 **1. Install**
 
