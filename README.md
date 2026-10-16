@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/coachwhip.png" alt="A coachwhip snake on sand" width="720"></p>
+<p align="center"><img src="docs/coachwhip-banner-1610.png" alt="Coachwhip: a Metal and Rust powered local AI engine" width="880"></p>
 
 <p align="center">
   <a href="https://github.com/1picassoai/coachwhip/releases/latest"><img src="https://img.shields.io/github/v/release/1picassoai/coachwhip" alt="Latest release"></a>
