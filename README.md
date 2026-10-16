@@ -74,6 +74,12 @@ Your Mac and your prompt move the numbers; the [release notes](docs/releases/0.5
 
 ---
 
+## Our promise
+
+**We built Coachwhip for ourselves first: a fast, private way to run a big coding model on a Mac. It worked well enough that we wanted everyone to have it, so we made it open source.**
+
+**We're a small team in England, UK, and we'll keep supporting Coachwhip for as long as people use it. Every issue gets read and answered, and every real bug gets fixed. A full roadmap of the features we're working on is coming soon.**
+
 ## Why we built it
 
 Two reasons, and both had to hold at once.
@@ -131,6 +137,8 @@ Good or bad, especially if it was slow, the fan worked hard, or it ran hot. [Ope
 Release notes, every version: [docs/releases](docs/releases).
 
 ## Roadmap
+
+What's next, while the full roadmap is being written:
 
 - More MoE families: Mixtral, Qwen2-MoE, OLMoE, DeepSeek, GLM, Qwen3.8.
 - Fused-attention GGUF files.
